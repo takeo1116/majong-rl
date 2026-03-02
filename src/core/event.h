@@ -26,7 +26,7 @@ struct Event {
     static Event make_discard(PlayerId player, TileId tile, bool riichi);
     static Event make_chi(PlayerId actor, TileId called);
     static Event make_pon(PlayerId actor, TileId called, PlayerId from);
-    static Event make_kan(PlayerId actor, MeldType kan_type);
+    static Event make_kan(PlayerId actor, MeldType kan_type, TileId tile);
     static Event make_dora_reveal(TileId indicator);
     static Event make_ron(PlayerId winner, PlayerId loser);
     static Event make_tsumo(PlayerId winner);

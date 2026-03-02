@@ -1,5 +1,7 @@
 #include "engine/game_engine.h"
 #include "engine/hand_utils.h"
+#include "engine/state_validator.h"
+#include "rl/reward_policy.h"
 #include "rules/agari.h"
 #include "rules/score_calculator.h"
 #include <algorithm>
@@ -85,11 +87,21 @@ std::vector<ActionType> GameEngine::allowed_action_types(Phase phase) {
 void GameEngine::reset_match(EnvironmentState& env, uint64_t seed, RunMode mode) {
     env.reset(seed, mode);
     init_round(env);
+    // Debug モードでは初期状態の整合性を検証（CQ-0031）
+    if (env.run_mode == RunMode::Debug) {
+        auto vr = state_validator::validate(env);
+        assert(vr.valid && "reset_match 後の状態が不整合");
+    }
 }
 
 void GameEngine::reset_match(EnvironmentState& env, uint64_t seed, PlayerId first_dealer, RunMode mode) {
     env.reset(seed, first_dealer, mode);
     init_round(env);
+    // Debug モードでは初期状態の整合性を検証（CQ-0031）
+    if (env.run_mode == RunMode::Debug) {
+        auto vr = state_validator::validate(env);
+        assert(vr.valid && "reset_match 後の状態が不整合");
+    }
 }
 
 void GameEngine::init_round(EnvironmentState& env) {
@@ -274,6 +286,22 @@ StepResult GameEngine::step(EnvironmentState& env, const Action& action) {
         return result;
     }
 
+    // 報酬計算用: step 前のスコアを記録
+    std::array<int32_t, kNumPlayers> scores_before = {};
+    for (PlayerId p = 0; p < kNumPlayers; ++p) {
+        scores_before[p] = rs.players[p].score;
+    }
+
+    // Debug モード: step 前の状態整合性を検証する（CQ-0031）
+    if (env.run_mode == RunMode::Debug) {
+        auto pre_vr = state_validator::validate(env);
+        if (!pre_vr.valid) {
+            StepResult result;
+            result.error = ErrorCode::InconsistentState;
+            return result;
+        }
+    }
+
     // フェーズに応じたアクション処理
     StepResult result;
     switch (rs.phase) {
@@ -292,6 +320,28 @@ StepResult GameEngine::step(EnvironmentState& env, const Action& action) {
     // 次局進行は advance_round() を外部から呼ぶ
     if (result.round_over && result.error == ErrorCode::Ok) {
         settle_round(env, result);
+        // 半荘終了判定（CQ-0032）
+        result.match_over = check_match_over(env);
+    }
+
+    // RewardPolicy に基づく報酬計算（CQ-0029）
+    if (result.error == ErrorCode::Ok) {
+        std::array<int32_t, kNumPlayers> scores_after = {};
+        for (PlayerId p = 0; p < kNumPlayers; ++p) {
+            scores_after[p] = rs.players[p].score;
+        }
+        result.rewards = reward_policy::compute(
+            scores_before, scores_after,
+            env.match_state, result.match_over,
+            env.reward_policy_config);
+    }
+
+    // Debug モードでは step 後の状態整合性を検証（CQ-0031）
+    if (env.run_mode == RunMode::Debug && result.error == ErrorCode::Ok) {
+        auto vr = state_validator::validate(env);
+        if (!vr.valid) {
+            result.error = ErrorCode::InconsistentState;
+        }
     }
 
     return result;
@@ -441,7 +491,7 @@ StepResult GameEngine::process_self_action(EnvironmentState& env, const Action& 
                 result.events.push_back(Event::make_dora_reveal(new_indicator));
             }
 
-            result.events.push_back(Event::make_kan(action.actor, MeldType::Ankan));
+            result.events.push_back(Event::make_kan(action.actor, MeldType::Ankan, kan_tiles[0]));
 
             // 全員の第一ツモ巡を終了
             rs.first_draw.fill(false);
@@ -488,7 +538,7 @@ StepResult GameEngine::process_self_action(EnvironmentState& env, const Action& 
             // 大明槓/加槓は次巡捨牌時にドラ公開
             rs.pending_kan_dora = true;
 
-            result.events.push_back(Event::make_kan(action.actor, MeldType::Kakan));
+            result.events.push_back(Event::make_kan(action.actor, MeldType::Kakan, added));
 
             // 全員の第一ツモ巡を終了
             rs.first_draw.fill(false);
@@ -712,7 +762,7 @@ void GameEngine::resolve_responses(EnvironmentState& env, StepResult& result) {
                 // 大明槓は次巡捨牌時にドラ公開
                 rs.pending_kan_dora = true;
 
-                result.events.push_back(Event::make_kan(daiminkan_player, MeldType::Daiminkan));
+                result.events.push_back(Event::make_kan(daiminkan_player, MeldType::Daiminkan, ctx.discard_tile));
 
                 // 嶺上ツモ
                 draw_rinshan(env, daiminkan_player, result);
@@ -912,7 +962,7 @@ WinContext build_win_context(
 
 }  // anonymous namespace
 
-void GameEngine::settle_round(EnvironmentState& env, StepResult& result) {
+void GameEngine::settle_round(EnvironmentState& env, StepResult& /*result*/) {
     auto& rs = env.round_state;
     auto& ms = env.match_state;
 
@@ -949,10 +999,6 @@ void GameEngine::settle_round(EnvironmentState& env, StepResult& result) {
                 rs.players[winner].score += rs.kyotaku * 1000;
             }
 
-            // リワード計算
-            for (PlayerId p = 0; p < kNumPlayers; ++p) {
-                result.rewards[p] = static_cast<float>(rs.players[p].score - ms.scores[p]);
-            }
             break;
         }
         case RoundEndReason::Ron: {
@@ -1002,10 +1048,6 @@ void GameEngine::settle_round(EnvironmentState& env, StepResult& result) {
                 }
             }
 
-            // リワード計算
-            for (PlayerId p = 0; p < kNumPlayers; ++p) {
-                result.rewards[p] = static_cast<float>(rs.players[p].score - ms.scores[p]);
-            }
             break;
         }
         case RoundEndReason::ExhaustiveDraw: {
@@ -1034,10 +1076,6 @@ void GameEngine::settle_round(EnvironmentState& env, StepResult& result) {
                 }
             }
 
-            // リワード計算
-            for (PlayerId p = 0; p < kNumPlayers; ++p) {
-                result.rewards[p] = static_cast<float>(rs.players[p].score - ms.scores[p]);
-            }
             break;
         }
         case RoundEndReason::AbortiveKyuushu:
@@ -1051,6 +1089,105 @@ void GameEngine::settle_round(EnvironmentState& env, StepResult& result) {
     for (PlayerId p = 0; p < kNumPlayers; ++p) {
         ms.scores[p] = rs.players[p].score;
     }
+}
+
+// ============================
+// 半荘終了判定（CQ-0032）
+// settle_round() 後に呼び、半荘が終了するかを判定する。
+// 終了する場合は ms.is_match_over と ranking を設定して true を返す。
+// advance_round() が後から呼ばれた場合、is_match_over が既に true なら即 return する。
+// ============================
+
+bool GameEngine::check_match_over(EnvironmentState& env) const {
+    const auto& rs = env.round_state;
+    auto& ms = env.match_state;
+
+    // --- 飛び終了チェック ---
+    for (PlayerId p = 0; p < kNumPlayers; ++p) {
+        if (ms.scores[p] < 0) {
+            ms.is_match_over = true;
+            ms.compute_ranking();
+            return true;
+        }
+    }
+
+    // --- 連荘判定（advance_round と同一ロジック）---
+    bool renchan = false;
+    switch (rs.end_reason) {
+        case RoundEndReason::Tsumo:
+            renchan = (rs.current_player == rs.dealer);
+            break;
+        case RoundEndReason::Ron: {
+            const auto& ctx = rs.response_context;
+            for (PlayerId p = 0; p < kNumPlayers; ++p) {
+                if (ctx.has_responded[p] && ctx.responses[p].type == ActionType::Ron && p == rs.dealer) {
+                    renchan = true;
+                    break;
+                }
+            }
+            break;
+        }
+        case RoundEndReason::ExhaustiveDraw: {
+            auto counts = hand_utils::make_type_counts(rs.players[rs.dealer].hand);
+            renchan = hand_utils::is_tenpai(counts);
+            break;
+        }
+        default:
+            break;
+    }
+
+    // --- オーラス終了判定 ---
+    bool was_oorasu = (rs.round_number >= 7);  // 南4局以降
+
+    if (was_oorasu) {
+        bool dealer_is_top = true;
+        for (PlayerId p = 0; p < kNumPlayers; ++p) {
+            if (p != rs.dealer && ms.scores[p] > ms.scores[rs.dealer]) {
+                dealer_is_top = false;
+                break;
+            }
+        }
+
+        // 和了止め: オーラス親がトップで和了
+        if (renchan && dealer_is_top &&
+            (rs.end_reason == RoundEndReason::Tsumo || rs.end_reason == RoundEndReason::Ron)) {
+            ms.is_match_over = true;
+            ms.compute_ranking();
+            return true;
+        }
+
+        // 聴牌止め: オーラス親がトップで流局テンパイ
+        if (renchan && dealer_is_top && rs.end_reason == RoundEndReason::ExhaustiveDraw) {
+            ms.is_match_over = true;
+            ms.compute_ranking();
+            return true;
+        }
+    }
+
+    // --- 延長局終了判定 ---
+    if (ms.is_extra_round && was_oorasu) {
+        ms.is_match_over = true;
+        ms.compute_ranking();
+        return true;
+    }
+
+    // --- 通常終了判定（advance_round での round_number 更新を先取り計算）---
+    uint8_t next_round = renchan ? ms.round_number : static_cast<uint8_t>(ms.round_number + 1);
+    if (next_round == 8 && !ms.is_extra_round) {
+        int32_t top_score = *std::max_element(ms.scores.begin(), ms.scores.end());
+        if (top_score >= 30000) {
+            ms.is_match_over = true;
+            ms.compute_ranking();
+            return true;
+        }
+        // top_score < 30000 → 延長局へ（advance_round で処理）
+    } else if (next_round > 8) {
+        ms.is_match_over = true;
+        ms.compute_ranking();
+        return true;
+    }
+
+    return false;
 }
 
 // ============================
@@ -1193,6 +1330,12 @@ void GameEngine::advance_round(EnvironmentState& env) {
 
     // --- 次の局を開始 ---
     init_round(env);
+
+    // Debug モードでは新局開始後の整合性を検証（CQ-0031）
+    if (env.run_mode == RunMode::Debug) {
+        auto vr = state_validator::validate(env);
+        assert(vr.valid && "advance_round 後の状態が不整合");
+    }
 }
 
 // ============================

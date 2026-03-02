@@ -35,13 +35,13 @@ struct StepResult {
 class GameEngine {
 public:
     // 半荘リセット（起家をRNGで決定）
-    void reset_match(EnvironmentState& env, uint64_t seed, RunMode mode = RunMode::Debug);
+    void reset_match(EnvironmentState& env, uint64_t seed, RunMode mode = RunMode::Fast);
 
     // 半荘リセット（起家指定）
-    void reset_match(EnvironmentState& env, uint64_t seed, PlayerId first_dealer, RunMode mode = RunMode::Debug);
+    void reset_match(EnvironmentState& env, uint64_t seed, PlayerId first_dealer, RunMode mode = RunMode::Fast);
 
     // 1局モードリセット（局面注入）
-    ErrorCode reset_round(EnvironmentState& env, const RoundConfig& config, RunMode mode = RunMode::Debug);
+    ErrorCode reset_round(EnvironmentState& env, const RoundConfig& config, RunMode mode = RunMode::Fast);
 
     // 1アクションを実行する
     StepResult step(EnvironmentState& env, const Action& action);
@@ -93,6 +93,9 @@ private:
 
     // 局清算（CQ-0018, CQ-0019）
     void settle_round(EnvironmentState& env, StepResult& result);
+
+    // 半荘終了判定（CQ-0032: settle_round 後に呼び、match_over を判定する）
+    bool check_match_over(EnvironmentState& env) const;
 
     // 合法手列挙の内部
     std::vector<Action> get_self_actions(const EnvironmentState& env) const;

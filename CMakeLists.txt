@@ -25,12 +25,22 @@ add_library(mahjong_core STATIC
     src/rules/yaku.cpp
     src/rules/fu_calculator.cpp
     src/rules/score_calculator.cpp
+    src/engine/state_validator.cpp
+    src/rl/observation.cpp
+    src/rl/reward_policy.cpp
+    src/rl/search_utils.cpp
+    src/io/game_record.cpp
+    src/io/display.cpp
 )
 target_include_directories(mahjong_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
 # サンプル実行ファイル
 add_executable(mahjong_example examples/main.cpp)
 target_link_libraries(mahjong_example PRIVATE mahjong_core)
+
+# CLI デバッグ実行ツール
+add_executable(mahjong_cli tools/mahjong_cli.cpp)
+target_link_libraries(mahjong_cli PRIVATE mahjong_core)
 
 # テスト
 enable_testing()
@@ -66,7 +76,15 @@ add_executable(mahjong_tests
     tests/unit/furiten_naki_test.cpp
     tests/unit/multi_ron_test.cpp
     tests/unit/oorasu_test.cpp
+    tests/unit/state_validator_test.cpp
+    tests/unit/observation_test.cpp
+    tests/unit/reward_policy_test.cpp
+    tests/unit/search_utils_test.cpp
+    tests/unit/game_record_test.cpp
+    tests/unit/debug_fast_test.cpp
+    tests/unit/reproducibility_test.cpp
     tests/integration/round_flow_test.cpp
+    tests/replay/replay_test.cpp
 )
 target_link_libraries(mahjong_tests PRIVATE mahjong_core GTest::gtest_main)
 target_include_directories(mahjong_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

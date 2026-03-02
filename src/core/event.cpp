@@ -70,12 +70,12 @@ Event Event::make_pon(PlayerId actor, TileId called, PlayerId from) {
     return e;
 }
 
-Event Event::make_kan(PlayerId actor, MeldType kan_type) {
+Event Event::make_kan(PlayerId actor, MeldType kan_type, TileId tile) {
     Event e{};
     e.type = EventType::Kan;
     e.actor = actor;
     e.target = 255;
-    e.tile = 255;
+    e.tile = tile;
     e.meld_type = kan_type;
     e.riichi = false;
     e.round_end_reason = RoundEndReason::None;
