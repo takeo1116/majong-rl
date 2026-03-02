@@ -19,6 +19,12 @@ add_library(mahjong_core STATIC
     src/core/round_state.cpp
     src/core/match_state.cpp
     src/core/environment_state.cpp
+    src/engine/hand_utils.cpp
+    src/engine/game_engine.cpp
+    src/rules/agari.cpp
+    src/rules/yaku.cpp
+    src/rules/fu_calculator.cpp
+    src/rules/score_calculator.cpp
 )
 target_include_directories(mahjong_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 
@@ -44,6 +50,17 @@ add_executable(mahjong_tests
     tests/unit/event_test.cpp
     tests/unit/state_test.cpp
     tests/unit/environment_test.cpp
+    tests/unit/phase_test.cpp
+    tests/unit/hand_utils_test.cpp
+    tests/unit/game_engine_test.cpp
+    tests/unit/round_reset_test.cpp
+    tests/unit/illegal_action_test.cpp
+    tests/unit/agari_test.cpp
+    tests/unit/yaku_test.cpp
+    tests/unit/fu_calculator_test.cpp
+    tests/unit/score_calculator_test.cpp
+    tests/unit/ippatsu_test.cpp
+    tests/integration/round_flow_test.cpp
 )
 target_link_libraries(mahjong_tests PRIVATE mahjong_core GTest::gtest_main)
 target_include_directories(mahjong_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

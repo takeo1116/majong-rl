@@ -3,9 +3,9 @@
 namespace mahjong {
 
 // 山のうちツモ可能な範囲: wall_position から (kNumTiles - 14 - rinshan_draw_count) 未満
-// 王牌は末尾14枚だが、嶺上ツモで使った分は山側に開放されない
+// 各槓ごとに嶺上牌を消費し、山の末端から1枚が王牌に移る扱い
 int RoundState::remaining_draws() const {
-    int drawable_end = kNumTiles - 14;  // 王牌を除く
+    int drawable_end = kNumTiles - 14 - rinshan_draw_count;
     return drawable_end - wall_position;
 }
 
@@ -26,10 +26,12 @@ void RoundState::reset(uint8_t round_num, PlayerId dealer_id, uint8_t honba_coun
     recent_events.clear();
     end_reason = RoundEndReason::None;
     phase = Phase::StartRound;
-    response_context = ResponseContext{};
+    response_context.reset();
     total_kan_count = 0;
     rinshan_draw_count = 0;
     first_draw.fill(true);
+    just_called = false;
+    last_call_tile_type = 255;
 
     // 各プレイヤーを初期化
     for (PlayerId i = 0; i < kNumPlayers; ++i) {

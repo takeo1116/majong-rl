@@ -42,6 +42,9 @@ struct MatchState {
     // 現在がオーラスかどうか
     bool is_oorasu() const;
 
+    // 比較
+    bool operator==(const MatchState&) const = default;
+
     // 初期化
     void reset(PlayerId dealer = 0);
 

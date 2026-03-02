@@ -25,6 +25,9 @@ struct Meld {
     // 副露に含まれる TileType を返す（チーの場合は最小の type）
     TileType base_type() const;
 
+    // 比較
+    bool operator==(const Meld&) const = default;
+
     // 文字列表現
     std::string to_string() const;
 };

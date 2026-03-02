@@ -12,9 +12,25 @@ namespace mahjong {
 
 // 応答コンテキスト（他家打牌に対する応答待ち情報）
 struct ResponseContext {
-    PlayerId discarder;           // 打牌者
-    TileId discard_tile;          // 打牌された牌
-    bool active = false;          // 応答待ち中かどうか
+    PlayerId discarder = 255;           // 打牌者
+    TileId discard_tile = 255;          // 打牌された牌
+    bool active = false;                // 応答待ち中かどうか
+
+    // 各プレイヤーの応答（ResponsePhase 中に収集）
+    std::array<Action, kNumPlayers> responses;
+    std::array<bool, kNumPlayers> has_responded = {};
+    // 応答が必要なプレイヤーの一覧
+    std::array<bool, kNumPlayers> needs_response = {};
+
+    void reset() {
+        discarder = 255;
+        discard_tile = 255;
+        active = false;
+        has_responded.fill(false);
+        needs_response.fill(false);
+    }
+
+    bool operator==(const ResponseContext&) const = default;
 };
 
 // 局状態
@@ -87,11 +103,18 @@ struct RoundState {
     // 第一ツモ巡かどうか（九種九牌の判定用）
     std::array<bool, kNumPlayers> first_draw;
 
+    // 喰い替えチェック用
+    bool just_called = false;
+    TileType last_call_tile_type = 255;
+
     // 局が終了しているかどうか
     bool is_round_over() const { return end_reason != RoundEndReason::None; }
 
     // ツモ可能な残り枚数を返す
     int remaining_draws() const;
+
+    // 比較
+    bool operator==(const RoundState&) const = default;
 
     // 初期化
     void reset(uint8_t round_num, PlayerId dealer_id, uint8_t honba_count, uint8_t kyotaku_count);

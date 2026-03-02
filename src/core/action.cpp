@@ -147,6 +147,7 @@ bool Action::operator==(const Action& other) const {
         && actor == other.actor
         && tile == other.tile
         && target_player == other.target_player
+        && meld_type == other.meld_type
         && riichi == other.riichi
         && consumed_tiles == other.consumed_tiles;
 }

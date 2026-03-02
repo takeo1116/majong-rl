@@ -35,6 +35,9 @@ struct Event {
     static Event make_round_end(RoundEndReason reason);
     static Event make_match_end();
 
+    // 比較
+    bool operator==(const Event&) const = default;
+
     // 文字列表現
     std::string to_string() const;
 };

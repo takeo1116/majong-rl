@@ -13,6 +13,8 @@ namespace mahjong {
 struct Rng {
     std::mt19937 engine;
 
+    bool operator==(const Rng& other) const { return engine == other.engine; }
+
     // seed で初期化
     void seed(uint64_t s) { engine.seed(static_cast<std::mt19937::result_type>(s)); }
 
@@ -40,6 +42,9 @@ struct EnvironmentState {
 
     // seed で環境を初期化する
     void reset(uint64_t seed, RunMode mode = RunMode::Debug);
+
+    // 比較
+    bool operator==(const EnvironmentState&) const = default;
 
     // seed + 起家指定で初期化する
     void reset(uint64_t seed, PlayerId first_dealer, RunMode mode = RunMode::Debug);

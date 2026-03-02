@@ -60,6 +60,26 @@ TEST(ActionTest, Equality) {
     EXPECT_NE(a1, a3);
 }
 
+TEST(ActionTest, EqualityDetectsMeldTypeDifference) {
+    // meld_type だけが異なる2つの Action を比較して != を検出できること
+    Action a1 = Action::make_pon(0, 0, 1, 2, 3);
+    Action a2 = a1;
+    EXPECT_EQ(a1, a2);
+
+    // meld_type を書き換え
+    a2.meld_type = MeldType::Daiminkan;
+    EXPECT_NE(a1, a2);
+}
+
+TEST(ActionTest, EqualityMeldTypeConsistentAcrossFactories) {
+    // 各ファクトリが正しい meld_type を設定していることを確認
+    EXPECT_EQ(Action::make_chi(0, 0, 4, 8).meld_type, MeldType::Chi);
+    EXPECT_EQ(Action::make_pon(0, 0, 1, 2, 3).meld_type, MeldType::Pon);
+    EXPECT_EQ(Action::make_daiminkan(0, 0, 1).meld_type, MeldType::Daiminkan);
+    EXPECT_EQ(Action::make_kakan(0, 0).meld_type, MeldType::Kakan);
+    EXPECT_EQ(Action::make_ankan(0, 0).meld_type, MeldType::Ankan);
+}
+
 TEST(ActionTest, ToString) {
     Action a = Action::make_discard(0, 4, true);
     std::string s = a.to_string();

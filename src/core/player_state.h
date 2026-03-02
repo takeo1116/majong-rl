@@ -13,6 +13,8 @@ struct DiscardInfo {
     TileId tile;
     bool riichi_discard;  // 立直宣言打牌かどうか
     bool called;          // 他家に鳴かれたかどうか
+
+    bool operator==(const DiscardInfo&) const = default;
 };
 
 // プレイヤー状態
@@ -59,6 +61,9 @@ struct PlayerState {
 
     // 初期化
     void reset(Wind wind, int32_t initial_score = 25000);
+
+    // 比較
+    bool operator==(const PlayerState&) const = default;
 
     // 手牌枚数を返す
     int hand_count() const { return static_cast<int>(hand.size()); }
