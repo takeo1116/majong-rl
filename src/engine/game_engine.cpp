@@ -1,11 +1,36 @@
 #include "engine/game_engine.h"
 #include "engine/hand_utils.h"
+#include "rules/agari.h"
+#include "rules/score_calculator.h"
 #include <algorithm>
 #include <cassert>
 #include <numeric>
 #include <set>
 
 namespace mahjong {
+
+namespace {
+
+// フリテン判定: 通常フリテン・同巡内フリテン・立直後フリテンのいずれか
+bool is_player_furiten(const PlayerState& player) {
+    if (player.is_temporary_furiten) return true;
+    if (player.is_riichi_furiten) return true;
+
+    // 通常フリテン: 自分の捨て牌に待ち牌があるか
+    auto counts = hand_utils::make_type_counts(player.hand);
+    auto waits = hand_utils::get_waits(counts);
+    if (waits.empty()) return false;
+
+    for (const auto& di : player.discards) {
+        TileType dt = di.tile / 4;
+        for (TileType w : waits) {
+            if (dt == w) return true;
+        }
+    }
+    return false;
+}
+
+}  // anonymous namespace
 
 // ============================
 // フェーズ遷移の検証（CQ-0006）
@@ -250,17 +275,26 @@ StepResult GameEngine::step(EnvironmentState& env, const Action& action) {
     }
 
     // フェーズに応じたアクション処理
+    StepResult result;
     switch (rs.phase) {
         case Phase::SelfActionPhase:
-            return process_self_action(env, action);
+            result = process_self_action(env, action);
+            break;
         case Phase::ResponsePhase:
-            return process_response(env, action);
-        default: {
-            StepResult result;
+            result = process_response(env, action);
+            break;
+        default:
             result.error = ErrorCode::WrongPhase;
             return result;
-        }
     }
+
+    // 局終了時の清算（CQ-0018, CQ-0019）
+    // 次局進行は advance_round() を外部から呼ぶ
+    if (result.round_over && result.error == ErrorCode::Ok) {
+        settle_round(env, result);
+    }
+
+    return result;
 }
 
 // ============================
@@ -350,7 +384,8 @@ StepResult GameEngine::process_self_action(EnvironmentState& env, const Action& 
             if (has_any_response(env, action.actor, action.tile)) {
                 setup_response_phase(env, action.actor, action.tile);
             } else {
-                // 応答なし → 次のプレイヤーのツモ
+                // 応答なし → フリテン更新後に次のプレイヤーのツモ（CQ-0017）
+                update_furiten_on_discard(env, action.actor, action.tile);
                 advance_to_next_draw(env, result);
             }
             break;
@@ -458,10 +493,13 @@ StepResult GameEngine::process_self_action(EnvironmentState& env, const Action& 
             // 全員の第一ツモ巡を終了
             rs.first_draw.fill(false);
 
-            // TODO: 槍槓チェック（CQ-0016 で実装）
-
-            // 嶺上ツモ
-            draw_rinshan(env, action.actor, result);
+            // 槍槓チェック: 他家がロンできるか確認（CQ-0016）
+            if (has_chankan_response(env, action.actor, added)) {
+                setup_chankan_response_phase(env, action.actor, added);
+            } else {
+                // 槍槓なし → 嶺上ツモ
+                draw_rinshan(env, action.actor, result);
+            }
             break;
         }
         case ActionType::Kyuushu: {
@@ -536,10 +574,12 @@ void GameEngine::resolve_responses(EnvironmentState& env, StepResult& result) {
         for (PlayerId winner : ron_players) {
             result.events.push_back(Event::make_ron(winner, ctx.discarder));
         }
-        // 河の牌を「鳴かれた」に
-        auto& discarder = rs.players[ctx.discarder];
-        if (!discarder.discards.empty()) {
-            discarder.discards.back().called = true;
+        // 河の牌を「鳴かれた」に（通常ロンの場合のみ、槍槓の場合は河に牌がない）
+        if (!ctx.is_chankan_response) {
+            auto& discarder = rs.players[ctx.discarder];
+            if (!discarder.discards.empty()) {
+                discarder.discards.back().called = true;
+            }
         }
         rs.end_reason = RoundEndReason::Ron;
         rs.phase = Phase::EndRound;
@@ -548,6 +588,18 @@ void GameEngine::resolve_responses(EnvironmentState& env, StepResult& result) {
         ctx.active = false;
         return;
     }
+
+    // 槍槓応答で全員スキップ → フリテン更新後に嶺上ツモ
+    if (ctx.is_chankan_response) {
+        update_furiten_on_discard(env, ctx.discarder, ctx.discard_tile);
+        ctx.active = false;
+        draw_rinshan(env, ctx.discarder, result);
+        return;
+    }
+
+    // ロン不成立 → フリテン更新（CQ-0017）
+    // ポン/チー等で同巡内フリテンはリセットされるが、立直後フリテンは永続
+    update_furiten_on_discard(env, ctx.discarder, ctx.discard_tile);
 
     // ポン / 大明槓判定（放銃者から反時計回りの近い順）
     PlayerId pon_player = 255;
@@ -596,11 +648,9 @@ void GameEngine::resolve_responses(EnvironmentState& env, StepResult& result) {
         // 全員の第一ツモ巡を終了
         rs.first_draw.fill(false);
 
-        // 同巡内フリテンをリセット（ポンした人以外の全員）
+        // 鳴きにより巡が変わるため、全員の同巡内フリテンをリセット
         for (PlayerId p = 0; p < kNumPlayers; ++p) {
-            if (p != pon_player) {
-                rs.players[p].is_temporary_furiten = false;
-            }
+            rs.players[p].is_temporary_furiten = false;
         }
 
         // 喰い替え追跡
@@ -654,6 +704,11 @@ void GameEngine::resolve_responses(EnvironmentState& env, StepResult& result) {
                 // 全員の第一ツモ巡を終了
                 rs.first_draw.fill(false);
 
+                // 鳴きにより巡が変わるため、全員の同巡内フリテンをリセット（CQ-0034）
+                for (PlayerId p = 0; p < kNumPlayers; ++p) {
+                    rs.players[p].is_temporary_furiten = false;
+                }
+
                 // 大明槓は次巡捨牌時にドラ公開
                 rs.pending_kan_dora = true;
 
@@ -701,6 +756,11 @@ void GameEngine::resolve_responses(EnvironmentState& env, StepResult& result) {
         // 全員の第一ツモ巡を終了
         rs.first_draw.fill(false);
 
+        // 鳴きにより巡が変わるため、全員の同巡内フリテンをリセット（CQ-0034）
+        for (PlayerId p = 0; p < kNumPlayers; ++p) {
+            rs.players[p].is_temporary_furiten = false;
+        }
+
         // 喰い替え追跡
         rs.just_called = true;
         rs.last_call_tile_type = ctx.discard_tile / 4;
@@ -714,12 +774,9 @@ void GameEngine::resolve_responses(EnvironmentState& env, StepResult& result) {
     }
 
     // 全員スキップ → 次のプレイヤーのツモ
+    // （同巡内フリテンは update_furiten_on_discard で既に設定済み、
+    //   各プレイヤーの draw_tile 時にリセットされる）
     ctx.active = false;
-
-    // 同巡内フリテンをリセット
-    for (PlayerId p = 0; p < kNumPlayers; ++p) {
-        rs.players[p].is_temporary_furiten = false;
-    }
 
     advance_to_next_draw(env, result);
 }
@@ -730,6 +787,9 @@ void GameEngine::resolve_responses(EnvironmentState& env, StepResult& result) {
 
 void GameEngine::draw_tile(EnvironmentState& env, PlayerId player, StepResult& result) {
     auto& rs = env.round_state;
+
+    // ツモ時に同巡内フリテンをリセット（CQ-0017）
+    rs.players[player].is_temporary_furiten = false;
 
     if (rs.remaining_draws() <= 0) {
         // 荒牌平局
@@ -774,6 +834,368 @@ void GameEngine::advance_to_next_draw(EnvironmentState& env, StepResult& result)
 }
 
 // ============================
+// フリテン更新（CQ-0017）
+// ============================
+
+void GameEngine::update_furiten_on_discard(EnvironmentState& env, PlayerId discarder, TileId tile) {
+    auto& rs = env.round_state;
+    TileType tile_type = tile / 4;
+
+    for (PlayerId p = 0; p < kNumPlayers; ++p) {
+        if (p == discarder) continue;
+        const auto& player = rs.players[p];
+        auto counts = hand_utils::make_type_counts(player.hand);
+        counts[tile_type]++;
+        if (hand_utils::is_agari(counts)) {
+            // この牌は p の和了牌だが、p がロンしなかった
+            rs.players[p].is_temporary_furiten = true;
+            if (player.is_riichi) {
+                rs.players[p].is_riichi_furiten = true;
+            }
+        }
+    }
+}
+
+// ============================
+// 局清算（CQ-0018, CQ-0019）
+// ============================
+
+namespace {
+
+// WinContext を構築するヘルパー
+WinContext build_win_context(
+    const RoundState& rs,
+    PlayerId winner,
+    TileType agari_tile,
+    bool is_tsumo,
+    bool is_chankan)
+{
+    const auto& player = rs.players[winner];
+    WinContext ctx{};
+    ctx.agari_tile = agari_tile;
+    ctx.is_tsumo = is_tsumo;
+    ctx.is_menzen = player.is_menzen;
+    ctx.is_riichi = player.is_riichi;
+    ctx.is_ippatsu = player.ippatsu;
+    ctx.is_rinshan = player.rinshan_draw;
+    ctx.is_chankan = is_chankan;
+    ctx.is_haitei = is_tsumo && rs.remaining_draws() == 0;
+    ctx.is_houtei = !is_tsumo && rs.remaining_draws() == 0;
+
+    // 場風・自風を TileType に変換（東=27, 南=28, 西=29, 北=30）
+    Wind bakaze = (rs.round_number < 4) ? Wind::East : Wind::South;
+    ctx.bakaze = static_cast<TileType>(27 + static_cast<int>(bakaze));
+    ctx.jikaze = static_cast<TileType>(27 + static_cast<int>(player.jikaze));
+
+    // 全牌ID（手牌 + 副露）
+    for (TileId t : player.hand) ctx.all_tile_ids.push_back(t);
+    for (const auto& meld : player.melds) {
+        for (int i = 0; i < meld.tile_count; ++i) {
+            ctx.all_tile_ids.push_back(meld.tiles[i]);
+        }
+    }
+
+    // ドラ表示牌
+    for (TileId ind : rs.dora_indicators) {
+        ctx.dora_indicators.push_back(ind / 4);
+    }
+
+    // 裏ドラ（立直者のみ）
+    if (player.is_riichi) {
+        for (TileId ind : rs.uradora_indicators) {
+            ctx.uradora_indicators.push_back(ind / 4);
+        }
+    }
+
+    return ctx;
+}
+
+}  // anonymous namespace
+
+void GameEngine::settle_round(EnvironmentState& env, StepResult& result) {
+    auto& rs = env.round_state;
+    auto& ms = env.match_state;
+
+    switch (rs.end_reason) {
+        case RoundEndReason::Tsumo: {
+            // ツモ和了の精算（CQ-0019）
+            PlayerId winner = rs.current_player;
+            const auto& player = rs.players[winner];
+            TileType agari_tile = player.hand.back() / 4;
+
+            auto ctx = build_win_context(rs, winner, agari_tile, true, false);
+            auto counts = hand_utils::make_type_counts(player.hand);
+            auto decomps = agari::enumerate_decompositions(counts, player.melds);
+            bool is_dealer = (winner == rs.dealer);
+            auto score_result = score_calculator::calculate_win_score(decomps, ctx, is_dealer, rs.honba);
+
+            if (score_result.valid) {
+                // ツモ精算: 他家から支払い
+                for (PlayerId p = 0; p < kNumPlayers; ++p) {
+                    if (p == winner) continue;
+                    int payment;
+                    if (is_dealer) {
+                        payment = score_result.payment.from_non_dealer;
+                    } else {
+                        payment = (p == rs.dealer)
+                            ? score_result.payment.from_dealer
+                            : score_result.payment.from_non_dealer;
+                    }
+                    rs.players[p].score -= payment;
+                    rs.players[winner].score += payment;
+                }
+
+                // 供託棒を和了者が取得
+                rs.players[winner].score += rs.kyotaku * 1000;
+            }
+
+            // リワード計算
+            for (PlayerId p = 0; p < kNumPlayers; ++p) {
+                result.rewards[p] = static_cast<float>(rs.players[p].score - ms.scores[p]);
+            }
+            break;
+        }
+        case RoundEndReason::Ron: {
+            // ロン和了の精算（CQ-0019: ダブロン・トリプルロン対応）
+            const auto& ctx_resp = rs.response_context;
+            TileId ron_tile = ctx_resp.discard_tile;
+            TileType agari_tile = ron_tile / 4;
+            PlayerId discarder = ctx_resp.discarder;
+            bool is_chankan = ctx_resp.is_chankan_response;
+
+            // ロン和了者を収集（放銃者から反時計回りの近い順 = 優先順）
+            std::vector<PlayerId> winners;
+            for (int offset = 1; offset <= 3; ++offset) {
+                PlayerId p = (discarder + offset) % kNumPlayers;
+                if (ctx_resp.has_responded[p] && ctx_resp.responses[p].type == ActionType::Ron) {
+                    winners.push_back(p);
+                }
+            }
+
+            for (size_t i = 0; i < winners.size(); ++i) {
+                PlayerId winner = winners[i];
+                const auto& player = rs.players[winner];
+
+                // ロン和了: 手牌にロン牌を加えてから分解
+                auto hand_with_ron = player.hand;
+                hand_with_ron.push_back(ron_tile);
+                auto counts = hand_utils::make_type_counts(hand_with_ron);
+                auto decomps = agari::enumerate_decompositions(counts, player.melds);
+
+                auto win_ctx = build_win_context(rs, winner, agari_tile, false, is_chankan);
+                // ロン牌を all_tile_ids に追加（手牌には含まれていないため）
+                win_ctx.all_tile_ids.push_back(ron_tile);
+
+                bool is_dealer = (winner == rs.dealer);
+                auto score_result = score_calculator::calculate_win_score(decomps, win_ctx, is_dealer, rs.honba);
+
+                if (score_result.valid) {
+                    // ロン精算: 放銃者から支払い
+                    // 積み棒は各和了者にそれぞれ加算（CQ-0019）
+                    rs.players[discarder].score -= score_result.payment.from_ron;
+                    rs.players[winner].score += score_result.payment.from_ron;
+                }
+
+                // 供託棒は最優先和了者（最初の1人）が総取り（CQ-0019）
+                if (i == 0) {
+                    rs.players[winner].score += rs.kyotaku * 1000;
+                }
+            }
+
+            // リワード計算
+            for (PlayerId p = 0; p < kNumPlayers; ++p) {
+                result.rewards[p] = static_cast<float>(rs.players[p].score - ms.scores[p]);
+            }
+            break;
+        }
+        case RoundEndReason::ExhaustiveDraw: {
+            // 通常流局: ノーテン罰符（CQ-0018）
+            std::vector<PlayerId> tenpai_players;
+            std::vector<PlayerId> noten_players;
+            for (PlayerId p = 0; p < kNumPlayers; ++p) {
+                auto counts = hand_utils::make_type_counts(rs.players[p].hand);
+                if (hand_utils::is_tenpai(counts)) {
+                    tenpai_players.push_back(p);
+                } else {
+                    noten_players.push_back(p);
+                }
+            }
+
+            // 全員テンパイまたは全員ノーテンの場合は移動なし
+            if (!tenpai_players.empty() && !noten_players.empty()) {
+                int pay_per_noten = 3000 / static_cast<int>(noten_players.size());
+                int recv_per_tenpai = 3000 / static_cast<int>(tenpai_players.size());
+
+                for (PlayerId p : noten_players) {
+                    rs.players[p].score -= pay_per_noten;
+                }
+                for (PlayerId p : tenpai_players) {
+                    rs.players[p].score += recv_per_tenpai;
+                }
+            }
+
+            // リワード計算
+            for (PlayerId p = 0; p < kNumPlayers; ++p) {
+                result.rewards[p] = static_cast<float>(rs.players[p].score - ms.scores[p]);
+            }
+            break;
+        }
+        case RoundEndReason::AbortiveKyuushu:
+            // 九種九牌: 点数移動なし（CQ-0018）
+            break;
+        default:
+            break;
+    }
+
+    // MatchState のスコアを同期
+    for (PlayerId p = 0; p < kNumPlayers; ++p) {
+        ms.scores[p] = rs.players[p].score;
+    }
+}
+
+// ============================
+// 次局進行（CQ-0018, CQ-0020）
+// ============================
+
+void GameEngine::advance_round(EnvironmentState& env) {
+    auto& rs = env.round_state;
+    auto& ms = env.match_state;
+
+    // --- 飛び終了チェック（CQ-0020）---
+    for (PlayerId p = 0; p < kNumPlayers; ++p) {
+        if (ms.scores[p] < 0) {
+            ms.is_match_over = true;
+            ms.compute_ranking();
+            return;
+        }
+    }
+
+    // --- 連荘判定（CQ-0018, CQ-0019）---
+    bool renchan = false;
+
+    switch (rs.end_reason) {
+        case RoundEndReason::Tsumo:
+            // 親がツモ和了 → 連荘
+            renchan = (rs.current_player == rs.dealer);
+            break;
+        case RoundEndReason::Ron: {
+            // 親がロン和了者に含まれる → 連荘（CQ-0019）
+            const auto& ctx = rs.response_context;
+            for (PlayerId p = 0; p < kNumPlayers; ++p) {
+                if (ctx.has_responded[p] && ctx.responses[p].type == ActionType::Ron && p == rs.dealer) {
+                    renchan = true;
+                    break;
+                }
+            }
+            break;
+        }
+        case RoundEndReason::ExhaustiveDraw: {
+            // 親テンパイ → 連荘（CQ-0018）
+            auto counts = hand_utils::make_type_counts(rs.players[rs.dealer].hand);
+            renchan = hand_utils::is_tenpai(counts);
+            break;
+        }
+        case RoundEndReason::AbortiveKyuushu:
+            // 九種九牌 → 親流れ（CQ-0018）
+            renchan = false;
+            break;
+        default:
+            break;
+    }
+
+    // --- 本場・供託更新 ---
+    switch (rs.end_reason) {
+        case RoundEndReason::Tsumo:
+        case RoundEndReason::Ron:
+            if (renchan) {
+                ms.honba++;
+            } else {
+                ms.honba = 0;
+            }
+            ms.kyotaku = 0;  // 和了者が取得済み
+            break;
+        case RoundEndReason::ExhaustiveDraw:
+            ms.honba++;
+            // 供託は持ち越し
+            ms.kyotaku = rs.kyotaku;
+            break;
+        case RoundEndReason::AbortiveKyuushu:
+            // 積み棒・供託は持ち越し
+            break;
+        default:
+            break;
+    }
+
+    // --- 局番号更新 ---
+    if (!renchan) {
+        ms.round_number++;
+    }
+    ms.current_dealer = (ms.first_dealer + ms.round_number % kNumPlayers) % kNumPlayers;
+
+    // --- オーラス終了判定（CQ-0020）---
+    bool was_oorasu = (rs.round_number >= 7);  // 南4局以降
+
+    if (was_oorasu) {
+        bool dealer_is_top = true;
+        for (PlayerId p = 0; p < kNumPlayers; ++p) {
+            if (p != rs.dealer && ms.scores[p] > ms.scores[rs.dealer]) {
+                dealer_is_top = false;
+                break;
+            }
+        }
+
+        // 和了止め: オーラス親がトップで和了
+        if (renchan && dealer_is_top &&
+            (rs.end_reason == RoundEndReason::Tsumo || rs.end_reason == RoundEndReason::Ron)) {
+            ms.is_match_over = true;
+            ms.compute_ranking();
+            return;
+        }
+
+        // 聴牌止め: オーラス親がトップで流局テンパイ
+        if (renchan && dealer_is_top && rs.end_reason == RoundEndReason::ExhaustiveDraw) {
+            ms.is_match_over = true;
+            ms.compute_ranking();
+            return;
+        }
+    }
+
+    // --- 延長局終了判定（CQ-0020）---
+    // 延長局が終了した場合は必ず終了（延長は1局のみ）
+    // ※ 延長局遷移の前に判定する（遷移直後に誤判定しないため）
+    if (ms.is_extra_round && was_oorasu) {
+        ms.is_match_over = true;
+        ms.compute_ranking();
+        return;
+    }
+
+    // --- 延長局遷移・通常終了判定（CQ-0020）---
+    if (ms.round_number == 8 && !ms.is_extra_round) {
+        // 南4局終了 → トップが30000点未満なら延長局
+        int32_t top_score = *std::max_element(ms.scores.begin(), ms.scores.end());
+        if (top_score < 30000) {
+            ms.is_extra_round = true;
+            // round_number = 8 のまま延長局へ
+        } else {
+            // トップが30000点以上 → 終了
+            ms.is_match_over = true;
+            ms.compute_ranking();
+            return;
+        }
+    } else if (ms.round_number > 8) {
+        // 延長局を超えた → 終了
+        ms.is_match_over = true;
+        ms.compute_ranking();
+        return;
+    }
+
+    if (ms.is_match_over) return;
+
+    // --- 次の局を開始 ---
+    init_round(env);
+}
+
+// ============================
 // 応答チェック・セットアップ
 // ============================
 
@@ -785,10 +1207,10 @@ bool GameEngine::has_any_response(const EnvironmentState& env, PlayerId discarde
         PlayerId p = (discarder + offset) % kNumPlayers;
         const auto& player = rs.players[p];
 
-        // ロンチェック（簡易: 手形のみ、フリテンはCQ-0017で実装）
+        // ロンチェック（フリテン考慮: CQ-0017）
         auto counts = hand_utils::make_type_counts(player.hand);
         counts[discard_type]++;
-        if (hand_utils::is_agari(counts)) return true;
+        if (hand_utils::is_agari(counts) && !is_player_furiten(player)) return true;
         counts[discard_type]--;
 
         // ポンチェック
@@ -864,10 +1286,10 @@ void GameEngine::setup_response_phase(EnvironmentState& env, PlayerId discarder,
         const auto& player = rs.players[p];
         bool has_option = false;
 
-        // ロンチェック
+        // ロンチェック（フリテン考慮: CQ-0017）
         auto counts = hand_utils::make_type_counts(player.hand);
         counts[discard_type]++;
-        if (hand_utils::is_agari(counts)) has_option = true;
+        if (hand_utils::is_agari(counts) && !is_player_furiten(player)) has_option = true;
         counts[discard_type]--;
 
         // ポンチェック
@@ -924,6 +1346,68 @@ void GameEngine::setup_response_phase(EnvironmentState& env, PlayerId discarder,
         rs.current_player = first_responder;
     } else {
         // 全員自動スキップ（通常ここには来ない）
+        StepResult dummy;
+        rs.phase = Phase::ResolveResponsePhase;
+        resolve_responses(env, dummy);
+    }
+}
+
+// ============================
+// 槍槓応答チェック（CQ-0016）
+// ============================
+
+bool GameEngine::has_chankan_response(const EnvironmentState& env, PlayerId kakan_player, TileId kakan_tile) const {
+    const auto& rs = env.round_state;
+    TileType kakan_type = kakan_tile / 4;
+
+    for (PlayerId p = 0; p < kNumPlayers; ++p) {
+        if (p == kakan_player) continue;
+        const auto& player = rs.players[p];
+
+        auto counts = hand_utils::make_type_counts(player.hand);
+        counts[kakan_type]++;
+        if (hand_utils::is_agari(counts) && !is_player_furiten(player)) return true;
+    }
+    return false;
+}
+
+void GameEngine::setup_chankan_response_phase(EnvironmentState& env, PlayerId kakan_player, TileId kakan_tile) {
+    auto& rs = env.round_state;
+    auto& ctx = rs.response_context;
+
+    ctx.reset();
+    ctx.discarder = kakan_player;  // 加槓者を放銃者扱い
+    ctx.discard_tile = kakan_tile;
+    ctx.active = true;
+    ctx.is_chankan_response = true;
+
+    TileType kakan_type = kakan_tile / 4;
+
+    for (PlayerId p = 0; p < kNumPlayers; ++p) {
+        if (p == kakan_player) {
+            ctx.has_responded[p] = true;
+            ctx.responses[p] = Action::make_skip(p);
+            continue;
+        }
+
+        const auto& player = rs.players[p];
+        auto counts = hand_utils::make_type_counts(player.hand);
+        counts[kakan_type]++;
+
+        if (hand_utils::is_agari(counts) && !is_player_furiten(player)) {
+            ctx.needs_response[p] = true;
+        } else {
+            ctx.has_responded[p] = true;
+            ctx.responses[p] = Action::make_skip(p);
+        }
+    }
+
+    rs.phase = Phase::ResponsePhase;
+    PlayerId first = find_next_responder(env);
+    if (first != 255) {
+        rs.current_player = first;
+    } else {
+        // 全員自動スキップ（has_chankan_response が true なので通常ここには来ない）
         StepResult dummy;
         rs.phase = Phase::ResolveResponsePhase;
         resolve_responses(env, dummy);
@@ -1002,8 +1486,23 @@ std::vector<Action> GameEngine::get_self_actions(const EnvironmentState& env) co
         std::set<TileType> checked;
         for (int t = 0; t < kNumTileTypes; ++t) {
             if (counts[t] == 4 && checked.insert(static_cast<TileType>(t)).second) {
-                // 立直中は待ち不変チェックが必要（CQ-0016で実装、ここでは単純に許可）
-                actions.push_back(Action::make_ankan(player_id, static_cast<TileType>(t)));
+                if (player.is_riichi) {
+                    // 立直中: 待ちが変化しないか確認（CQ-0016）
+                    TileId drawn_tile = player.hand.back();
+                    auto riichi_counts = counts;
+                    riichi_counts[drawn_tile / 4]--;
+                    auto waits_before = hand_utils::get_waits(riichi_counts);
+
+                    auto after_counts = counts;
+                    after_counts[t] -= 4;
+                    auto waits_after = hand_utils::get_waits(after_counts);
+
+                    if (waits_before == waits_after) {
+                        actions.push_back(Action::make_ankan(player_id, static_cast<TileType>(t)));
+                    }
+                } else {
+                    actions.push_back(Action::make_ankan(player_id, static_cast<TileType>(t)));
+                }
             }
         }
     }
@@ -1042,12 +1541,17 @@ std::vector<Action> GameEngine::get_response_actions(const EnvironmentState& env
 
     TileType discard_type = ctx.discard_tile / 4;
 
-    // --- ロン ---
+    // --- ロン（フリテン考慮: CQ-0017）---
     auto counts = hand_utils::make_type_counts(player.hand);
     counts[discard_type]++;
-    if (hand_utils::is_agari(counts)) {
-        // フリテンチェックは CQ-0017 で実装。ここでは形のみ。
+    if (hand_utils::is_agari(counts) && !is_player_furiten(player)) {
         actions.push_back(Action::make_ron(player_id, ctx.discarder));
+    }
+
+    // 槍槓応答の場合はロンとスキップのみ（CQ-0016）
+    if (ctx.is_chankan_response) {
+        actions.push_back(Action::make_skip(player_id));
+        return actions;
     }
 
     // --- ポン ---

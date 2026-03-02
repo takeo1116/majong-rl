@@ -60,6 +60,12 @@ add_executable(mahjong_tests
     tests/unit/fu_calculator_test.cpp
     tests/unit/score_calculator_test.cpp
     tests/unit/ippatsu_test.cpp
+    tests/unit/chankan_test.cpp
+    tests/unit/furiten_test.cpp
+    tests/unit/settlement_test.cpp
+    tests/unit/furiten_naki_test.cpp
+    tests/unit/multi_ron_test.cpp
+    tests/unit/oorasu_test.cpp
     tests/integration/round_flow_test.cpp
 )
 target_link_libraries(mahjong_tests PRIVATE mahjong_core GTest::gtest_main)

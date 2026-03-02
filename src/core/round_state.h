@@ -15,6 +15,7 @@ struct ResponseContext {
     PlayerId discarder = 255;           // 打牌者
     TileId discard_tile = 255;          // 打牌された牌
     bool active = false;                // 応答待ち中かどうか
+    bool is_chankan_response = false;   // 槍槓応答かどうか
 
     // 各プレイヤーの応答（ResponsePhase 中に収集）
     std::array<Action, kNumPlayers> responses;
@@ -26,6 +27,7 @@ struct ResponseContext {
         discarder = 255;
         discard_tile = 255;
         active = false;
+        is_chankan_response = false;
         has_responded.fill(false);
         needs_response.fill(false);
     }

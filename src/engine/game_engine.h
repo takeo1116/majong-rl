@@ -49,6 +49,9 @@ public:
     // 現在の合法手を列挙する
     std::vector<Action> get_legal_actions(const EnvironmentState& env) const;
 
+    // 次の局へ進む / 半荘終了判定（局終了後に呼ぶ）
+    void advance_round(EnvironmentState& env);
+
     // フェーズ遷移の検証
     static bool is_valid_transition(Phase from, Phase to);
 
@@ -80,6 +83,16 @@ private:
     bool has_any_response(const EnvironmentState& env, PlayerId discarder, TileId tile) const;
     void setup_response_phase(EnvironmentState& env, PlayerId discarder, TileId tile);
     PlayerId find_next_responder(const EnvironmentState& env) const;
+
+    // 槍槓応答チェック（CQ-0016）
+    bool has_chankan_response(const EnvironmentState& env, PlayerId kakan_player, TileId kakan_tile) const;
+    void setup_chankan_response_phase(EnvironmentState& env, PlayerId kakan_player, TileId kakan_tile);
+
+    // フリテン処理（CQ-0017）
+    void update_furiten_on_discard(EnvironmentState& env, PlayerId discarder, TileId tile);
+
+    // 局清算（CQ-0018, CQ-0019）
+    void settle_round(EnvironmentState& env, StepResult& result);
 
     // 合法手列挙の内部
     std::vector<Action> get_self_actions(const EnvironmentState& env) const;
