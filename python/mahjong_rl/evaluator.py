@@ -23,6 +23,7 @@ class EvalMetrics:
     deal_in_rate: float
     num_matches: int
     num_rounds: int
+    policy_seats: list[int] | None = None
 
     def save(self, path: Path) -> None:
         """JSON に保存"""
@@ -34,15 +35,33 @@ class EvalMetrics:
             "num_matches": self.num_matches,
             "num_rounds": self.num_rounds,
         }
+        if self.policy_seats is not None:
+            data["policy_seats"] = self.policy_seats
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
 
 
+@dataclass
+class RotationEvalResult:
+    """席ローテーション評価の集計結果"""
+    per_seat: dict[int, EvalMetrics]
+    aggregate: EvalMetrics
+
+    def save(self, eval_dir: Path) -> None:
+        """席別・総合の結果を eval ディレクトリに保存"""
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        # 席別
+        for seat, metrics in self.per_seat.items():
+            metrics.save(eval_dir / f"eval_seat{seat}.json")
+        # 総合
+        self.aggregate.save(eval_dir / "eval_rotation.json")
+
+
 class EvaluationRunner:
     """評価対戦ランナー
 
-    プレイヤー0=学習ポリシー（argmax）、プレイヤー1-3=ベースライン。
+    指定席=学習ポリシー（argmax）、残り=ベースライン。
     """
 
     def __init__(self, model: torch.nn.Module, encoder, observation_mode: str = "full"):
@@ -57,30 +76,42 @@ class EvaluationRunner:
         num_matches: int = 100,
         seed_start: int = 0,
         eval_dir: Path | None = None,
+        policy_seats: list[int] | None = None,
     ) -> EvalMetrics:
-        """評価対戦を実行して指標を返す"""
+        """評価対戦を実行して指標を返す
+
+        Args:
+            policy_seats: ポリシー席のリスト。None なら [0]。
+                          複数席を指定すると各席で全半荘を実行し平均する。
+        """
+        if policy_seats is None:
+            policy_seats = [0]
+
         all_ranks = []
         all_scores = []
         total_wins = 0
         total_deal_ins = 0
         total_rounds = 0
 
-        for i in range(num_matches):
-            seed = seed_start + i
-            result = self._play_one_match(seed)
-            all_ranks.append(result["rank"])
-            all_scores.append(result["score"])
-            total_wins += result["wins"]
-            total_deal_ins += result["deal_ins"]
-            total_rounds += result["rounds"]
+        for seat in policy_seats:
+            for i in range(num_matches):
+                seed = seed_start + i
+                result = self._play_one_match(seed, policy_seat=seat)
+                all_ranks.append(result["rank"])
+                all_scores.append(result["score"])
+                total_wins += result["wins"]
+                total_deal_ins += result["deal_ins"]
+                total_rounds += result["rounds"]
 
+        total_matches = num_matches * len(policy_seats)
         metrics = EvalMetrics(
             avg_rank=float(np.mean(all_ranks)),
             avg_score=float(np.mean(all_scores)),
             win_rate=total_wins / max(total_rounds, 1),
             deal_in_rate=total_deal_ins / max(total_rounds, 1),
-            num_matches=num_matches,
+            num_matches=total_matches,
             num_rounds=total_rounds,
+            policy_seats=policy_seats,
         )
 
         if eval_dir:
@@ -88,13 +119,59 @@ class EvaluationRunner:
 
         return metrics
 
-    def _play_one_match(self, seed: int) -> dict:
+    def evaluate_rotation(
+        self,
+        num_matches: int = 100,
+        seed_start: int = 0,
+        eval_dir: Path | None = None,
+        seats: list[int] | None = None,
+    ) -> RotationEvalResult:
+        """全席ローテーション評価を実行し、席別・総合の指標を返す
+
+        Args:
+            seats: 評価する席のリスト。None なら [0,1,2,3]。
+        """
+        if seats is None:
+            seats = [0, 1, 2, 3]
+
+        per_seat: dict[int, EvalMetrics] = {}
+        for seat in seats:
+            metrics = self.evaluate(
+                num_matches=num_matches,
+                seed_start=seed_start,
+                policy_seats=[seat],
+            )
+            per_seat[seat] = metrics
+
+        # 総合集計
+        all_metrics = list(per_seat.values())
+        total_matches = sum(m.num_matches for m in all_metrics)
+        total_rounds = sum(m.num_rounds for m in all_metrics)
+        total_wins = sum(m.win_rate * m.num_rounds for m in all_metrics)
+        total_deal_ins = sum(m.deal_in_rate * m.num_rounds for m in all_metrics)
+
+        aggregate = EvalMetrics(
+            avg_rank=float(np.mean([m.avg_rank for m in all_metrics])),
+            avg_score=float(np.mean([m.avg_score for m in all_metrics])),
+            win_rate=total_wins / max(total_rounds, 1),
+            deal_in_rate=total_deal_ins / max(total_rounds, 1),
+            num_matches=total_matches,
+            num_rounds=total_rounds,
+            policy_seats=seats,
+        )
+
+        result = RotationEvalResult(per_seat=per_seat, aggregate=aggregate)
+        if eval_dir:
+            result.save(eval_dir)
+
+        return result
+
+    def _play_one_match(self, seed: int, policy_seat: int = 0) -> dict:
         """1 半荘を実行して結果を返す"""
         env = Stage1Env(observation_mode=self._observation_mode)
         obs, info = env.reset(seed=seed)
 
-        # プレイヤー 0 がポリシー
-        policy_player = 0
+        policy_player = policy_seat
         wins = 0
         deal_ins = 0
         round_count = 0

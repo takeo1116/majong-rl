@@ -198,3 +198,82 @@ class TestSampleTemporalAlignment:
             assert s.legal_mask[s.action] > 0.5, (
                 f"action {s.action} が legal_mask で非合法"
             )
+
+
+class TestBaselineTeacherData:
+    """baseline 教師データ保存テスト (CQ-0042)"""
+
+    def test_save_baseline_actions(self, tmp_path: Path):
+        """save_baseline_actions=True で baseline サンプルが保存される"""
+        config = _make_config(policy_ratio=0.5)
+        config["selfplay"]["save_baseline_actions"] = True
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        worker.run(num_matches=1, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        samples = reader.read_all()
+        assert len(samples) > 0
+
+        actor_types = {s.actor_type for s in samples}
+        assert "baseline" in actor_types
+        assert "policy" in actor_types
+
+    def test_baseline_not_saved_by_default(self, tmp_path: Path):
+        """デフォルトでは baseline サンプルは保存されない"""
+        config = _make_config(policy_ratio=0.5)
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        worker.run(num_matches=1, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        samples = reader.read_all()
+        for s in samples:
+            assert s.actor_type == "policy"
+
+    def test_baseline_identifiable_in_shard(self, tmp_path: Path):
+        """baseline サンプルを actor_type で識別できる"""
+        config = _make_config(policy_ratio=0.0)  # 全席 baseline
+        config["selfplay"]["save_baseline_actions"] = True
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        worker.run(num_matches=1, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        samples = reader.read_all()
+        assert len(samples) > 0
+        for s in samples:
+            assert s.actor_type == "baseline"
+
+    def test_actor_type_in_tensors(self, tmp_path: Path):
+        """read_as_tensors でも actor_types が取れる"""
+        config = _make_config(policy_ratio=0.5)
+        config["selfplay"]["save_baseline_actions"] = True
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        worker.run(num_matches=1, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        tensors = reader.read_as_tensors()
+        assert "actor_types" in tensors
+        assert set(tensors["actor_types"]).issubset({"policy", "baseline"})

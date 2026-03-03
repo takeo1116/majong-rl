@@ -209,3 +209,143 @@ class TestStage1Rules:
         samples = reader.read_all()
         for s in samples:
             assert 0 <= s.action < 34, f"不正な action: {s.action}"
+
+
+class TestStage1ExperimentIntegration:
+    """Stage 1 実験経路の統合テスト (CQ-0047)"""
+
+    def test_run_init_creates_directory(self, tmp_path: Path):
+        """Stage 1 run 初期化でディレクトリ構造が作られる"""
+        from mahjong_rl.experiment import ExperimentConfig, RunDirectory
+
+        config = ExperimentConfig(
+            experiment={"name": "integ_test", "stage": 1, "observation_mode": "full"},
+            feature_encoder={"name": "FlatFeatureEncoder"},
+            model={"name": "MLPPolicyValueModel", "hidden_dims": [32]},
+            reward={"type": "point_delta"},
+            selfplay={"num_matches": 1},
+            training={"algorithm": "ppo", "lr": 0.001, "batch_size": 32, "epochs": 1},
+            evaluation={"num_matches": 1},
+        )
+        run_dir = RunDirectory(base_dir=tmp_path).create(config)
+        assert run_dir.exists()
+        assert (run_dir / "config.yaml").exists()
+        assert (run_dir / "notes.md").exists()
+
+    def test_baseline_teacher_data_saved(self, tmp_path: Path):
+        """baseline 教師データが shard に保存される"""
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = MLPPolicyValueModel(input_dim=encoder.output_dim, hidden_dims=[16])
+
+        config = {
+            "experiment": {"name": "test", "observation_mode": "full"},
+            "selfplay": {"policy_ratio": 0.5, "temperature": 1.0,
+                          "max_samples_per_shard": 10000,
+                          "save_baseline_actions": True},
+        }
+        shard_dir = tmp_path / "shards"
+        worker = SelfPlayWorker(config=config, model=model, encoder=encoder,
+                                output_dir=shard_dir)
+        worker.run(num_matches=1, seed_start=42)
+
+        reader = ShardReader(shard_dir)
+        tensors = reader.read_as_tensors()
+        actor_types = tensors["actor_types"]
+        has_baseline = any(a == "baseline" for a in actor_types)
+        has_policy = any(a == "policy" for a in actor_types)
+        assert has_baseline
+        assert has_policy
+
+    def test_imitation_filter_selects_baseline(self, tmp_path: Path):
+        """imitation 用サンプル選別で baseline のみ抽出できる"""
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = MLPPolicyValueModel(input_dim=encoder.output_dim, hidden_dims=[16])
+
+        config = {
+            "experiment": {"name": "test", "observation_mode": "full"},
+            "selfplay": {"policy_ratio": 0.5, "temperature": 1.0,
+                          "max_samples_per_shard": 10000,
+                          "save_baseline_actions": True},
+        }
+        shard_dir = tmp_path / "shards"
+        worker = SelfPlayWorker(config=config, model=model, encoder=encoder,
+                                output_dir=shard_dir)
+        worker.run(num_matches=1, seed_start=42)
+
+        reader = ShardReader(shard_dir)
+        filtered = reader.read_as_tensors(filter_actor_type="baseline")
+        assert filtered["observations"].shape[0] > 0
+        assert all(a == "baseline" for a in filtered["actor_types"])
+
+    def test_selfplay_learner_eval_pipeline(self, tmp_path: Path):
+        """self-play → learner → eval の一連実行"""
+        from mahjong_rl.experiment import ExperimentConfig
+        from mahjong_rl.runner import Stage1Runner
+
+        config = ExperimentConfig(
+            experiment={"name": "pipeline_test", "stage": 1, "observation_mode": "full"},
+            feature_encoder={"name": "FlatFeatureEncoder", "observation_mode": "full"},
+            model={"name": "MLPPolicyValueModel", "hidden_dims": [32],
+                   "value_heads": ["round_delta"]},
+            reward={"type": "point_delta"},
+            selfplay={"num_matches": 1, "policy_ratio": 1.0, "temperature": 1.0,
+                      "max_samples_per_shard": 10000},
+            training={"algorithm": "ppo", "lr": 0.001, "batch_size": 32,
+                      "epochs": 1, "gamma": 0.99, "gae_lambda": 0.95,
+                      "clip_epsilon": 0.2, "value_loss_coef": 0.5,
+                      "entropy_coef": 0.01, "max_grad_norm": 0.5},
+            evaluation={"num_matches": 1, "seed_start": 100000},
+        )
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert result["selfplay_stats"]["total_steps"] > 0
+        assert result["train_metrics"]["total_steps"] > 0
+        assert 1.0 <= result["eval_metrics"]["avg_rank"] <= 4.0
+
+    def test_rotation_eval_in_pipeline(self, tmp_path: Path):
+        """席ローテーション評価が動作する"""
+        from mahjong_rl.evaluator import EvaluationRunner, RotationEvalResult
+
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = MLPPolicyValueModel(input_dim=encoder.output_dim, hidden_dims=[16])
+
+        runner = EvaluationRunner(model=model, encoder=encoder, observation_mode="full")
+        result = runner.evaluate_rotation(num_matches=1, seed_start=42, seats=[0, 1])
+
+        assert isinstance(result, RotationEvalResult)
+        assert len(result.per_seat) == 2
+        assert result.aggregate.num_matches == 2
+
+    def test_reproducibility_across_runs(self, tmp_path: Path):
+        """同一 config / seed で再現性がある"""
+        from mahjong_rl.experiment import ExperimentConfig
+        from mahjong_rl.runner import Stage1Runner
+
+        def make_config():
+            return ExperimentConfig(
+                experiment={"name": "repro_test", "stage": 1, "observation_mode": "full"},
+                feature_encoder={"name": "FlatFeatureEncoder", "observation_mode": "full"},
+                model={"name": "MLPPolicyValueModel", "hidden_dims": [32],
+                       "value_heads": ["round_delta"]},
+                reward={"type": "point_delta"},
+                selfplay={"num_matches": 1, "policy_ratio": 1.0, "temperature": 1.0,
+                          "max_samples_per_shard": 10000, "seed_start": 42},
+                training={"algorithm": "ppo", "lr": 0.001, "batch_size": 32,
+                          "epochs": 1, "gamma": 0.99, "gae_lambda": 0.95,
+                          "clip_epsilon": 0.2, "value_loss_coef": 0.5,
+                          "entropy_coef": 0.01, "max_grad_norm": 0.5},
+                evaluation={"num_matches": 1, "seed_start": 100000},
+            )
+
+        results = []
+        for i in range(2):
+            torch.manual_seed(0)  # モデル初期化の乱数を固定
+            config = make_config()
+            runner = Stage1Runner(config=config, base_dir=tmp_path / f"run_{i}")
+            result = runner.run()
+            results.append(result)
+
+        # 同一 seed + 同一モデル初期化なので self-play ステップ数は一致
+        assert results[0]["selfplay_stats"]["total_steps"] == results[1]["selfplay_stats"]["total_steps"]

@@ -42,8 +42,16 @@ class Learner:
     def mode(self) -> str:
         return self._mode
 
-    def train(self, shard_dir: Path, num_epochs: int | None = None) -> dict:
+    def train(
+        self,
+        shard_dir: Path,
+        num_epochs: int | None = None,
+        filter_actor_type: str | None = None,
+    ) -> dict:
         """shard データを読み込んで学習を実行する
+
+        Args:
+            filter_actor_type: 指定時、該当 actor_type のサンプルのみ学習に使う
 
         Returns:
             metrics dict: mode, policy_loss, value_loss, entropy, total_steps
@@ -51,7 +59,7 @@ class Learner:
         epochs = num_epochs if num_epochs is not None else self._epochs
 
         reader = ShardReader(shard_dir)
-        data = reader.read_as_tensors()
+        data = reader.read_as_tensors(filter_actor_type=filter_actor_type)
 
         observations = torch.from_numpy(data["observations"])
         legal_masks = torch.from_numpy(data["legal_masks"])

@@ -42,6 +42,7 @@ class LearningSample:
     round_id: int = 0
     step_id: int = 0
     player_id: int = 0
+    actor_type: str = "policy"  # "policy" or "baseline"
 
 
 def validate_metadata(sample: LearningSample) -> None:
@@ -161,6 +162,7 @@ class ShardWriter:
             "round_id": [s.round_id for s in self._buffer],
             "step_id": [s.step_id for s in self._buffer],
             "player_id": [s.player_id for s in self._buffer],
+            "actor_type": [s.actor_type for s in self._buffer],
         }
 
         self._backend.write(data, path)
@@ -217,11 +219,23 @@ class ShardReader:
                     round_id=table.column("round_id")[i].as_py(),
                     step_id=table.column("step_id")[i].as_py(),
                     player_id=table.column("player_id")[i].as_py(),
+                    actor_type=self._read_column_safe(table, "actor_type", i, "policy"),
                 ))
         return samples
 
-    def read_as_tensors(self) -> dict[str, np.ndarray]:
-        """バッチ処理用に numpy 配列群として読み込む"""
+    @staticmethod
+    def _read_column_safe(table: pa.Table, column: str, index: int, default):
+        """カラムが存在すれば読み込み、なければデフォルト値を返す"""
+        if column in table.column_names:
+            return table.column(column)[index].as_py()
+        return default
+
+    def read_as_tensors(self, filter_actor_type: str | None = None) -> dict[str, np.ndarray]:
+        """バッチ処理用に numpy 配列群として読み込む
+
+        Args:
+            filter_actor_type: 指定時、該当 actor_type のサンプルのみ返す
+        """
         all_obs = []
         all_masks = []
         all_actions = []
@@ -229,6 +243,7 @@ class ShardReader:
         all_log_probs = []
         all_values = []
         all_terminateds = []
+        all_actor_types = []
 
         for path in self._find_shards():
             table = self._backend.read(path)
@@ -247,6 +262,10 @@ class ShardReader:
             all_log_probs.extend(table.column("log_prob").to_pylist())
             all_values.extend(table.column("value").to_pylist())
             all_terminateds.extend(table.column("terminated").to_pylist())
+            if "actor_type" in table.column_names:
+                all_actor_types.extend(table.column("actor_type").to_pylist())
+            else:
+                all_actor_types.extend(["policy"] * n)
 
         if not all_obs:
             return {
@@ -257,9 +276,10 @@ class ShardReader:
                 "log_probs": np.zeros(0, dtype=np.float32),
                 "values": np.zeros(0, dtype=np.float32),
                 "terminateds": np.zeros(0, dtype=bool),
+                "actor_types": np.array([], dtype=object),
             }
 
-        return {
+        result = {
             "observations": np.stack(all_obs),
             "legal_masks": np.stack(all_masks),
             "actions": np.array(all_actions, dtype=np.int32),
@@ -267,4 +287,11 @@ class ShardReader:
             "log_probs": np.array(all_log_probs, dtype=np.float32),
             "values": np.array(all_values, dtype=np.float32),
             "terminateds": np.array(all_terminateds, dtype=bool),
+            "actor_types": np.array(all_actor_types, dtype=object),
         }
+
+        if filter_actor_type is not None:
+            mask = result["actor_types"] == filter_actor_type
+            result = {k: v[mask] for k, v in result.items()}
+
+        return result

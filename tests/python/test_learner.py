@@ -218,3 +218,78 @@ class TestImitationMode:
         assert m_ppo["mode"] == "ppo"
         assert m_imi["mode"] == "imitation"
         assert m_ppo["total_steps"] == m_imi["total_steps"]
+
+
+class TestBaselineImitation:
+    """baseline 教師データによる imitation テスト (CQ-0043)"""
+
+    def test_filter_baseline_samples(self, tmp_path: Path):
+        """baseline サンプルだけを learner に渡せる"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        writer = ShardWriter(shard_dir, max_samples=10000)
+        for i in range(50):
+            writer.add(LearningSample(
+                observation=np.random.randn(obs_dim).astype(np.float32),
+                legal_mask=(np.random.rand(34) > 0.5).astype(np.float32),
+                action=np.random.randint(0, 34),
+                reward=0.0, log_prob=0.0, value=0.0,
+                terminated=(i == 49), round_over=False,
+                experiment_id="test", run_id="run", worker_id="w",
+                episode_id="ep", step_id=i,
+                actor_type="baseline" if i < 30 else "policy",
+            ))
+        writer.close()
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        metrics = learner.train(
+            shard_dir, num_epochs=1, filter_actor_type="baseline")
+        assert metrics["total_steps"] == 30
+        assert metrics["mode"] == "imitation"
+
+    def test_imitation_with_baseline_data(self, tmp_path: Path):
+        """baseline 教師データを用いた cross-entropy 学習が回る"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        writer = ShardWriter(shard_dir, max_samples=10000)
+        for i in range(50):
+            writer.add(LearningSample(
+                observation=np.random.randn(obs_dim).astype(np.float32),
+                legal_mask=(np.random.rand(34) > 0.5).astype(np.float32),
+                action=np.random.randint(0, 34),
+                reward=0.0, log_prob=0.0, value=0.0,
+                terminated=(i == 49), round_over=False,
+                experiment_id="test", run_id="run", worker_id="w",
+                episode_id="ep", step_id=i,
+                actor_type="baseline",
+            ))
+        writer.close()
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        metrics = learner.train(shard_dir, num_epochs=2)
+        assert metrics["policy_loss"] > 0
+        assert metrics["total_steps"] == 50
+
+    def test_ppo_unaffected_by_filter(self, tmp_path: Path):
+        """filter_actor_type は PPO モードでも正常動作"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=50, obs_dim=obs_dim)
+
+        config = _make_config()
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        # デフォルト actor_type="policy" なので全件ヒット
+        metrics = learner.train(
+            shard_dir, num_epochs=1, filter_actor_type="policy")
+        assert metrics["mode"] == "ppo"
+        assert metrics["total_steps"] == 50

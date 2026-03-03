@@ -43,6 +43,7 @@ class SelfPlayWorker:
         sp = config.get("selfplay", {})
         self._policy_ratio = sp.get("policy_ratio", 0.5)
         self._temperature = sp.get("temperature", 1.0)
+        self._save_baseline_actions = sp.get("save_baseline_actions", False)
         max_per_shard = sp.get("max_samples_per_shard", 10000)
 
         self._selector = ActionSelector(
@@ -119,7 +120,12 @@ class SelfPlayWorker:
                 tile_type = self._baseline_step(env, mask)
                 log_prob = 0.0
                 value = 0.0
-                pre_features_flat = None
+                # baseline 保存が有効なら観測をエンコード
+                if self._save_baseline_actions:
+                    pre_features = self._encoder.encode(obs)
+                    pre_features_flat = pre_features.flatten() if pre_features.ndim > 1 else pre_features
+                else:
+                    pre_features_flat = None
 
             obs, rewards, terminated, truncated, info = env.step(tile_type)
 
@@ -130,8 +136,11 @@ class SelfPlayWorker:
                 round_count += 1
             prev_round_number = round_number
 
-            # ポリシー席のサンプルのみ収集（action 選択前の観測を使用）
-            if seat_is_policy[current]:
+            # サンプル収集
+            should_save = seat_is_policy[current] or (
+                self._save_baseline_actions and not seat_is_policy[current])
+            if should_save:
+                actor_type = "policy" if seat_is_policy[current] else "baseline"
                 sample = LearningSample(
                     observation=pre_features_flat,
                     legal_mask=mask.astype(np.float32),
@@ -152,6 +161,7 @@ class SelfPlayWorker:
                     round_id=round_number,
                     step_id=sample_step,
                     player_id=current,
+                    actor_type=actor_type,
                 )
                 self._writer.add(sample)
                 sample_step += 1
