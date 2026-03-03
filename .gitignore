@@ -1,6 +1,11 @@
 # ビルド成果物
 build/
 
+# Python
+__pycache__/
+*.pyc
+*.so
+
 # IDE / エディタ
 .vscode/
 .idea/

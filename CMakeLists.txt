@@ -33,6 +33,7 @@ add_library(mahjong_core STATIC
     src/io/display.cpp
 )
 target_include_directories(mahjong_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+set_target_properties(mahjong_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # サンプル実行ファイル
 add_executable(mahjong_example examples/main.cpp)
@@ -91,3 +92,20 @@ target_include_directories(mahjong_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 include(GoogleTest)
 gtest_discover_tests(mahjong_tests)
+
+# pybind11 Python バインディング（Python が見つかった場合のみ）
+find_package(Python3 COMPONENTS Interpreter Development QUIET)
+if(Python3_FOUND)
+    FetchContent_Declare(
+        pybind11
+        GIT_REPOSITORY https://github.com/pybind/pybind11.git
+        GIT_TAG v2.11.1
+    )
+    FetchContent_MakeAvailable(pybind11)
+
+    pybind11_add_module(_mahjong_core bindings/mahjong_bindings.cpp)
+    target_link_libraries(_mahjong_core PRIVATE mahjong_core)
+    target_include_directories(_mahjong_core PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+    install(TARGETS _mahjong_core DESTINATION mahjong_rl)
+endif()
