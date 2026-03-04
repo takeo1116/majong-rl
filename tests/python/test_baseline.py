@@ -9,6 +9,7 @@ from mahjong_rl.env import Stage1Env
 
 # --- シャンテン数テスト ---
 
+@pytest.mark.smoke
 class TestShantenAgari:
     """和了形 (シャンテン数 = -1)"""
 
@@ -40,6 +41,7 @@ class TestShantenAgari:
         assert compute_shanten(counts) == -1
 
 
+@pytest.mark.smoke
 class TestShantenTenpai:
     """テンパイ (シャンテン数 = 0)"""
 
@@ -74,6 +76,7 @@ class TestShantenTenpai:
         assert compute_shanten(counts) == 0
 
 
+@pytest.mark.smoke
 class TestShantenIshanten:
     """一向聴 (シャンテン数 = 1)"""
 
@@ -93,6 +96,7 @@ class TestShantenIshanten:
         assert compute_shanten(counts) == 1
 
 
+@pytest.mark.smoke
 class TestShantenEdgeCases:
     """シャンテン数エッジケース"""
 
@@ -118,6 +122,7 @@ class TestShantenEdgeCases:
 
 # --- RuleBasedBaseline テスト ---
 
+@pytest.mark.smoke
 class TestRuleBasedBaseline:
     """RuleBasedBaseline テスト"""
 
@@ -163,6 +168,7 @@ class TestRuleBasedBaseline:
         assert result in (31, 33)
 
 
+@pytest.mark.slow
 class TestBaselineOnStage1:
     """Stage1Env 上でのベースライン動作テスト"""
 

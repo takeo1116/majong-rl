@@ -2,6 +2,8 @@
 import pytest
 import numpy as np
 import torch
+
+pytestmark = pytest.mark.smoke
 from mahjong_rl.legal_mask import make_discard_mask, make_discard_mask_from_legal_actions
 from mahjong_rl.action_selector import ActionSelector, SelectionMode
 from mahjong_rl import (

@@ -1,6 +1,8 @@
 """CQ-0029: Stage 1 環境ラッパーテスト"""
 import pytest
 import numpy as np
+
+pytestmark = pytest.mark.smoke
 from mahjong_rl.env import Stage1Env
 from mahjong_rl import (
     ActionType, Phase, RunMode, EventType, MeldType,

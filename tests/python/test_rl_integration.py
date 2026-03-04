@@ -12,6 +12,8 @@ import torch
 import numpy as np
 from pathlib import Path
 
+pytestmark = pytest.mark.slow
+
 from mahjong_rl.env import Stage1Env
 from mahjong_rl.encoders import FlatFeatureEncoder, ChannelTensorEncoder
 from mahjong_rl.models import MLPPolicyValueModel
@@ -325,7 +327,8 @@ class TestStage1ExperimentIntegration:
 
         def make_config():
             return ExperimentConfig(
-                experiment={"name": "repro_test", "stage": 1, "observation_mode": "full"},
+                experiment={"name": "repro_test", "stage": 1, "observation_mode": "full",
+                            "global_seed": 0},
                 feature_encoder={"name": "FlatFeatureEncoder", "observation_mode": "full"},
                 model={"name": "MLPPolicyValueModel", "hidden_dims": [32],
                        "value_heads": ["round_delta"]},
@@ -341,11 +344,138 @@ class TestStage1ExperimentIntegration:
 
         results = []
         for i in range(2):
-            torch.manual_seed(0)  # モデル初期化の乱数を固定
             config = make_config()
             runner = Stage1Runner(config=config, base_dir=tmp_path / f"run_{i}")
             result = runner.run()
             results.append(result)
 
-        # 同一 seed + 同一モデル初期化なので self-play ステップ数は一致
+        # 同一 global_seed + 同一 config なので self-play ステップ数は一致
         assert results[0]["selfplay_stats"]["total_steps"] == results[1]["selfplay_stats"]["total_steps"]
+
+
+class TestRunnerInfraIntegration:
+    """runner の seed・rotation・summary 統合テスト (CQ-0058)"""
+
+    def test_seed_recorded_in_summary(self, tmp_path: Path):
+        """seed が summary.json に記録される"""
+        from mahjong_rl.experiment import ExperimentConfig
+        from mahjong_rl.runner import Stage1Runner
+        import json
+
+        config = ExperimentConfig(
+            experiment={"name": "seed_test", "stage": 1, "observation_mode": "full",
+                        "global_seed": 42},
+            feature_encoder={"name": "FlatFeatureEncoder", "observation_mode": "full"},
+            model={"name": "MLPPolicyValueModel", "hidden_dims": [32],
+                   "value_heads": ["round_delta"]},
+            reward={"type": "point_delta"},
+            selfplay={"num_matches": 1, "policy_ratio": 1.0, "temperature": 1.0,
+                      "max_samples_per_shard": 10000},
+            training={"algorithm": "ppo", "lr": 0.001, "batch_size": 32,
+                      "epochs": 1, "gamma": 0.99, "gae_lambda": 0.95,
+                      "clip_epsilon": 0.2, "value_loss_coef": 0.5,
+                      "entropy_coef": 0.01, "max_grad_norm": 0.5},
+            evaluation={"num_matches": 1, "seed_start": 100000},
+        )
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        assert summary["global_seed"] == 42
+
+    def test_rotation_eval_from_runner(self, tmp_path: Path):
+        """runner から rotation 評価を実行して結果が残る"""
+        from mahjong_rl.experiment import ExperimentConfig
+        from mahjong_rl.runner import Stage1Runner
+        import json
+
+        config = ExperimentConfig(
+            experiment={"name": "rot_test", "stage": 1, "observation_mode": "full"},
+            feature_encoder={"name": "FlatFeatureEncoder", "observation_mode": "full"},
+            model={"name": "MLPPolicyValueModel", "hidden_dims": [32],
+                   "value_heads": ["round_delta"]},
+            reward={"type": "point_delta"},
+            selfplay={"num_matches": 1, "policy_ratio": 1.0, "temperature": 1.0,
+                      "max_samples_per_shard": 10000},
+            training={"algorithm": "ppo", "lr": 0.001, "batch_size": 32,
+                      "epochs": 1, "gamma": 0.99, "gae_lambda": 0.95,
+                      "clip_epsilon": 0.2, "value_loss_coef": 0.5,
+                      "entropy_coef": 0.01, "max_grad_norm": 0.5},
+            evaluation={"num_matches": 1, "seed_start": 100000,
+                        "mode": "rotation", "rotation_seats": [0, 1]},
+        )
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert result["eval_metrics"]["eval_mode"] == "rotation"
+
+        # eval ディレクトリに rotation ファイルが残る
+        run_dir = Path(result["run_dir"])
+        eval_dir = run_dir / "eval"
+        assert (eval_dir / "eval_rotation.json").exists()
+        assert (eval_dir / "eval_seat0.json").exists()
+        assert (eval_dir / "eval_seat1.json").exists()
+
+    def test_summary_and_log_on_success(self, tmp_path: Path):
+        """正常終了時に summary.json と run.log が保存される"""
+        from mahjong_rl.experiment import ExperimentConfig
+        from mahjong_rl.runner import Stage1Runner
+        import json
+
+        config = ExperimentConfig(
+            experiment={"name": "summary_test", "stage": 1, "observation_mode": "full"},
+            feature_encoder={"name": "FlatFeatureEncoder", "observation_mode": "full"},
+            model={"name": "MLPPolicyValueModel", "hidden_dims": [32],
+                   "value_heads": ["round_delta"]},
+            reward={"type": "point_delta"},
+            selfplay={"num_matches": 1, "policy_ratio": 1.0, "temperature": 1.0,
+                      "max_samples_per_shard": 10000},
+            training={"algorithm": "ppo", "lr": 0.001, "batch_size": 32,
+                      "epochs": 1, "gamma": 0.99, "gae_lambda": 0.95,
+                      "clip_epsilon": 0.2, "value_loss_coef": 0.5,
+                      "entropy_coef": 0.01, "max_grad_norm": 0.5},
+            evaluation={"num_matches": 1, "seed_start": 100000},
+        )
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        # summary
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        assert summary["success"] is True
+        assert summary["shard_count"] >= 1
+        assert summary["has_checkpoint"] is True
+        assert summary["has_eval"] is True
+        # run.log
+        assert (run_dir / "run.log").exists()
+        log_content = (run_dir / "run.log").read_text()
+        assert "実験完了" in log_content
+
+    def test_eval_results_in_run_dir(self, tmp_path: Path):
+        """eval 結果が run ディレクトリに残る"""
+        from mahjong_rl.experiment import ExperimentConfig
+        from mahjong_rl.runner import Stage1Runner
+
+        config = ExperimentConfig(
+            experiment={"name": "eval_test", "stage": 1, "observation_mode": "full"},
+            feature_encoder={"name": "FlatFeatureEncoder", "observation_mode": "full"},
+            model={"name": "MLPPolicyValueModel", "hidden_dims": [32],
+                   "value_heads": ["round_delta"]},
+            reward={"type": "point_delta"},
+            selfplay={"num_matches": 1, "policy_ratio": 1.0, "temperature": 1.0,
+                      "max_samples_per_shard": 10000},
+            training={"algorithm": "ppo", "lr": 0.001, "batch_size": 32,
+                      "epochs": 1, "gamma": 0.99, "gae_lambda": 0.95,
+                      "clip_epsilon": 0.2, "value_loss_coef": 0.5,
+                      "entropy_coef": 0.01, "max_grad_norm": 0.5},
+            evaluation={"num_matches": 1, "seed_start": 100000},
+        )
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        assert (run_dir / "eval" / "eval_metrics.json").exists()

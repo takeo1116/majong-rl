@@ -33,9 +33,31 @@ ctest --output-on-failure
 ```
 
 ```bash
-# Python テスト (169 tests)
+# Python smoke テスト（軽量・日常確認用）
+python3 -m pytest tests/python/ -m smoke -v
+```
+
+```bash
+# Python slow 除外テスト（smoke + unmarked テスト）
+python3 -m pytest tests/python/ -m "not slow" -v
+```
+
+```bash
+# Python 全テスト（smoke + slow 含む完全網羅）
 python3 -m pytest tests/python/ -v
 ```
+
+### テスト分類
+
+| マーカー | 対象 | 実行時間目安 |
+|---|---|---|
+| `smoke` | 軽量な基本検証テスト（単体・変換・バリデーション） | 約1分 |
+| `slow` | 重い評価・統合テスト（runner.run / 半荘実行 / self-play） | 約25分 |
+| 未指定 | 全テスト（smoke + slow） | 約25分 |
+
+- **日常開発**: `python3 -m pytest -m smoke` で高速確認
+- **PR 前 / CI**: `python3 -m pytest` で全テスト実行
+- marker 未指定で `pytest` を実行すると、全テスト（smoke + slow）が実行される
 
 ## サンプル実行
 

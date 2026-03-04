@@ -4,6 +4,8 @@ import torch
 import numpy as np
 from pathlib import Path
 
+pytestmark = pytest.mark.smoke
+
 from mahjong_rl.encoders import FlatFeatureEncoder
 from mahjong_rl.models import MLPPolicyValueModel
 from mahjong_rl.shard import LearningSample, ShardWriter
@@ -293,3 +295,181 @@ class TestBaselineImitation:
             shard_dir, num_epochs=1, filter_actor_type="policy")
         assert metrics["mode"] == "ppo"
         assert metrics["total_steps"] == 50
+
+
+class TestImitationFilter:
+    """imitation 品質フィルタテスト (CQ-0054)"""
+
+    def _write_shards_with_varied_legal(self, shard_dir: Path, obs_dim: int = 100):
+        """legal action 数が異なるサンプルを書き出す"""
+        writer = ShardWriter(shard_dir, max_samples=10000)
+        for i in range(60):
+            # i < 30: legal 2個, i >= 30: legal 10個
+            if i < 30:
+                mask = np.zeros(34, dtype=np.float32)
+                mask[0] = 1.0
+                mask[1] = 1.0
+            else:
+                mask = np.zeros(34, dtype=np.float32)
+                mask[:10] = 1.0
+            writer.add(LearningSample(
+                observation=np.random.randn(obs_dim).astype(np.float32),
+                legal_mask=mask,
+                action=0,
+                reward=0.0, log_prob=0.0, value=0.0,
+                terminated=(i == 59), round_over=False,
+                experiment_id="test", run_id="run", worker_id="w",
+                episode_id="ep", step_id=i,
+                actor_type="baseline",
+            ))
+        writer.close()
+
+    def test_filter_by_min_legal_actions(self, tmp_path: Path):
+        """min_legal_actions でサンプルが絞り込まれる"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        self._write_shards_with_varied_legal(shard_dir, obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        metrics = learner.train(
+            shard_dir, num_epochs=1,
+            imitation_filter={"min_legal_actions": 5})
+
+        # legal >= 5 のサンプルのみ (後半30件)
+        assert metrics["total_steps"] == 30
+
+    def test_filter_stats_recorded(self, tmp_path: Path):
+        """フィルタ前後の件数が記録される"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        self._write_shards_with_varied_legal(shard_dir, obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        metrics = learner.train(
+            shard_dir, num_epochs=1,
+            imitation_filter={"min_legal_actions": 5})
+
+        assert "filter_stats" in metrics
+        assert metrics["filter_stats"]["before"] == 60
+        assert metrics["filter_stats"]["after"] == 30
+        assert metrics["filter_stats"]["removed"] == 30
+
+    def test_filter_disabled(self, tmp_path: Path):
+        """enabled=False でフィルタが無効になる"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        self._write_shards_with_varied_legal(shard_dir, obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        metrics = learner.train(
+            shard_dir, num_epochs=1,
+            imitation_filter={"min_legal_actions": 5, "enabled": False})
+
+        # フィルタ無効なので全件
+        assert metrics["total_steps"] == 60
+        assert "filter_stats" not in metrics
+
+    def test_no_filter_backward_compatible(self, tmp_path: Path):
+        """imitation_filter 未指定で既存動作と互換"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        self._write_shards_with_varied_legal(shard_dir, obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        metrics = learner.train(shard_dir, num_epochs=1)
+
+        assert metrics["total_steps"] == 60
+        assert "filter_stats" not in metrics
+
+    def test_ppo_ignores_filter(self, tmp_path: Path):
+        """PPO モードでは imitation_filter は無視される"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        self._write_shards_with_varied_legal(shard_dir, obs_dim)
+
+        config = _make_config()
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        metrics = learner.train(
+            shard_dir, num_epochs=1,
+            imitation_filter={"min_legal_actions": 5})
+
+        # PPO なのでフィルタ不適用
+        assert metrics["total_steps"] == 60
+        assert "filter_stats" not in metrics
+
+
+class TestLearnerDevice:
+    """Learner デバイス切替テスト (CQ-0063)"""
+
+    def test_cpu_device_works(self, tmp_path: Path):
+        """CPU 明示指定で既存動作維持"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=50, obs_dim=obs_dim)
+
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(
+            config=_make_config(), model=model, run_dir=tmp_path,
+            device=torch.device("cpu"))
+        metrics = learner.train(shard_dir, num_epochs=1)
+
+        assert metrics["total_steps"] == 50
+        assert isinstance(metrics["policy_loss"], float)
+
+    def test_device_in_metrics(self, tmp_path: Path):
+        """metrics に device が記録される"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=50, obs_dim=obs_dim)
+
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(
+            config=_make_config(), model=model, run_dir=tmp_path,
+            device=torch.device("cpu"))
+        metrics = learner.train(shard_dir, num_epochs=1)
+
+        assert "device" in metrics
+        assert metrics["device"] == "cpu"
+
+    def test_checkpoint_cross_device(self, tmp_path: Path):
+        """checkpoint save → load が device をまたいで動作する"""
+        obs_dim = 100
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(
+            config=_make_config(), model=model, run_dir=tmp_path,
+            device=torch.device("cpu"))
+
+        ckpt_path = learner.save_checkpoint(tag="test")
+        assert ckpt_path.exists()
+
+        # 別の learner で load
+        model2 = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner2 = Learner(
+            config=_make_config(), model=model2, run_dir=tmp_path / "run2",
+            device=torch.device("cpu"))
+        learner2.load_checkpoint(ckpt_path)
+
+        test_input = torch.randn(1, obs_dim)
+        test_mask = torch.ones(1, 34)
+        with torch.no_grad():
+            out1 = model(test_input, test_mask)
+            out2 = model2(test_input, test_mask)
+        torch.testing.assert_close(out1.logits, out2.logits)

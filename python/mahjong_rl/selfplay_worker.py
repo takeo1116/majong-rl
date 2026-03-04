@@ -30,9 +30,11 @@ class SelfPlayWorker:
         encoder,
         output_dir: Path,
         worker_id: str = "worker_0",
+        inference_device: torch.device | None = None,
     ):
         self._config = config
-        self._model = model
+        self._device = inference_device or torch.device("cpu")
+        self._model = model.to(self._device)
         self._encoder = encoder
         self._output_dir = Path(output_dir)
         self._worker_id = worker_id
@@ -89,6 +91,7 @@ class SelfPlayWorker:
             "total_steps": total_steps,
             "total_rounds": total_rounds,
             "output_dir": str(self._output_dir),
+            "inference_device": str(self._device),
         }
 
     def _play_one_match(self, seed: int, episode_id: str, run_id: str) -> dict:
@@ -181,8 +184,8 @@ class SelfPlayWorker:
         """ポリシーモデルで打牌を選択する"""
         features = self._encoder.encode(obs)
         features_flat = features.flatten() if features.ndim > 1 else features
-        features_t = torch.from_numpy(features_flat).unsqueeze(0)
-        mask_t = torch.from_numpy(mask).unsqueeze(0)
+        features_t = torch.from_numpy(features_flat).unsqueeze(0).to(self._device)
+        mask_t = torch.from_numpy(mask).unsqueeze(0).to(self._device)
 
         with torch.no_grad():
             output = self._model(features_t, mask_t)

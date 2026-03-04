@@ -19,10 +19,12 @@ class Learner:
         imitation: action ラベルへの cross-entropy loss
     """
 
-    def __init__(self, config: dict, model: nn.Module, run_dir: Path):
+    def __init__(self, config: dict, model: nn.Module, run_dir: Path,
+                 device: torch.device | None = None):
         self._config = config
-        self._model = model
         self._run_dir = Path(run_dir)
+        self._device = device or torch.device("cpu")
+        self._model = model.to(self._device)
 
         tc = config.get("training", {})
         self._mode = tc.get("algorithm", "ppo")
@@ -47,11 +49,15 @@ class Learner:
         shard_dir: Path,
         num_epochs: int | None = None,
         filter_actor_type: str | None = None,
+        imitation_filter: dict | None = None,
     ) -> dict:
         """shard データを読み込んで学習を実行する
 
         Args:
             filter_actor_type: 指定時、該当 actor_type のサンプルのみ学習に使う
+            imitation_filter: imitation 用品質フィルタ設定
+                - min_legal_actions: legal action 数の最小値
+                - enabled: フィルタの有効/無効 (デフォルト True)
 
         Returns:
             metrics dict: mode, policy_loss, value_loss, entropy, total_steps
@@ -61,18 +67,43 @@ class Learner:
         reader = ShardReader(shard_dir)
         data = reader.read_as_tensors(filter_actor_type=filter_actor_type)
 
-        observations = torch.from_numpy(data["observations"])
-        legal_masks = torch.from_numpy(data["legal_masks"])
-        actions = torch.from_numpy(data["actions"]).long()
-        rewards = torch.from_numpy(data["rewards"])
-        old_log_probs = torch.from_numpy(data["log_probs"])
-        old_values = torch.from_numpy(data["values"])
-        terminateds = torch.from_numpy(data["terminateds"])
+        observations = torch.from_numpy(data["observations"]).to(self._device)
+        legal_masks = torch.from_numpy(data["legal_masks"]).to(self._device)
+        actions = torch.from_numpy(data["actions"]).long().to(self._device)
+        rewards = torch.from_numpy(data["rewards"]).to(self._device)
+        old_log_probs = torch.from_numpy(data["log_probs"]).to(self._device)
+        old_values = torch.from_numpy(data["values"]).to(self._device)
+        terminateds = torch.from_numpy(data["terminateds"]).to(self._device)
+
+        n_before_filter = len(observations)
+
+        # imitation 品質フィルタ適用
+        filter_stats = None
+        if self._mode == "imitation" and imitation_filter is not None:
+            enabled = imitation_filter.get("enabled", True)
+            if enabled:
+                keep = self._apply_imitation_filter(legal_masks, imitation_filter)
+                filter_stats = {
+                    "before": n_before_filter,
+                    "after": int(keep.sum()),
+                    "removed": n_before_filter - int(keep.sum()),
+                }
+                observations = observations[keep]
+                legal_masks = legal_masks[keep]
+                actions = actions[keep]
+                rewards = rewards[keep]
+                old_log_probs = old_log_probs[keep]
+                old_values = old_values[keep]
+                terminateds = terminateds[keep]
 
         n = len(observations)
         if n == 0:
-            return {"mode": self._mode, "policy_loss": 0.0, "value_loss": 0.0,
-                    "entropy": 0.0, "total_steps": 0}
+            result = {"mode": self._mode, "policy_loss": 0.0, "value_loss": 0.0,
+                      "entropy": 0.0, "total_steps": 0, "num_updates": 0,
+                      "device": str(self._device)}
+            if filter_stats is not None:
+                result["filter_stats"] = filter_stats
+            return result
 
         if self._mode == "imitation":
             metrics = self._train_imitation(
@@ -84,6 +115,9 @@ class Learner:
 
         metrics["mode"] = self._mode
         metrics["total_steps"] = n
+        metrics["device"] = str(self._device)
+        if filter_stats is not None:
+            metrics["filter_stats"] = filter_stats
 
         # metrics 保存
         metrics_dir = self._run_dir / "metrics"
@@ -92,6 +126,31 @@ class Learner:
             json.dump(metrics, f, indent=2)
 
         return metrics
+
+    @staticmethod
+    def _apply_imitation_filter(
+        legal_masks: torch.Tensor,
+        filter_config: dict,
+    ) -> torch.Tensor:
+        """imitation 用品質フィルタを適用し、保持するインデックスの bool mask を返す
+
+        Args:
+            legal_masks: (N, 34) の legal mask テンソル
+            filter_config: フィルタ設定 dict
+
+        Returns:
+            (N,) の bool テンソル — True のサンプルを保持
+        """
+        n = len(legal_masks)
+        keep = torch.ones(n, dtype=torch.bool)
+
+        # legal action 数フィルタ
+        min_legal = filter_config.get("min_legal_actions", 0)
+        if min_legal > 0:
+            legal_counts = (legal_masks > 0).sum(dim=1)
+            keep &= legal_counts >= min_legal
+
+        return keep
 
     def _train_ppo(
         self,
@@ -112,6 +171,7 @@ class Learner:
         all_policy_losses = []
         all_value_losses = []
         all_entropies = []
+        num_updates = 0
 
         for _ in range(epochs):
             indices = torch.randperm(n)
@@ -152,6 +212,7 @@ class Learner:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self._model.parameters(), self._max_grad_norm)
                 self._optimizer.step()
+                num_updates += 1
 
                 all_policy_losses.append(policy_loss.item())
                 all_value_losses.append(value_loss.item())
@@ -161,6 +222,7 @@ class Learner:
             "policy_loss": float(np.mean(all_policy_losses)) if all_policy_losses else 0.0,
             "value_loss": float(np.mean(all_value_losses)) if all_value_losses else 0.0,
             "entropy": float(np.mean(all_entropies)) if all_entropies else 0.0,
+            "num_updates": num_updates,
         }
 
     def _train_imitation(
@@ -174,6 +236,7 @@ class Learner:
         """模倣学習 (cross-entropy loss)"""
         all_policy_losses = []
         all_entropies = []
+        num_updates = 0
 
         for _ in range(epochs):
             indices = torch.randperm(n)
@@ -201,6 +264,7 @@ class Learner:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self._model.parameters(), self._max_grad_norm)
                 self._optimizer.step()
+                num_updates += 1
 
                 all_policy_losses.append(policy_loss.item())
                 all_entropies.append(entropy.item())
@@ -209,6 +273,7 @@ class Learner:
             "policy_loss": float(np.mean(all_policy_losses)) if all_policy_losses else 0.0,
             "value_loss": 0.0,
             "entropy": float(np.mean(all_entropies)) if all_entropies else 0.0,
+            "num_updates": num_updates,
         }
 
     def _compute_gae(
@@ -217,24 +282,31 @@ class Learner:
         values: torch.Tensor,
         terminateds: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """GAE (Generalized Advantage Estimation) を計算する"""
-        n = len(rewards)
+        """GAE (Generalized Advantage Estimation) を計算する
+
+        逐次計算のため CPU 上で行い、結果を self._device に移す。
+        """
+        # CPU 上で逐次計算
+        r_cpu = rewards.cpu()
+        v_cpu = values.cpu()
+        t_cpu = terminateds.cpu()
+        n = len(r_cpu)
         advantages = torch.zeros(n)
         last_gae = 0.0
 
         for t in reversed(range(n)):
-            if t == n - 1 or terminateds[t]:
+            if t == n - 1 or t_cpu[t]:
                 next_value = 0.0
             else:
-                next_value = values[t + 1].item()
+                next_value = v_cpu[t + 1].item()
 
-            delta = rewards[t] + self._gamma * next_value - values[t]
-            if terminateds[t]:
+            delta = r_cpu[t] + self._gamma * next_value - v_cpu[t]
+            if t_cpu[t]:
                 last_gae = 0.0
             advantages[t] = last_gae = delta + self._gamma * self._gae_lambda * last_gae
 
-        returns = advantages + values
-        return advantages, returns
+        returns = advantages + v_cpu
+        return advantages.to(self._device), returns.to(self._device)
 
     def save_checkpoint(self, tag: str = "") -> Path:
         """checkpoint を保存する"""
@@ -251,6 +323,6 @@ class Learner:
 
     def load_checkpoint(self, path: Path) -> None:
         """checkpoint を読み込む"""
-        ckpt = torch.load(path, weights_only=False)
+        ckpt = torch.load(path, weights_only=False, map_location=self._device)
         self._model.load_state_dict(ckpt["model_state_dict"])
         self._optimizer.load_state_dict(ckpt["optimizer_state_dict"])

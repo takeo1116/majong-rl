@@ -3,6 +3,8 @@ import pytest
 import torch
 import numpy as np
 
+pytestmark = pytest.mark.smoke
+
 from mahjong_rl import NUM_TILE_TYPES
 from mahjong_rl.env import Stage1Env
 from mahjong_rl.encoders import FlatFeatureEncoder, ChannelTensorEncoder

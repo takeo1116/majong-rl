@@ -17,3 +17,7 @@ wheel.packages = ["python/mahjong_rl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+markers = [
+    "slow: 重い評価・統合テスト（-m 'not slow' で除外）",
+    "smoke: 軽量な基本検証テスト（-m smoke で選択実行）",
+]

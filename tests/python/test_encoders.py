@@ -1,6 +1,8 @@
 """CQ-0030: FeatureEncoder テスト"""
 import pytest
 import numpy as np
+
+pytestmark = pytest.mark.smoke
 from mahjong_rl import (
     GameEngine, EnvironmentState, RunMode,
     PartialObservation, FullObservation,

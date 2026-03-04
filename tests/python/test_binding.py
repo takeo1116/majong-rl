@@ -1,5 +1,7 @@
 """CQ-0028: pybind11 バインディングテスト"""
 import pytest
+
+pytestmark = pytest.mark.smoke
 import mahjong_rl
 from mahjong_rl import (
     GameEngine, EnvironmentState, Action, ActionType, Phase, ErrorCode,

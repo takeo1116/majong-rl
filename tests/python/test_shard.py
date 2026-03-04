@@ -3,6 +3,8 @@ import pytest
 import numpy as np
 from pathlib import Path
 
+pytestmark = pytest.mark.smoke
+
 from mahjong_rl.shard import (
     LearningSample, ShardWriter, ShardReader,
     ShardBackend, ParquetBackend, validate_metadata,

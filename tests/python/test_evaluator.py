@@ -5,9 +5,10 @@ from pathlib import Path
 
 from mahjong_rl.encoders import FlatFeatureEncoder
 from mahjong_rl.models import MLPPolicyValueModel
-from mahjong_rl.evaluator import EvaluationRunner, EvalMetrics, RotationEvalResult
+from mahjong_rl.evaluator import EvaluationRunner, EvalMetrics, RotationEvalResult, compute_eval_diff
 
 
+@pytest.mark.slow
 class TestEvaluationRunner:
     """EvaluationRunner テスト"""
 
@@ -56,6 +57,7 @@ class TestEvaluationRunner:
         assert "deal_in_rate" in data
 
 
+@pytest.mark.slow
 class TestPolicySeatConfig:
     """policy 席設定テスト (CQ-0044)"""
 
@@ -112,6 +114,7 @@ class TestPolicySeatConfig:
         assert metrics.num_matches == 1
 
 
+@pytest.mark.slow
 class TestRotationEval:
     """席ローテーション集計テスト (CQ-0045)"""
 
@@ -200,3 +203,81 @@ class TestRotationEval:
 
         assert isinstance(metrics, EvalMetrics)
         assert metrics.num_matches == 1
+
+
+@pytest.mark.smoke
+class TestComputeEvalDiff:
+    """学習前後差分レポートテスト (CQ-0056)"""
+
+    def test_diff_has_all_keys(self):
+        """diff に主要 4 指標の差分が含まれる"""
+        before = {"avg_rank": 2.5, "avg_score": -500.0,
+                  "win_rate": 0.2, "deal_in_rate": 0.15}
+        after = {"avg_rank": 2.3, "avg_score": 100.0,
+                 "win_rate": 0.25, "deal_in_rate": 0.12}
+
+        diff = compute_eval_diff(before, after)
+
+        for key in ["avg_rank", "avg_score", "win_rate", "deal_in_rate"]:
+            assert key in diff
+            assert "before" in diff[key]
+            assert "after" in diff[key]
+            assert "delta" in diff[key]
+
+    def test_diff_delta_correct(self):
+        """delta が after - before と一致する"""
+        before = {"avg_rank": 3.0, "avg_score": -1000.0,
+                  "win_rate": 0.1, "deal_in_rate": 0.2}
+        after = {"avg_rank": 2.5, "avg_score": 500.0,
+                 "win_rate": 0.3, "deal_in_rate": 0.1}
+
+        diff = compute_eval_diff(before, after)
+
+        assert diff["avg_rank"]["delta"] == pytest.approx(-0.5)
+        assert diff["avg_score"]["delta"] == pytest.approx(1500.0)
+        assert diff["win_rate"]["delta"] == pytest.approx(0.2)
+        assert diff["deal_in_rate"]["delta"] == pytest.approx(-0.1)
+
+    def test_diff_preserves_eval_mode(self):
+        """eval_mode が before/after に記録される"""
+        before = {"avg_rank": 2.5, "avg_score": 0.0,
+                  "win_rate": 0.2, "deal_in_rate": 0.1,
+                  "eval_mode": "single"}
+        after = {"avg_rank": 2.3, "avg_score": 100.0,
+                 "win_rate": 0.25, "deal_in_rate": 0.12,
+                 "eval_mode": "rotation"}
+
+        diff = compute_eval_diff(before, after)
+
+        assert diff["eval_mode_before"] == "single"
+        assert diff["eval_mode_after"] == "rotation"
+
+    def test_diff_missing_key_gives_none_delta(self):
+        """before/after に欠損キーがある場合 delta は None"""
+        before = {"avg_rank": 2.5}
+        after = {"avg_rank": 2.3}
+
+        diff = compute_eval_diff(before, after)
+
+        assert diff["avg_rank"]["delta"] == pytest.approx(-0.2)
+        assert diff["avg_score"]["delta"] is None
+        assert diff["win_rate"]["delta"] is None
+
+
+@pytest.mark.slow
+class TestEvaluatorDevice:
+    """EvaluationRunner デバイス切替テスト (CQ-0064)"""
+
+    def test_cpu_device_works(self):
+        """CPU 明示指定で既存動作維持"""
+        import torch
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = MLPPolicyValueModel(input_dim=encoder.output_dim, hidden_dims=[32])
+
+        runner = EvaluationRunner(
+            model=model, encoder=encoder, observation_mode="full",
+            inference_device=torch.device("cpu"))
+        metrics = runner.evaluate(num_matches=1, seed_start=42)
+
+        assert isinstance(metrics, EvalMetrics)
+        assert 1.0 <= metrics.avg_rank <= 4.0

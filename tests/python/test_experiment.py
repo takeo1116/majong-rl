@@ -2,6 +2,8 @@
 import pytest
 from pathlib import Path
 
+pytestmark = pytest.mark.smoke
+
 from mahjong_rl.experiment import ExperimentConfig, RunDirectory
 
 

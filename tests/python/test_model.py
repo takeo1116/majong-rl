@@ -3,6 +3,8 @@ import pytest
 import torch
 import numpy as np
 
+pytestmark = pytest.mark.smoke
+
 from mahjong_rl.models import (
     DiscardPolicyModel, PolicyValueOutput, MLPPolicyValueModel,
 )

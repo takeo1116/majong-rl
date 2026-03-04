@@ -58,14 +58,42 @@ class RotationEvalResult:
         self.aggregate.save(eval_dir / "eval_rotation.json")
 
 
+def compute_eval_diff(before: dict, after: dict) -> dict:
+    """学習前後の評価差分を計算する
+
+    Args:
+        before: 学習前の eval_metrics dict (avg_rank, avg_score, win_rate, deal_in_rate)
+        after:  学習後の eval_metrics dict
+
+    Returns:
+        diff dict: 各指標の before, after, delta を含む
+    """
+    keys = ["avg_rank", "avg_score", "win_rate", "deal_in_rate"]
+    diff: dict = {
+        "eval_mode_before": before.get("eval_mode", "single"),
+        "eval_mode_after": after.get("eval_mode", "single"),
+    }
+    for key in keys:
+        b = before.get(key)
+        a = after.get(key)
+        diff[key] = {
+            "before": b,
+            "after": a,
+            "delta": round(a - b, 6) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else None,
+        }
+    return diff
+
+
 class EvaluationRunner:
     """評価対戦ランナー
 
     指定席=学習ポリシー（argmax）、残り=ベースライン。
     """
 
-    def __init__(self, model: torch.nn.Module, encoder, observation_mode: str = "full"):
-        self._model = model
+    def __init__(self, model: torch.nn.Module, encoder, observation_mode: str = "full",
+                 inference_device: torch.device | None = None):
+        self._device = inference_device or torch.device("cpu")
+        self._model = model.to(self._device)
         self._encoder = encoder
         self._observation_mode = observation_mode
         self._baseline = RuleBasedBaseline()
@@ -232,8 +260,8 @@ class EvaluationRunner:
         """ポリシーモデルで打牌を選択する（argmax）"""
         features = self._encoder.encode(obs)
         features_flat = features.flatten() if features.ndim > 1 else features
-        features_t = torch.from_numpy(features_flat).unsqueeze(0)
-        mask_t = torch.from_numpy(mask).unsqueeze(0)
+        features_t = torch.from_numpy(features_flat).unsqueeze(0).to(self._device)
+        mask_t = torch.from_numpy(mask).unsqueeze(0).to(self._device)
 
         with torch.no_grad():
             output = self._model(features_t, mask_t)

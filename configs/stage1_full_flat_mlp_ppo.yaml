@@ -1,0 +1,42 @@
+experiment:
+  name: "stage1_full_flat_mlp_ppo"
+  stage: 1
+  observation_mode: "full"
+  memo: "Stage1 PPO: Full観測 + FlatEncoder + MLP"
+
+feature_encoder:
+  name: "FlatFeatureEncoder"
+  observation_mode: "full"
+
+model:
+  name: "MLPPolicyValueModel"
+  hidden_dims: [256, 128]
+  value_heads: ["round_delta"]
+
+reward:
+  type: "point_delta"
+  point_delta_scale: 0.0001
+
+selfplay:
+  num_matches: 100
+  policy_ratio: 1.0
+  temperature: 1.0
+  max_samples_per_shard: 10000
+
+training:
+  algorithm: "ppo"
+  lr: 0.0003
+  batch_size: 256
+  epochs: 4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_loss_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+
+evaluation:
+  num_matches: 100
+  seed_start: 100000
+
+export: {}

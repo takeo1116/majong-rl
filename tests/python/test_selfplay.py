@@ -29,6 +29,7 @@ def _make_model(encoder):
     return MLPPolicyValueModel(input_dim=encoder.output_dim, hidden_dims=[32])
 
 
+@pytest.mark.slow
 class TestSelfPlayWorker:
     """SelfPlayWorker テスト"""
 
@@ -113,6 +114,7 @@ class TestSelfPlayWorker:
         assert len(samples) == 0
 
 
+@pytest.mark.slow
 class TestSampleTemporalAlignment:
     """サンプル時点整合テスト"""
 
@@ -200,6 +202,7 @@ class TestSampleTemporalAlignment:
             )
 
 
+@pytest.mark.slow
 class TestBaselineTeacherData:
     """baseline 教師データ保存テスト (CQ-0042)"""
 
@@ -277,3 +280,23 @@ class TestBaselineTeacherData:
         tensors = reader.read_as_tensors()
         assert "actor_types" in tensors
         assert set(tensors["actor_types"]).issubset({"policy", "baseline"})
+
+
+@pytest.mark.slow
+class TestSelfPlayDevice:
+    """SelfPlayWorker デバイス切替テスト (CQ-0064)"""
+
+    def test_cpu_device_works(self, tmp_path: Path):
+        """CPU 明示指定で既存動作維持"""
+        config = _make_config()
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+            inference_device=torch.device("cpu"),
+        )
+        stats = worker.run(num_matches=1, seed_start=42)
+        assert stats["total_steps"] > 0
+        assert stats["inference_device"] == "cpu"
