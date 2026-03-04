@@ -21,6 +21,8 @@ Thumbs.db
 docs/AGENTS.md
 docs/CHANGE_QUEUE.md
 docs/CLAUDE.md
+docs/EXPERIMENT_STAGE1_RUNBOOK.md
 
 # 実験レポート
+experiments/
 reports/

@@ -8,6 +8,7 @@
 
 - **ゲームエンジン**: C++20 製。半荘進行・合法手列挙・和了判定・符計算・点数計算・精算を実装
 - **学習基盤**: PyTorch ベース。pybind11 経由でエンジンを呼び出し、self-play → shard 保存 → PPO/Imitation 学習 → 評価のパイプラインを提供
+- **並列実行**: self-play / eval の multi-process 並列化、マルチ seed バッチ実行に対応
 - **段階的設計**: Stage 1 (打牌のみ学習) から段階的に拡張する構成
 
 ## ビルド方法
@@ -51,9 +52,9 @@ python3 -m pytest tests/python/ -v
 
 | マーカー | 対象 | 実行時間目安 |
 |---|---|---|
-| `smoke` | 軽量な基本検証テスト（単体・変換・バリデーション） | 約1分 |
-| `slow` | 重い評価・統合テスト（runner.run / 半荘実行 / self-play） | 約25分 |
-| 未指定 | 全テスト（smoke + slow） | 約25分 |
+| `smoke` | 軽量な基本検証テスト（単体・変換・バリデーション） | 約3分 |
+| `slow` | 重い評価・統合テスト（runner.run / 半荘実行 / parallel） | 約25分 |
+| 未指定 | 全テスト（smoke + slow） | 約28分 |
 
 - **日常開発**: `python3 -m pytest -m smoke` で高速確認
 - **PR 前 / CI**: `python3 -m pytest` で全テスト実行
@@ -65,6 +66,21 @@ python3 -m pytest tests/python/ -v
 # config のバリデーションのみ実行（run ディレクトリは作成されない）
 python3 -m mahjong_rl.cli --config configs/stage1_full_flat_mlp_ppo.yaml --validate-only
 ```
+
+### マルチ seed バッチ実行
+
+```bash
+# seed を明示列挙
+python3 -m mahjong_rl.cli --config configs/stage1_full_flat_mlp_ppo.yaml --seeds 42,43,44
+
+# seed 範囲を指定
+python3 -m mahjong_rl.cli --config configs/stage1_full_flat_mlp_ppo.yaml --seed-start 42 --num-seeds 5
+
+# エラー時も続行（夜間実行向け）
+python3 -m mahjong_rl.cli --config config.yaml --seeds 42,43,44 --continue-on-error
+```
+
+バッチ実行結果は `batch_summary.json`（集約統計）と `batch_table.csv`（seed 一覧）として batch_dir に保存される。
 
 ## サンプル実行
 
@@ -93,8 +109,11 @@ python/mahjong_rl/
   shard.py    - 学習サンプル Parquet 入出力
   selfplay_worker.py  - Self-play データ生成
   learner.py          - PPO / Imitation 学習
-  evaluator.py        - 評価対戦ランナー
+  evaluator.py        - 評価対戦ランナー（parallel eval 対応）
+  runner.py           - Stage1Runner（selfplay/learner/eval 統合、parallel 対応）
   experiment.py       - 実験設定 YAML・Run ディレクトリ管理
+  cli.py              - CLI エントリポイント（マルチ seed バッチ対応）
+  batch_report.py     - バッチ集約レポート生成
   action_selector.py  - 行動選択 (argmax / sampling)
 
 configs/      - 実験設定 YAML テンプレート
@@ -115,6 +134,7 @@ examples/     - サンプル実行
 | `docs/GAME_SPEC.md` | ゲームエンジン実装仕様 |
 | `docs/RL_RULE.md` | 学習方針・研究方針 |
 | `docs/RL_SPEC.md` | 学習システム実装仕様 |
+| `docs/EXPERIMENT_STAGE1_RUNBOOK.md` | Stage 1 実験の実行手順 Runbook |
 
 ## 技術スタック
 

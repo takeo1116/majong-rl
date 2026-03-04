@@ -1,12 +1,14 @@
 """テスト: cli.py — Stage 1 CLI エントリポイント (CQ-0051)"""
+import json
 import pytest
 from pathlib import Path
 from unittest.mock import patch
 
 pytestmark = pytest.mark.smoke
 
-from mahjong_rl.cli import main, _apply_override, _parse_value
+from mahjong_rl.cli import main, _apply_override, _parse_value, run_batch, _resolve_seeds
 from mahjong_rl.experiment import ExperimentConfig
+from mahjong_rl.runner import Stage1Runner
 
 
 class TestCLIParsing:
@@ -266,3 +268,203 @@ class TestCLIFailureExitCodes:
         assert ret == 1
         captured = capsys.readouterr()
         assert "バリデーション" in captured.err
+
+
+def _make_cli_config() -> ExperimentConfig:
+    """CLI テスト用の最小構成"""
+    return ExperimentConfig(
+        experiment={"name": "cli_test", "stage": 1, "observation_mode": "full"},
+        feature_encoder={"name": "FlatFeatureEncoder", "observation_mode": "full"},
+        model={"name": "MLPPolicyValueModel", "hidden_dims": [32],
+               "value_heads": ["round_delta"]},
+        reward={"type": "point_delta"},
+        selfplay={"num_matches": 1, "policy_ratio": 1.0, "temperature": 1.0,
+                  "max_samples_per_shard": 10000},
+        training={"algorithm": "ppo", "lr": 0.001, "batch_size": 32,
+                  "epochs": 1, "gamma": 0.99, "gae_lambda": 0.95,
+                  "clip_epsilon": 0.2, "value_loss_coef": 0.5,
+                  "entropy_coef": 0.01, "max_grad_norm": 0.5},
+        evaluation={"num_matches": 1, "seed_start": 100000},
+    )
+
+
+class TestResolveSeed:
+    """seed リスト構築テスト (CQ-0077)"""
+
+    def test_no_seeds(self):
+        """seed 未指定で None を返す"""
+        from argparse import Namespace
+        args = Namespace(seeds=None, seed_start=None, num_seeds=None)
+        seeds, err = _resolve_seeds(args)
+        assert seeds is None
+        assert err is None
+
+    def test_seeds_list(self):
+        """--seeds で seed リストを返す"""
+        from argparse import Namespace
+        args = Namespace(seeds="42,43,44", seed_start=None, num_seeds=None)
+        seeds, err = _resolve_seeds(args)
+        assert seeds == [42, 43, 44]
+        assert err is None
+
+    def test_seed_range(self):
+        """--seed-start + --num-seeds で seed 範囲を返す"""
+        from argparse import Namespace
+        args = Namespace(seeds=None, seed_start=10, num_seeds=3)
+        seeds, err = _resolve_seeds(args)
+        assert seeds == [10, 11, 12]
+        assert err is None
+
+    def test_conflict(self):
+        """--seeds と --seed-start の同時指定はエラー"""
+        from argparse import Namespace
+        args = Namespace(seeds="42,43", seed_start=10, num_seeds=3)
+        seeds, err = _resolve_seeds(args)
+        assert seeds is None
+        assert err is not None
+        assert "同時" in err
+
+    def test_seed_start_without_num_seeds(self):
+        """--seed-start のみはエラー"""
+        from argparse import Namespace
+        args = Namespace(seeds=None, seed_start=10, num_seeds=None)
+        seeds, err = _resolve_seeds(args)
+        assert err is not None
+        assert "両方" in err
+
+
+class TestBatchExecution:
+    """マルチ seed バッチ実行テスト (CQ-0077, CQ-0080)"""
+
+    def test_batch_seeds_creates_run_dirs(self, tmp_path: Path):
+        """--seeds で seed ごとの run_dir が作られる"""
+        config = _make_cli_config()
+        yaml_path = tmp_path / "config.yaml"
+        config.to_yaml(yaml_path)
+
+        ret = main([
+            "--config", str(yaml_path),
+            "--base-dir", str(tmp_path / "runs"),
+            "--seeds", "42,43",
+        ])
+        assert ret == 0
+
+        # batch_dir が作られている
+        runs_dir = tmp_path / "runs"
+        batch_dirs = [d for d in runs_dir.iterdir() if d.is_dir() and "batch" in d.name]
+        assert len(batch_dirs) == 1
+        batch_dir = batch_dirs[0]
+
+        # batch_dir 内に run_dir が 2 つある
+        run_dirs = [d for d in batch_dir.iterdir() if d.is_dir()]
+        assert len(run_dirs) == 2
+
+    def test_batch_seed_range(self, tmp_path: Path):
+        """--seed-start + --num-seeds で動作する"""
+        config = _make_cli_config()
+        yaml_path = tmp_path / "config.yaml"
+        config.to_yaml(yaml_path)
+
+        ret = main([
+            "--config", str(yaml_path),
+            "--base-dir", str(tmp_path / "runs"),
+            "--seed-start", "10",
+            "--num-seeds", "2",
+        ])
+        assert ret == 0
+
+    def test_batch_generates_report(self, tmp_path: Path):
+        """batch_summary.json と batch_table.csv が出力される"""
+        config = _make_cli_config()
+        yaml_path = tmp_path / "config.yaml"
+        config.to_yaml(yaml_path)
+
+        main([
+            "--config", str(yaml_path),
+            "--base-dir", str(tmp_path / "runs"),
+            "--seeds", "42,43",
+        ])
+
+        runs_dir = tmp_path / "runs"
+        batch_dirs = [d for d in runs_dir.iterdir() if d.is_dir() and "batch" in d.name]
+        batch_dir = batch_dirs[0]
+
+        assert (batch_dir / "batch_summary.json").exists()
+        assert (batch_dir / "batch_table.csv").exists()
+
+        with open(batch_dir / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert summary["num_seeds"] == 2
+        assert summary["success_count"] == 2
+
+    def test_batch_continue_on_error(self, tmp_path: Path):
+        """--continue-on-error でエラー後も続行する"""
+        config = _make_cli_config()
+        # 不正な selfplay 設定で失敗させる
+        config.selfplay["num_matches"] = 0  # 0 は失敗を引き起こす可能性がある
+        yaml_path = tmp_path / "config.yaml"
+        config.to_yaml(yaml_path)
+
+        # run_batch を直接呼んでテスト（mock で失敗させる）
+        from mahjong_rl.cli import run_batch
+        import copy
+
+        call_count = 0
+        original_run = Stage1Runner.run
+
+        def mock_run(self):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("テスト用エラー")
+            return original_run(self)
+
+        good_config = _make_cli_config()
+        with patch.object(Stage1Runner, "run", mock_run):
+            ret = run_batch(
+                good_config, [42, 43],
+                tmp_path / "batch_out",
+                stop_on_error=False,
+            )
+
+        assert ret == 1  # 1 つ失敗あり
+        # 2 つとも実行された
+        assert call_count == 2
+
+    def test_batch_stop_on_error(self, tmp_path: Path):
+        """--stop-on-error（デフォルト）でエラー時に停止する"""
+        call_count = 0
+        original_run = Stage1Runner.run
+
+        def mock_run(self):
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("テスト用エラー")
+
+        config = _make_cli_config()
+        with patch.object(Stage1Runner, "run", mock_run):
+            ret = run_batch(
+                config, [42, 43, 44],
+                tmp_path / "batch_out",
+                stop_on_error=True,
+            )
+
+        assert ret == 1
+        # 最初の 1 つでエラー停止
+        assert call_count == 1
+
+    def test_seeds_and_seed_start_conflict(self, tmp_path: Path, capsys):
+        """--seeds と --seed-start の同時指定でエラー"""
+        config = _make_cli_config()
+        yaml_path = tmp_path / "config.yaml"
+        config.to_yaml(yaml_path)
+
+        ret = main([
+            "--config", str(yaml_path),
+            "--seeds", "42,43",
+            "--seed-start", "10",
+            "--num-seeds", "2",
+        ])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "同時" in captured.err
