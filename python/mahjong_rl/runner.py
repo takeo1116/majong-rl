@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +13,72 @@ import torch
 
 from mahjong_rl.experiment import ExperimentConfig, RunDirectory
 
+import hashlib
+import traceback
+
 VALID_DEVICES = {"cpu", "cuda", "auto"}
+
+
+def derive_worker_seed(base_seed: int, worker_id: int) -> int:
+    """worker 用 seed を base_seed から派生する
+
+    SHA-256 ハッシュで衝突しにくい seed を生成する。
+
+    Args:
+        base_seed: 実験のベース seed
+        worker_id: worker 識別子
+
+    Returns:
+        worker 用 seed (0 〜 2**32-1)
+    """
+    data = f"worker:{base_seed}:{worker_id}".encode()
+    h = hashlib.sha256(data).hexdigest()
+    return int(h[:8], 16)  # 先頭 8 hex chars → 32bit
+
+
+def derive_match_seed(worker_seed: int, match_index: int) -> int:
+    """match 用 seed を worker_seed から派生する
+
+    Args:
+        worker_seed: worker のベース seed
+        match_index: match のインデックス (0-based)
+
+    Returns:
+        match 用 seed
+    """
+    data = f"match:{worker_seed}:{match_index}".encode()
+    h = hashlib.sha256(data).hexdigest()
+    return int(h[:8], 16)
+
+
+def configure_worker_threads(num_threads: int = 1) -> dict:
+    """worker 内部スレッド数を抑制する
+
+    multi-process 環境で各 worker のスレッド数を固定し、
+    スレッド競合を防ぐ。
+
+    Args:
+        num_threads: スレッド数 (デフォルト: 1)
+
+    Returns:
+        設定結果の dict (記録用)
+    """
+    torch.set_num_threads(num_threads)
+    # 注: torch.set_num_interop_threads は subprocess 内でのみ呼ぶ
+    # (プロセス起動後に変更すると abort する)
+
+    env_vars = {
+        "OMP_NUM_THREADS": str(num_threads),
+        "MKL_NUM_THREADS": str(num_threads),
+        "OPENBLAS_NUM_THREADS": str(num_threads),
+    }
+    for key, val in env_vars.items():
+        os.environ[key] = val
+
+    return {
+        "torch_num_threads": torch.get_num_threads(),
+        "env_vars": env_vars,
+    }
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -31,11 +98,196 @@ def resolve_device(requested: str) -> torch.device:
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("cuda が要求されましたが利用できません")
     return torch.device(requested)
+import multiprocessing as mp
+
 from mahjong_rl.encoders import FlatFeatureEncoder, ChannelTensorEncoder
 from mahjong_rl.models import MLPPolicyValueModel
 from mahjong_rl.selfplay_worker import SelfPlayWorker
 from mahjong_rl.learner import Learner
-from mahjong_rl.evaluator import EvaluationRunner, compute_eval_diff
+from mahjong_rl.evaluator import (
+    EvaluationRunner, compute_eval_diff,
+    PartialEvalMetrics, aggregate_partials,
+    save_partial, load_partials, aggregate_and_save,
+    aggregate_rotation_partials,
+)
+
+
+def _eval_worker_fn(
+    worker_id: int,
+    model_path: str,
+    model_config: dict,
+    encoder_config: dict,
+    obs_mode: str,
+    num_matches: int,
+    policy_seats: list[int],
+    partials_dir: str,
+    num_threads: int,
+    base_seed: int,
+    error_queue: mp.Queue | None = None,
+) -> None:
+    """evaluation worker プロセスのエントリポイント
+
+    subprocess (spawn) として実行される。結果は partials_dir に保存する。
+    モデルはファイルから読み込む (shared-memory 非依存)。
+    例外発生時は error_queue に詳細を送る。
+    """
+    try:
+        # worker は CPU 推論のため CUDA 初期化を避ける
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        # スレッド数固定 (spawn なので interop_threads も設定可能)
+        torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(num_threads)
+        env_vars = {
+            "OMP_NUM_THREADS": str(num_threads),
+            "MKL_NUM_THREADS": str(num_threads),
+            "OPENBLAS_NUM_THREADS": str(num_threads),
+        }
+        for key, val in env_vars.items():
+            os.environ[key] = val
+
+        # seed 派生: base_seed → worker_seed → match_seeds
+        worker_seed = derive_worker_seed(base_seed, worker_id)
+        match_seeds = [derive_match_seed(worker_seed, i) for i in range(num_matches)]
+
+        # モデル・エンコーダ再構築 (ファイルから state_dict を読み込み)
+        enc_name = encoder_config.get("name", "FlatFeatureEncoder")
+        enc_obs = encoder_config.get("observation_mode", obs_mode)
+        if enc_name == "ChannelTensorEncoder":
+            encoder = ChannelTensorEncoder(observation_mode=enc_obs)
+        else:
+            encoder = FlatFeatureEncoder(observation_mode=enc_obs)
+
+        import math
+        meta = encoder.metadata()
+        input_dim = math.prod(meta.output_shape)
+        model = MLPPolicyValueModel(
+            input_dim=input_dim,
+            hidden_dims=model_config.get("hidden_dims", [256, 128]),
+            value_heads=model_config.get("value_heads", ["round_delta"]),
+        )
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        eval_runner = EvaluationRunner(
+            model=model, encoder=encoder, observation_mode=obs_mode)
+
+        partial = eval_runner.evaluate_partial(
+            num_matches=num_matches,
+            policy_seats=policy_seats,
+            worker_id=worker_id,
+            match_seeds=match_seeds,
+        )
+        # seed/thread 情報をメタデータに記録
+        partial.metadata = {
+            "base_seed": base_seed,
+            "worker_seed": worker_seed,
+            "num_threads": num_threads,
+            "torch_num_threads": torch.get_num_threads(),
+        }
+        save_partial(partial, Path(partials_dir), worker_id=worker_id)
+    except Exception as e:
+        if error_queue is not None:
+            error_queue.put({
+                "worker_id": worker_id,
+                "exception_type": type(e).__name__,
+                "message": str(e),
+                "traceback": traceback.format_exc(),
+            })
+        raise
+
+
+def _selfplay_worker_fn(
+    worker_id: int,
+    model_path: str,
+    config: dict,
+    model_config: dict,
+    encoder_config: dict,
+    obs_mode: str,
+    num_matches: int,
+    match_seeds: list[int],
+    output_dir: str,
+    num_threads: int,
+    base_seed: int,
+    worker_seed: int,
+    error_queue: mp.Queue | None = None,
+) -> None:
+    """self-play worker プロセスのエントリポイント
+
+    subprocess (spawn) として実行される。shard を output_dir に保存し、
+    stats.json に統計を書き出す。
+    """
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(num_threads)
+        env_vars = {
+            "OMP_NUM_THREADS": str(num_threads),
+            "MKL_NUM_THREADS": str(num_threads),
+            "OPENBLAS_NUM_THREADS": str(num_threads),
+        }
+        for key, val in env_vars.items():
+            os.environ[key] = val
+
+        # エンコーダ再構築
+        enc_name = encoder_config.get("name", "FlatFeatureEncoder")
+        enc_obs = encoder_config.get("observation_mode", obs_mode)
+        if enc_name == "ChannelTensorEncoder":
+            encoder = ChannelTensorEncoder(observation_mode=enc_obs)
+        else:
+            encoder = FlatFeatureEncoder(observation_mode=enc_obs)
+
+        # モデル再構築
+        import math
+        meta = encoder.metadata()
+        input_dim = math.prod(meta.output_shape)
+        model = MLPPolicyValueModel(
+            input_dim=input_dim,
+            hidden_dims=model_config.get("hidden_dims", [256, 128]),
+            value_heads=model_config.get("value_heads", ["round_delta"]),
+        )
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        worker = SelfPlayWorker(
+            config=config,
+            model=model,
+            encoder=encoder,
+            output_dir=Path(output_dir),
+            worker_id=f"worker_{worker_id}",
+            inference_device=torch.device("cpu"),
+        )
+        sp_stats = worker.run(
+            num_matches=num_matches,
+            match_seeds=match_seeds,
+        )
+
+        # stats を JSON で保存
+        sp_stats["base_seed"] = base_seed
+        sp_stats["worker_seed"] = worker_seed
+        sp_stats["worker_id"] = worker_id
+        sp_stats["num_threads"] = num_threads
+        if match_seeds is not None and len(match_seeds) > 0:
+            sp_stats["match_index_start"] = 0
+            sp_stats["match_index_end"] = len(match_seeds) - 1
+            sp_stats["first_match_seed"] = match_seeds[0]
+            sp_stats["last_match_seed"] = match_seeds[-1]
+        stats_path = Path(output_dir) / "stats.json"
+        import json as _json
+        with open(stats_path, "w") as f:
+            _json.dump(sp_stats, f, indent=2)
+
+    except Exception as e:
+        if error_queue is not None:
+            error_queue.put({
+                "worker_id": worker_id,
+                "exception_type": type(e).__name__,
+                "message": str(e),
+                "traceback": traceback.format_exc(),
+            })
+        raise
+
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +403,54 @@ class Stage1Runner:
             if dv not in VALID_DEVICES:
                 errors.append(
                     f"不正な {label} '{dv}' (有効値: {sorted(VALID_DEVICES)})")
+
+        # num_workers チェック
+        for section_name, key in [
+            ("selfplay", "num_workers"),
+            ("evaluation", "num_workers"),
+        ]:
+            section = getattr(cfg, section_name, {})
+            nw = section.get(key, None)
+            if nw is not None:
+                if not isinstance(nw, int) or isinstance(nw, bool):
+                    errors.append(
+                        f"{section_name}.{key} は正の整数で指定してください"
+                        f" (型: {type(nw).__name__})")
+                elif nw < 1:
+                    errors.append(
+                        f"{section_name}.{key} は 1 以上で指定してください"
+                        f" (値: {nw})")
+
+        # worker_num_threads チェック
+        for section_name, key in [
+            ("selfplay", "worker_num_threads"),
+            ("evaluation", "worker_num_threads"),
+        ]:
+            section = getattr(cfg, section_name, {})
+            nt = section.get(key, None)
+            if nt is not None:
+                if not isinstance(nt, int) or isinstance(nt, bool):
+                    errors.append(
+                        f"{section_name}.{key} は正の整数で指定してください"
+                        f" (型: {type(nt).__name__})")
+                elif nt < 1:
+                    errors.append(
+                        f"{section_name}.{key} は 1 以上で指定してください"
+                        f" (値: {nt})")
+
+        # output_layout チェック
+        ol = cfg.selfplay.get("output_layout", None)
+        if ol is not None and ol != "worker_subdir":
+            errors.append(
+                f"不正な selfplay.output_layout '{ol}'"
+                f" (有効値: worker_subdir)")
+
+        # seed_strategy チェック
+        ss = cfg.experiment.get("seed_strategy", None)
+        if ss is not None and ss != "derive":
+            errors.append(
+                f"不正な experiment.seed_strategy '{ss}'"
+                f" (有効値: derive)")
 
         return errors
 
@@ -344,16 +644,27 @@ class Stage1Runner:
         return metrics
 
     def _run_selfplay(self, run_dir: Path, model, encoder) -> dict:
-        """self-play フェーズ"""
+        """self-play フェーズ
+
+        selfplay.num_workers > 1 の場合は multi-process 実行。
+        """
         sp_cfg = self._config.selfplay
+        num_workers = sp_cfg.get("num_workers", 1)
+
+        if num_workers > 1:
+            return self._run_selfplay_parallel(run_dir, model, num_workers)
+
+        # 単一 worker 経路
         selfplay_dir = run_dir / "selfplay"
+        worker_output_dir = selfplay_dir / "worker_0"
         sp_device = resolve_device(
             sp_cfg.get("inference_device", "auto"))
         worker = SelfPlayWorker(
             config=self._as_dict(),
             model=model,
             encoder=encoder,
-            output_dir=selfplay_dir,
+            output_dir=worker_output_dir,
+            worker_id="worker_0",
             inference_device=sp_device,
         )
         sp_stats = worker.run(
@@ -362,6 +673,102 @@ class Stage1Runner:
         )
         logger.info(f"  total_steps: {sp_stats['total_steps']}")
         return sp_stats
+
+    def _run_selfplay_parallel(
+        self, run_dir: Path, model, num_workers: int,
+    ) -> dict:
+        """multi-process self-play を実行する
+
+        各 worker に matches を分配し、worker_*/shard_*.parquet に保存後に統計を集約する。
+        """
+        sp_cfg = self._config.selfplay
+        selfplay_dir = run_dir / "selfplay"
+        selfplay_dir.mkdir(parents=True, exist_ok=True)
+        num_matches = sp_cfg.get("num_matches", 10)
+        num_threads = sp_cfg.get("worker_num_threads", 1)
+        base_seed = self._global_seed or 0
+        obs_mode = self._config.experiment.get("observation_mode", "full")
+
+        # model を一時ファイルに保存
+        model_path = selfplay_dir / "_selfplay_model.pt"
+        state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+        torch.save(state_dict_cpu, model_path)
+
+        model_config = dict(self._config.model)
+        encoder_config = dict(self._config.feature_encoder)
+        config_dict = self._as_dict()
+
+        matches_per_worker = self._distribute_matches(num_matches, num_workers)
+
+        ctx = mp.get_context("spawn")
+        error_queue = ctx.Queue()
+        processes = []
+
+        try:
+            for i, wm in enumerate(matches_per_worker):
+                if wm == 0:
+                    continue
+                worker_seed = derive_worker_seed(base_seed, i)
+                match_seeds = [derive_match_seed(worker_seed, j) for j in range(wm)]
+                worker_output_dir = selfplay_dir / f"worker_{i}"
+
+                p = ctx.Process(
+                    target=_selfplay_worker_fn,
+                    args=(
+                        i, str(model_path), config_dict, model_config,
+                        encoder_config, obs_mode, wm, match_seeds,
+                        str(worker_output_dir), num_threads, base_seed,
+                        worker_seed, error_queue,
+                    ),
+                )
+                p.start()
+                processes.append(p)
+
+            self._wait_and_check_workers(
+                processes, error_queue=error_queue,
+                worker_label="selfplay worker")
+
+            # 統計集約
+            aggregated = self._aggregate_selfplay_stats(selfplay_dir, num_workers)
+            aggregated["num_workers"] = num_workers
+            aggregated["seed_strategy"] = {
+                "base_seed": base_seed,
+                "method": "derive_worker_seed + derive_match_seed",
+            }
+            logger.info(
+                f"  total_steps: {aggregated['total_steps']} "
+                f"({num_workers} workers)")
+            return aggregated
+        finally:
+            if model_path.exists():
+                model_path.unlink()
+
+    @staticmethod
+    def _aggregate_selfplay_stats(selfplay_dir: Path, num_workers: int) -> dict:
+        """各 worker の stats.json を読んで集約する"""
+        total_steps = 0
+        total_rounds = 0
+        total_matches = 0
+        worker_stats_list = []
+
+        for i in range(num_workers):
+            stats_path = selfplay_dir / f"worker_{i}" / "stats.json"
+            if not stats_path.exists():
+                continue
+            with open(stats_path) as f:
+                ws = json.load(f)
+            total_steps += ws.get("total_steps", 0)
+            total_rounds += ws.get("total_rounds", 0)
+            total_matches += ws.get("num_matches", 0)
+            worker_stats_list.append(ws)
+
+        return {
+            "num_matches": total_matches,
+            "total_steps": total_steps,
+            "total_rounds": total_rounds,
+            "output_dir": str(selfplay_dir),
+            "worker_stats": worker_stats_list,
+        }
 
     def _run_learner(self, run_dir: Path, shard_dir: Path, model) -> dict:
         """learner フェーズ"""
@@ -383,11 +790,23 @@ class Stage1Runner:
         """eval フェーズ
 
         evaluation.mode で単席 / rotation を切り替え可能。
+        evaluation.num_workers > 1 の場合は multi-process 実行。
         - "single" (デフォルト): 単席評価
         - "rotation": 全席ローテーション評価
         """
         eval_cfg = self._config.evaluation
         eval_dir = eval_dir_override or (run_dir / "eval")
+        num_workers = eval_cfg.get("num_workers", 1)
+        eval_mode = eval_cfg.get("mode", "single")
+        num_matches = eval_cfg.get("num_matches", 10)
+        seed_start = eval_cfg.get("seed_start", 0)
+
+        if num_workers > 1:
+            return self._run_eval_parallel(
+                run_dir, model, eval_dir, eval_mode, num_matches,
+                seed_start, num_workers, obs_mode)
+
+        # 単一プロセス評価 (既存経路)
         eval_device = resolve_device(
             eval_cfg.get("inference_device", "auto"))
         eval_runner = EvaluationRunner(
@@ -396,9 +815,6 @@ class Stage1Runner:
             observation_mode=obs_mode,
             inference_device=eval_device,
         )
-        eval_mode = eval_cfg.get("mode", "single")
-        num_matches = eval_cfg.get("num_matches", 10)
-        seed_start = eval_cfg.get("seed_start", 0)
 
         if eval_mode == "rotation":
             seats = eval_cfg.get("rotation_seats", [0, 1, 2, 3])
@@ -434,6 +850,244 @@ class Stage1Runner:
                 "win_rate": eval_metrics.win_rate,
                 "deal_in_rate": eval_metrics.deal_in_rate,
             }
+
+    def _run_eval_parallel(
+        self,
+        run_dir: Path,
+        model,
+        eval_dir: Path,
+        eval_mode: str,
+        num_matches: int,
+        seed_start: int,
+        num_workers: int,
+        obs_mode: str,
+    ) -> dict:
+        """multi-process evaluation を実行する
+
+        各 worker に matches を分配し、partial 結果を保存後に集約する。
+        モデルはファイル経由で受け渡す (shared-memory 非依存)。
+        """
+        eval_cfg = self._config.evaluation
+        partials_dir = eval_dir / "partials"
+        partials_dir.mkdir(parents=True, exist_ok=True)
+        num_threads = eval_cfg.get("worker_num_threads", 1)
+        base_seed = self._global_seed or 0
+
+        # state_dict をファイルに保存 (shared-memory 非依存)
+        model_path = eval_dir / "_eval_model.pt"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+        torch.save(state_dict_cpu, model_path)
+
+        model_config = dict(self._config.model)
+        encoder_config = dict(self._config.feature_encoder)
+
+        try:
+            if eval_mode == "rotation":
+                seats = eval_cfg.get("rotation_seats", [0, 1, 2, 3])
+                return self._run_eval_parallel_rotation(
+                    partials_dir, eval_dir, str(model_path), model_config,
+                    encoder_config, obs_mode, num_matches,
+                    num_workers, num_threads, base_seed, seats)
+            else:
+                policy_seats = eval_cfg.get("policy_seats", None) or [0]
+                return self._run_eval_parallel_single(
+                    partials_dir, eval_dir, str(model_path), model_config,
+                    encoder_config, obs_mode, num_matches,
+                    num_workers, num_threads, base_seed, policy_seats)
+        finally:
+            # 一時モデルファイルを削除
+            if model_path.exists():
+                model_path.unlink()
+
+    def _run_eval_parallel_single(
+        self,
+        partials_dir: Path,
+        eval_dir: Path,
+        model_path: str,
+        model_config: dict,
+        encoder_config: dict,
+        obs_mode: str,
+        num_matches: int,
+        num_workers: int,
+        num_threads: int,
+        base_seed: int,
+        policy_seats: list[int],
+    ) -> dict:
+        """single モードの parallel eval"""
+        # matches を worker に分配
+        matches_per_worker = self._distribute_matches(num_matches, num_workers)
+
+        ctx = mp.get_context("spawn")
+        error_queue = ctx.Queue()
+        processes = self._spawn_eval_workers(
+            matches_per_worker, model_path, model_config, encoder_config,
+            obs_mode, policy_seats, str(partials_dir), num_threads, base_seed,
+            error_queue=error_queue)
+
+        self._wait_and_check_workers(processes, error_queue=error_queue)
+
+        # 集約
+        metrics = aggregate_and_save(partials_dir, eval_dir)
+        logger.info(f"  avg_rank (parallel, {num_workers} workers): {metrics.avg_rank:.2f}")
+        return {
+            "eval_mode": "single",
+            "avg_rank": metrics.avg_rank,
+            "avg_score": metrics.avg_score,
+            "win_rate": metrics.win_rate,
+            "deal_in_rate": metrics.deal_in_rate,
+            "num_workers": num_workers,
+        }
+
+    def _run_eval_parallel_rotation(
+        self,
+        partials_dir: Path,
+        eval_dir: Path,
+        model_path: str,
+        model_config: dict,
+        encoder_config: dict,
+        obs_mode: str,
+        num_matches: int,
+        num_workers: int,
+        num_threads: int,
+        base_seed: int,
+        seats: list[int],
+    ) -> dict:
+        """rotation モードの parallel eval
+
+        各席を各 worker に割り当てる。worker 数が席数より多い場合、
+        席ごとの matches も分割する。
+        """
+        ctx = mp.get_context("spawn")
+        error_queue = ctx.Queue()
+        all_processes = []
+        worker_id_offset = 0
+
+        for seat in seats:
+            if num_workers >= len(seats):
+                workers_for_seat = max(1, num_workers // len(seats))
+            else:
+                workers_for_seat = 1
+            matches_per_worker = self._distribute_matches(
+                num_matches, workers_for_seat)
+
+            processes = self._spawn_eval_workers(
+                matches_per_worker, model_path, model_config,
+                encoder_config, obs_mode, [seat],
+                str(partials_dir), num_threads, base_seed,
+                worker_id_offset=worker_id_offset,
+                error_queue=error_queue)
+            all_processes.extend(processes)
+            worker_id_offset += len(matches_per_worker)
+
+        self._wait_and_check_workers(all_processes, error_queue=error_queue)
+
+        # 席別集約
+        result = aggregate_rotation_partials(partials_dir, eval_dir, seats)
+        agg = result.aggregate
+        logger.info(f"  avg_rank (rotation parallel, {num_workers} workers): {agg.avg_rank:.2f}")
+        return {
+            "eval_mode": "rotation",
+            "rotation_seats": seats,
+            "avg_rank": agg.avg_rank,
+            "avg_score": agg.avg_score,
+            "win_rate": agg.win_rate,
+            "deal_in_rate": agg.deal_in_rate,
+            "num_workers": num_workers,
+        }
+
+    @staticmethod
+    def _spawn_eval_workers(
+        matches_per_worker: list[int],
+        model_path: str,
+        model_config: dict,
+        encoder_config: dict,
+        obs_mode: str,
+        policy_seats: list[int],
+        partials_dir: str,
+        num_threads: int,
+        base_seed: int,
+        worker_id_offset: int = 0,
+        error_queue: mp.Queue | None = None,
+    ) -> list[mp.Process]:
+        """eval worker プロセスを生成・起動する
+
+        Returns:
+            起動済みの Process リスト
+        """
+        ctx = mp.get_context("spawn")
+        processes = []
+        for i, wm in enumerate(matches_per_worker):
+            if wm == 0:
+                continue
+            wid = worker_id_offset + i
+            p = ctx.Process(
+                target=_eval_worker_fn,
+                args=(
+                    wid, model_path, model_config, encoder_config,
+                    obs_mode, wm, policy_seats,
+                    partials_dir, num_threads, base_seed,
+                    error_queue,
+                ),
+            )
+            p.start()
+            processes.append(p)
+        return processes
+
+    @staticmethod
+    def _wait_and_check_workers(
+        processes: list[mp.Process],
+        error_queue: mp.Queue | None = None,
+        worker_label: str = "eval worker",
+    ) -> None:
+        """全 worker の完了を待ち、エラーを検知する
+
+        error_queue が渡された場合、worker 側の例外詳細を取得してログに記録する。
+        """
+        for p in processes:
+            p.join()
+
+        # error_queue からエラー詳細を収集
+        # (Queue.empty() は信頼性が低いため get_nowait + Empty 例外で終了)
+        worker_errors: list[dict] = []
+        if error_queue is not None:
+            import queue
+            while True:
+                try:
+                    worker_errors.append(error_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+        failed = [p for p in processes if p.exitcode != 0]
+        if failed:
+            exit_codes = [p.exitcode for p in failed]
+
+            # worker 側エラー詳細をログ出力
+            for err in worker_errors:
+                logger.error(
+                    f"{worker_label} {err['worker_id']} 例外: "
+                    f"[{err['exception_type']}] {err['message']}")
+                logger.error(f"{worker_label} {err['worker_id']} traceback:\n{err['traceback']}")
+
+            # エラーメッセージ組み立て
+            msg_parts = [f"{worker_label} {len(failed)}/{len(processes)} 件が失敗 (exit codes: {exit_codes})"]
+            for err in worker_errors:
+                msg_parts.append(
+                    f"  worker {err['worker_id']}: [{err['exception_type']}] {err['message']}")
+            msg = "\n".join(msg_parts)
+            logger.error(msg)
+            raise RuntimeError(msg)
+
+    @staticmethod
+    def _distribute_matches(num_matches: int, num_workers: int) -> list[int]:
+        """matches を worker に均等分配する
+
+        Returns:
+            各 worker の match 数リスト
+        """
+        base = num_matches // num_workers
+        remainder = num_matches % num_workers
+        return [base + (1 if i < remainder else 0) for i in range(num_workers)]
 
     def _create_encoder(self):
         """設定からエンコーダを生成する"""
@@ -487,9 +1141,14 @@ class Stage1Runner:
     def _save_summary(self, run_dir: Path, result: dict,
                       phase_status: dict[str, str]) -> None:
         """summary.json を保存する"""
-        # shard 数カウント
+        # shard 数カウント (平坦 + worker サブディレクトリ)
         selfplay_dir = run_dir / "selfplay"
-        shard_count = len(list(selfplay_dir.glob("shard_*.parquet"))) if selfplay_dir.exists() else 0
+        if selfplay_dir.exists():
+            flat = list(selfplay_dir.glob("shard_*.parquet"))
+            nested = list(selfplay_dir.glob("worker_*/shard_*.parquet"))
+            shard_count = len(set(flat) | set(nested))
+        else:
+            shard_count = 0
 
         # checkpoint 有無
         ckpt_dir = run_dir / "checkpoints"
@@ -504,8 +1163,10 @@ class Stage1Runner:
             sp = result["selfplay_stats"]
             phase_stats["selfplay"] = {
                 "total_steps": sp.get("total_steps", 0),
-                "total_matches": sp.get("total_matches", 0),
+                "total_matches": sp.get("num_matches", 0),
                 "shard_count": shard_count,
+                "num_workers": sp.get("num_workers", 1),
+                "seed_strategy": sp.get("seed_strategy"),
             }
         if "imitation_metrics" in result:
             imi = result["imitation_metrics"]
@@ -581,10 +1242,12 @@ class Stage1Runner:
         counts: dict[str, int] = {}
         for subdir_name in ["selfplay", "imitation"]:
             subdir = run_dir / subdir_name
-            if not subdir.exists() or not list(subdir.glob("shard_*.parquet")):
+            if not subdir.exists():
                 continue
             try:
                 reader = ShardReader(subdir)
+                if not reader._find_shards():
+                    continue
                 tensors = reader.read_as_tensors()
                 for at in tensors.get("actor_types", []):
                     counts[at] = counts.get(at, 0) + 1
@@ -613,6 +1276,9 @@ class Stage1Runner:
             lines.append(f"- devices: training={resolved.get('training', '?')}, "
                          f"selfplay={resolved.get('selfplay', '?')}, "
                          f"eval={resolved.get('evaluation', '?')}")
+
+        # Python 実行環境情報
+        lines.append(f"- python: {sys.version.split()[0]} ({sys.executable})")
 
         # エラー情報
         if "error" in result:
@@ -675,14 +1341,20 @@ class Stage1Runner:
 
     @staticmethod
     def _collect_env_info() -> dict:
-        """PyTorch/CUDA 環境情報を収集する"""
+        """PyTorch/CUDA/Python 環境情報を収集する"""
         info: dict = {
             "torch_version": torch.__version__,
             "cuda_available": torch.cuda.is_available(),
+            "python_version": sys.version,
+            "python_executable": sys.executable,
+            "venv": os.environ.get("VIRTUAL_ENV"),
         }
         if torch.cuda.is_available():
-            info["cuda_device_name"] = torch.cuda.get_device_name(0)
-            info["cuda_device_count"] = torch.cuda.device_count()
+            try:
+                info["cuda_device_name"] = torch.cuda.get_device_name(0)
+                info["cuda_device_count"] = torch.cuda.device_count()
+            except Exception:
+                pass
         return info
 
     def _as_dict(self) -> dict:

@@ -288,3 +288,49 @@ class TestShardBackendAbstraction:
         writer = ShardWriter(tmp_path, validate=True)
         writer.add(sample)  # 例外なし — writer が shard_id を付与済み
         writer.close()
+
+
+@pytest.mark.smoke
+class TestShardReaderSubdirectory:
+    """ShardReader のサブディレクトリ対応テスト (CQ-0071)"""
+
+    def test_read_from_worker_subdirectories(self, tmp_path: Path):
+        """worker_*/shard_*.parquet 構造から読める"""
+        for wid in range(2):
+            worker_dir = tmp_path / f"worker_{wid}"
+            writer = ShardWriter(worker_dir, max_samples=100)
+            for i in range(3):
+                writer.add(_make_sample(step_id=wid * 10 + i))
+            writer.close()
+
+        reader = ShardReader(tmp_path)
+        loaded = reader.read_all()
+        assert len(loaded) == 6
+
+    def test_read_mixed_flat_and_nested(self, tmp_path: Path):
+        """平坦 shard と nested shard が混在する場合に両方読める"""
+        # 平坦
+        writer = ShardWriter(tmp_path, max_samples=100)
+        writer.add(_make_sample(step_id=0))
+        writer.close()
+        # nested
+        nested_dir = tmp_path / "worker_0"
+        writer2 = ShardWriter(nested_dir, max_samples=100)
+        writer2.add(_make_sample(step_id=1))
+        writer2.close()
+
+        reader = ShardReader(tmp_path)
+        loaded = reader.read_all()
+        assert len(loaded) == 2
+
+    def test_read_as_tensors_from_subdirectories(self, tmp_path: Path):
+        """read_as_tensors もサブディレクトリから読める"""
+        worker_dir = tmp_path / "worker_0"
+        writer = ShardWriter(worker_dir, max_samples=100)
+        for i in range(5):
+            writer.add(_make_sample(step_id=i))
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        tensors = reader.read_as_tensors()
+        assert tensors["observations"].shape[0] == 5

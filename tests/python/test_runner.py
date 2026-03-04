@@ -6,7 +6,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mahjong_rl.experiment import ExperimentConfig
-from mahjong_rl.runner import Stage1Runner, resolve_device
+from mahjong_rl.runner import (
+    Stage1Runner, resolve_device,
+    derive_worker_seed, derive_match_seed, configure_worker_threads,
+)
 
 
 def _make_minimal_config() -> ExperimentConfig:
@@ -52,8 +55,8 @@ class TestStage1Runner:
         assert (run_dir / "config.yaml").exists()
         assert (run_dir / "notes.md").exists()
 
-        # self-play shard
-        shards = list((run_dir / "selfplay").glob("shard_*.parquet"))
+        # self-play shard (worker サブディレクトリ)
+        shards = list((run_dir / "selfplay").glob("worker_*/shard_*.parquet"))
         assert len(shards) >= 1
 
         # checkpoint
@@ -404,6 +407,20 @@ class TestPhaseStats:
         sp = summary["phase_stats"]["selfplay"]
         assert sp["total_steps"] > 0
         assert sp["shard_count"] >= 1
+
+    def test_selfplay_total_matches_nonzero(self, tmp_path: Path):
+        """selfplay.total_matches が config の対局数と整合する (CQ-0069)"""
+        config = _make_minimal_config()
+        config.selfplay["num_matches"] = 3
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        sp = summary["phase_stats"]["selfplay"]
+        assert sp["total_matches"] == 3
 
     def test_eval_stats_in_summary(self, tmp_path: Path):
         """eval フェーズ統計が記録される"""
@@ -759,6 +776,34 @@ class TestDeviceEnvInfo:
         assert isinstance(ei["torch_version"], str)
         assert isinstance(ei["cuda_available"], bool)
 
+    def test_env_info_has_python_info(self, tmp_path: Path):
+        """env_info に Python 実行環境情報が含まれる (CQ-0070)"""
+        config = _make_minimal_config()
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        ei = summary["env_info"]
+        assert isinstance(ei["python_version"], str)
+        assert len(ei["python_version"]) > 0
+        assert isinstance(ei["python_executable"], str)
+        assert len(ei["python_executable"]) > 0
+        # venv は None か文字列
+        assert ei["venv"] is None or isinstance(ei["venv"], str)
+
+    def test_notes_has_python_info(self, tmp_path: Path):
+        """notes.md に Python 情報が含まれる (CQ-0070)"""
+        config = _make_minimal_config()
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        notes = (run_dir / "notes.md").read_text()
+        assert "python:" in notes
+
     def test_resolved_devices_in_result(self, tmp_path: Path):
         """result に resolved_devices が含まれる"""
         config = _make_minimal_config()
@@ -884,3 +929,604 @@ class TestLearnerNumUpdates:
         import math
         expected = epochs * math.ceil(total_steps / batch_size)
         assert result["train_metrics"]["num_updates"] == expected
+
+
+@pytest.mark.smoke
+class TestSeedDerivation:
+    """seed 派生テスト (CQ-0070)"""
+
+    def test_different_workers_get_different_seeds(self):
+        """異なる worker_id で異なる seed が生成される"""
+        s0 = derive_worker_seed(42, 0)
+        s1 = derive_worker_seed(42, 1)
+        s2 = derive_worker_seed(42, 2)
+        assert len({s0, s1, s2}) == 3
+
+    def test_same_inputs_give_same_seed(self):
+        """同一入力で同一 seed"""
+        assert derive_worker_seed(42, 0) == derive_worker_seed(42, 0)
+
+    def test_seed_in_valid_range(self):
+        """seed が 0 〜 2**32-1 の範囲"""
+        for wid in range(10):
+            s = derive_worker_seed(12345, wid)
+            assert 0 <= s <= 2**32 - 1
+
+    def test_different_base_seeds(self):
+        """異なる base_seed で異なる worker seed"""
+        s1 = derive_worker_seed(100, 0)
+        s2 = derive_worker_seed(200, 0)
+        assert s1 != s2
+
+    def test_match_seed_derivation(self):
+        """match seed が worker_seed + match_index から派生される"""
+        ws = derive_worker_seed(42, 0)
+        m0 = derive_match_seed(ws, 0)
+        m1 = derive_match_seed(ws, 1)
+        assert m0 != m1
+        assert 0 <= m0 <= 2**32 - 1
+
+    def test_match_seed_deterministic(self):
+        """同一入力で同一 match seed"""
+        ws = derive_worker_seed(42, 0)
+        assert derive_match_seed(ws, 5) == derive_match_seed(ws, 5)
+
+
+@pytest.mark.smoke
+class TestConfigureWorkerThreads:
+    """worker thread 固定テスト (CQ-0070)"""
+
+    def test_thread_count_set(self):
+        """configure_worker_threads が torch スレッド数を設定する"""
+        import os
+        result = configure_worker_threads(num_threads=1)
+        assert result["torch_num_threads"] == 1
+        assert os.environ.get("OMP_NUM_THREADS") == "1"
+        assert os.environ.get("MKL_NUM_THREADS") == "1"
+        assert os.environ.get("OPENBLAS_NUM_THREADS") == "1"
+
+    def test_returns_env_vars(self):
+        """設定結果に env_vars が含まれる"""
+        result = configure_worker_threads(num_threads=1)
+        assert "env_vars" in result
+        assert result["env_vars"]["OMP_NUM_THREADS"] == "1"
+
+
+@pytest.mark.smoke
+class TestDistributeMatches:
+    """matches 分配テスト (CQ-0069)"""
+
+    def test_even_distribution(self):
+        """均等に分配される"""
+        result = Stage1Runner._distribute_matches(10, 2)
+        assert result == [5, 5]
+
+    def test_uneven_distribution(self):
+        """余りが先頭 worker に割り当てられる"""
+        result = Stage1Runner._distribute_matches(10, 3)
+        assert result == [4, 3, 3]
+        assert sum(result) == 10
+
+    def test_single_worker(self):
+        """worker 1 の場合は全 matches"""
+        result = Stage1Runner._distribute_matches(10, 1)
+        assert result == [10]
+
+    def test_more_workers_than_matches(self):
+        """worker 数が matches 数より多い場合"""
+        result = Stage1Runner._distribute_matches(2, 5)
+        assert sum(result) == 2
+        assert result.count(0) == 3
+
+
+@pytest.mark.smoke
+class TestEvalNumWorkers1:
+    """num_workers=1 で既存動作を維持 (CQ-0069)"""
+
+    def test_default_num_workers_is_1(self):
+        """num_workers 未指定で既存経路"""
+        config = _make_minimal_config()
+        assert config.evaluation.get("num_workers", 1) == 1
+
+
+@pytest.mark.slow
+class TestEvalMultiProcess:
+    """multi-process eval テスト (CQ-0069)"""
+
+    def test_parallel_eval_single_mode(self, tmp_path: Path):
+        """num_workers=2 で single 評価が完走する"""
+        config = _make_minimal_config()
+        config.evaluation["num_workers"] = 2
+        config.evaluation["num_matches"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert result["eval_metrics"]["eval_mode"] == "single"
+        assert 1.0 <= result["eval_metrics"]["avg_rank"] <= 4.0
+        assert result["eval_metrics"].get("num_workers") == 2
+
+    def test_parallel_eval_rotation_mode(self, tmp_path: Path):
+        """num_workers=2 で rotation 評価が完走する"""
+        config = _make_minimal_config()
+        config.evaluation["num_workers"] = 2
+        config.evaluation["num_matches"] = 1
+        config.evaluation["mode"] = "rotation"
+        config.evaluation["rotation_seats"] = [0, 1]
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert result["eval_metrics"]["eval_mode"] == "rotation"
+        assert result["eval_metrics"]["rotation_seats"] == [0, 1]
+        assert result["eval_metrics"].get("num_workers") == 2
+
+    def test_parallel_eval_creates_partials(self, tmp_path: Path):
+        """parallel eval が partials ディレクトリを生成する"""
+        config = _make_minimal_config()
+        config.evaluation["num_workers"] = 2
+        config.evaluation["num_matches"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        partials_dir = run_dir / "eval" / "partials"
+        assert partials_dir.exists()
+        partials = list(partials_dir.glob("worker_*.json"))
+        assert len(partials) >= 2
+
+    def test_num_workers_1_uses_existing_path(self, tmp_path: Path):
+        """num_workers=1 で既存の単一プロセス経路が使われる"""
+        config = _make_minimal_config()
+        config.evaluation["num_workers"] = 1
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        # num_workers=1 では parallel 経路を使わないので num_workers キーなし
+        assert "num_workers" not in result.get("eval_metrics", {})
+
+    def test_parallel_partials_have_seed_metadata(self, tmp_path: Path):
+        """parallel eval の partial に seed/thread 情報が記録される (CQ-0078)"""
+        config = _make_minimal_config()
+        config.evaluation["num_workers"] = 2
+        config.evaluation["num_matches"] = 2
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        partials_dir = run_dir / "eval" / "partials"
+        partials = sorted(partials_dir.glob("worker_*.json"))
+        assert len(partials) >= 2
+
+        for p_path in partials:
+            with open(p_path) as f:
+                data = json.load(f)
+            assert "metadata" in data
+            meta = data["metadata"]
+            assert "base_seed" in meta
+            assert meta["base_seed"] == 42
+            assert "worker_seed" in meta
+            assert "num_threads" in meta
+            assert "torch_num_threads" in meta
+
+    def test_parallel_worker_seeds_unique(self, tmp_path: Path):
+        """parallel eval の各 worker の seed が異なる (CQ-0078)"""
+        config = _make_minimal_config()
+        config.evaluation["num_workers"] = 2
+        config.evaluation["num_matches"] = 2
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        partials_dir = run_dir / "eval" / "partials"
+        partials = sorted(partials_dir.glob("worker_*.json"))
+
+        worker_seeds = set()
+        for p_path in partials:
+            with open(p_path) as f:
+                data = json.load(f)
+            worker_seeds.add(data["metadata"]["worker_seed"])
+        assert len(worker_seeds) == len(partials)
+
+    def test_model_file_cleaned_up(self, tmp_path: Path):
+        """parallel eval 後に一時モデルファイルが削除される (CQ-0077)"""
+        config = _make_minimal_config()
+        config.evaluation["num_workers"] = 2
+        config.evaluation["num_matches"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        # _eval_model.pt は削除されているはず
+        assert not (run_dir / "eval" / "_eval_model.pt").exists()
+
+
+@pytest.mark.slow
+class TestSelfPlayMultiProcess:
+    """multi-process self-play テスト (CQ-0072)"""
+
+    def test_parallel_selfplay_completes(self, tmp_path: Path):
+        """num_workers=2 で self-play が完走する"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert result["selfplay_stats"]["total_steps"] > 0
+        assert result["selfplay_stats"].get("num_workers") == 2
+
+    def test_parallel_selfplay_creates_worker_dirs(self, tmp_path: Path):
+        """worker ごとに shard サブディレクトリが作られる"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        selfplay_dir = run_dir / "selfplay"
+        assert (selfplay_dir / "worker_0").exists()
+        assert (selfplay_dir / "worker_1").exists()
+        for wid in range(2):
+            shards = list((selfplay_dir / f"worker_{wid}").glob("shard_*.parquet"))
+            assert len(shards) >= 1
+
+    def test_parallel_selfplay_learner_reads_shards(self, tmp_path: Path):
+        """parallel self-play の shard を learner が読めて学習が完走する"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert "train_metrics" in result
+        assert result["train_metrics"]["total_steps"] > 0
+
+    def test_parallel_selfplay_seeds_differ(self, tmp_path: Path):
+        """各 worker の seed が異なる (CQ-0073)"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 2
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        selfplay_dir = run_dir / "selfplay"
+        worker_seeds = set()
+        for wid in range(2):
+            stats_path = selfplay_dir / f"worker_{wid}" / "stats.json"
+            assert stats_path.exists()
+            with open(stats_path) as f:
+                data = json.load(f)
+            worker_seeds.add(data["worker_seed"])
+        assert len(worker_seeds) == 2
+
+    def test_num_workers_1_uses_existing_path(self, tmp_path: Path):
+        """num_workers=1 で既存経路が使われる"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 1
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert "num_workers" not in result.get("selfplay_stats", {})
+
+    def test_model_file_cleaned_up(self, tmp_path: Path):
+        """parallel self-play 後に一時モデルファイルが削除される"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        assert not (run_dir / "selfplay" / "_selfplay_model.pt").exists()
+
+    def test_seed_strategy_in_summary(self, tmp_path: Path):
+        """summary に seed_strategy が記録される (CQ-0073)"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 2
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        sp_stats = summary["phase_stats"]["selfplay"]
+        assert sp_stats["num_workers"] == 2
+        assert sp_stats["seed_strategy"] is not None
+        assert sp_stats["seed_strategy"]["base_seed"] == 42
+
+    def test_seed_range_recorded_in_worker_stats(self, tmp_path: Path):
+        """各 worker の stats.json に seed range が記録される (CQ-0080)"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 4
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        selfplay_dir = run_dir / "selfplay"
+
+        for wid in range(2):
+            stats_path = selfplay_dir / f"worker_{wid}" / "stats.json"
+            assert stats_path.exists()
+            with open(stats_path) as f:
+                data = json.load(f)
+            # seed range フィールドが存在する
+            assert "match_index_start" in data
+            assert "match_index_end" in data
+            assert "first_match_seed" in data
+            assert "last_match_seed" in data
+            # match_index_start は 0
+            assert data["match_index_start"] == 0
+            # match_index_end は num_matches - 1
+            wm = data["num_matches"]
+            assert data["match_index_end"] == wm - 1
+            # first/last seed が異なる (matches > 1 なら)
+            if wm > 1:
+                assert data["first_match_seed"] != data["last_match_seed"]
+
+
+class TestEvalWorkerErrorReporting:
+    """worker 失敗時のエラー詳細ログテスト (CQ-0079)"""
+
+    def test_error_queue_details_in_runtime_error(self):
+        """error_queue にエラー詳細があると RuntimeError メッセージに含まれる"""
+        import queue as stdlib_queue
+        from unittest.mock import MagicMock
+
+        error_queue = stdlib_queue.Queue()
+        error_queue.put({
+            "worker_id": 99,
+            "exception_type": "ValueError",
+            "message": "テスト用の意図的エラー",
+            "traceback": "Traceback ...\nValueError: テスト用の意図的エラー\n",
+        })
+
+        # exitcode != 0 の mock process
+        mock_proc = MagicMock()
+        mock_proc.exitcode = 1
+
+        with pytest.raises(RuntimeError) as exc_info:
+            Stage1Runner._wait_and_check_workers([mock_proc], error_queue=error_queue)
+
+        msg = str(exc_info.value)
+        assert "worker 99" in msg
+        assert "ValueError" in msg
+        assert "テスト用の意図的エラー" in msg
+
+    def test_multiple_worker_errors_all_reported(self):
+        """複数 worker が失敗した場合、全エラーが報告される"""
+        import queue as stdlib_queue
+        from unittest.mock import MagicMock
+
+        error_queue = stdlib_queue.Queue()
+        error_queue.put({
+            "worker_id": 0,
+            "exception_type": "ValueError",
+            "message": "エラーA",
+            "traceback": "Traceback ...\nValueError: エラーA\n",
+        })
+        error_queue.put({
+            "worker_id": 1,
+            "exception_type": "RuntimeError",
+            "message": "エラーB",
+            "traceback": "Traceback ...\nRuntimeError: エラーB\n",
+        })
+
+        mock_p0 = MagicMock()
+        mock_p0.exitcode = 1
+        mock_p1 = MagicMock()
+        mock_p1.exitcode = 1
+
+        with pytest.raises(RuntimeError) as exc_info:
+            Stage1Runner._wait_and_check_workers(
+                [mock_p0, mock_p1], error_queue=error_queue)
+
+        msg = str(exc_info.value)
+        assert "worker 0" in msg
+        assert "worker 1" in msg
+        assert "エラーA" in msg
+        assert "エラーB" in msg
+        assert "2/2" in msg
+
+    def test_no_error_queue_still_raises_on_failure(self):
+        """error_queue なしでも exitcode ベースで RuntimeError が出る"""
+        from unittest.mock import MagicMock
+
+        mock_proc = MagicMock()
+        mock_proc.exitcode = 1
+
+        with pytest.raises(RuntimeError) as exc_info:
+            Stage1Runner._wait_and_check_workers([mock_proc])
+
+        msg = str(exc_info.value)
+        assert "eval worker" in msg
+        assert "失敗" in msg
+
+    def test_success_workers_no_error(self):
+        """全 worker 成功時はエラーなし"""
+        import queue as stdlib_queue
+        from unittest.mock import MagicMock
+
+        error_queue = stdlib_queue.Queue()
+
+        mock_proc = MagicMock()
+        mock_proc.exitcode = 0
+
+        # 例外が発生しないことを確認
+        Stage1Runner._wait_and_check_workers([mock_proc], error_queue=error_queue)
+
+
+@pytest.mark.smoke
+class TestParallelConfigValidation:
+    """並列実行向け config validation テスト (CQ-0074)"""
+
+    def test_valid_parallel_config(self, tmp_path: Path):
+        """num_workers=2 等の正常 config が通る"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["worker_num_threads"] = 2
+        config.evaluation["num_workers"] = 2
+        config.evaluation["worker_num_threads"] = 2
+        config.selfplay["output_layout"] = "worker_subdir"
+        config.experiment["seed_strategy"] = "derive"
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert errors == []
+
+    def test_num_workers_zero_rejected(self, tmp_path: Path):
+        """num_workers=0 は拒否される"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 0
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert any("selfplay.num_workers" in e for e in errors)
+
+    def test_num_workers_negative_rejected(self, tmp_path: Path):
+        """num_workers=-1 は拒否される"""
+        config = _make_minimal_config()
+        config.evaluation["num_workers"] = -1
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert any("evaluation.num_workers" in e for e in errors)
+
+    def test_num_workers_float_rejected(self, tmp_path: Path):
+        """num_workers=1.5 は拒否される"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 1.5
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert any("selfplay.num_workers" in e for e in errors)
+
+    def test_worker_num_threads_zero_rejected(self, tmp_path: Path):
+        """worker_num_threads=0 は拒否される"""
+        config = _make_minimal_config()
+        config.selfplay["worker_num_threads"] = 0
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert any("worker_num_threads" in e for e in errors)
+
+    def test_invalid_output_layout_rejected(self, tmp_path: Path):
+        """不正な output_layout は拒否される"""
+        config = _make_minimal_config()
+        config.selfplay["output_layout"] = "flat"
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert any("output_layout" in e for e in errors)
+
+    def test_invalid_seed_strategy_rejected(self, tmp_path: Path):
+        """不正な seed_strategy は拒否される"""
+        config = _make_minimal_config()
+        config.experiment["seed_strategy"] = "random"
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert any("seed_strategy" in e for e in errors)
+
+    def test_default_config_passes(self, tmp_path: Path):
+        """既存の最小 config がそのまま通る"""
+        config = _make_minimal_config()
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert errors == []
+
+
+@pytest.mark.slow
+class TestParallelSmokeIntegration:
+    """parallel eval / self-play の統合 smoke test (CQ-0075)"""
+
+    def test_parallel_eval_partials_aggregated(self, tmp_path: Path):
+        """num_workers=2 の eval で partials が集約され最終 eval_metrics が得られる"""
+        config = _make_minimal_config()
+        config.evaluation["num_workers"] = 2
+        config.evaluation["num_matches"] = 2
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert "eval_metrics" in result
+        em = result["eval_metrics"]
+        assert "avg_rank" in em or "win_rate" in em or "policy_avg_rank" in em
+
+        # partials ディレクトリに部分結果がある
+        run_dir = Path(result["run_dir"])
+        partials_dir = run_dir / "eval" / "partials"
+        assert partials_dir.exists()
+        partial_files = list(partials_dir.glob("worker_*.json"))
+        assert len(partial_files) >= 1
+
+    def test_parallel_selfplay_shard_separation_and_learner(self, tmp_path: Path):
+        """selfplay(num_workers=2) → learner が通り、全 worker の shard が読まれる"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 4
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+
+        # 各 worker に shard がある
+        for wid in range(2):
+            worker_dir = run_dir / "selfplay" / f"worker_{wid}"
+            assert worker_dir.exists()
+            shards = list(worker_dir.glob("shard_*.parquet"))
+            assert len(shards) >= 1
+
+        # learner が学習できた
+        assert "train_metrics" in result
+        assert result["train_metrics"]["total_steps"] > 0
+
+    def test_single_worker_full_pipeline(self, tmp_path: Path):
+        """num_workers=1 で selfplay → learner → eval の全導線が通る"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 1
+        config.evaluation["num_workers"] = 1
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert "selfplay_stats" in result
+        assert "train_metrics" in result
+        assert "eval_metrics" in result
+
+    def test_parallel_summary_has_worker_outputs(self, tmp_path: Path):
+        """summary.json に parallel 関連の記録がある"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 2
+        config.evaluation["num_workers"] = 2
+        config.evaluation["num_matches"] = 2
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        # selfplay の parallel 記録
+        sp = summary["phase_stats"]["selfplay"]
+        assert sp["num_workers"] == 2
+        assert sp["seed_strategy"] is not None
+
+        # worker ごとの stats.json が存在する
+        selfplay_dir = run_dir / "selfplay"
+        for wid in range(2):
+            stats_path = selfplay_dir / f"worker_{wid}" / "stats.json"
+            assert stats_path.exists()

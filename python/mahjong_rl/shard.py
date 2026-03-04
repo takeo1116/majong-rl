@@ -183,9 +183,14 @@ class ShardReader:
         self._backend = backend or ParquetBackend()
 
     def _find_shards(self) -> list[Path]:
-        """shard ファイルを検索"""
+        """shard ファイルを検索
+
+        平坦な shard_*{ext} と worker_*/shard_*{ext} の両方を探索する。
+        """
         ext = self._backend.file_extension()
-        return sorted(self._shard_dir.glob(f"shard_*{ext}"))
+        flat = self._shard_dir.glob(f"shard_*{ext}")
+        nested = self._shard_dir.glob(f"worker_*/shard_*{ext}")
+        return sorted(set(flat) | set(nested))
 
     def read_all(self) -> list[LearningSample]:
         """全サンプルを LearningSample のリストとして読み込む"""

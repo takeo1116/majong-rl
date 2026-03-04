@@ -62,18 +62,29 @@ class SelfPlayWorker:
         self._model_version = 0
         self._generation = 0
 
-    def run(self, num_matches: int, seed_start: int = 0) -> dict:
+    def run(self, num_matches: int, seed_start: int = 0,
+            match_seeds: list[int] | None = None) -> dict:
         """指定数の半荘を生成し、shard に書き出す
+
+        Args:
+            num_matches: 半荘数
+            seed_start: シード開始値 (match_seeds 未指定時に使用)
+            match_seeds: 各 match の seed リスト (指定時は seed_start を無視)
 
         Returns:
             統計情報 dict
         """
+        if match_seeds is not None and len(match_seeds) != num_matches:
+            raise ValueError(
+                f"match_seeds の長さ ({len(match_seeds)}) と "
+                f"num_matches ({num_matches}) が一致しません")
+
         total_steps = 0
         total_rounds = 0
         run_id = uuid.uuid4().hex[:8]
 
         for match_idx in range(num_matches):
-            seed = seed_start + match_idx
+            seed = match_seeds[match_idx] if match_seeds is not None else seed_start + match_idx
             episode_id = f"ep_{seed}"
 
             stats = self._play_one_match(

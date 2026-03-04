@@ -5,7 +5,12 @@ from pathlib import Path
 
 from mahjong_rl.encoders import FlatFeatureEncoder
 from mahjong_rl.models import MLPPolicyValueModel
-from mahjong_rl.evaluator import EvaluationRunner, EvalMetrics, RotationEvalResult, compute_eval_diff
+from mahjong_rl.evaluator import (
+    EvaluationRunner, EvalMetrics, RotationEvalResult,
+    PartialEvalMetrics, aggregate_partials, compute_eval_diff,
+    save_partial, load_partials, aggregate_and_save,
+    aggregate_rotation_partials,
+)
 
 
 @pytest.mark.slow
@@ -262,6 +267,206 @@ class TestComputeEvalDiff:
         assert diff["avg_rank"]["delta"] == pytest.approx(-0.2)
         assert diff["avg_score"]["delta"] is None
         assert diff["win_rate"]["delta"] is None
+
+
+@pytest.mark.smoke
+class TestPartialEvalMetrics:
+    """PartialEvalMetrics / aggregate_partials テスト (CQ-0067)"""
+
+    def test_partial_to_dict_round_trip(self):
+        """to_dict → from_dict で復元できる"""
+        partial = PartialEvalMetrics(
+            sum_rank=10.0, sum_score=5000.0, wins=3, deal_ins=2,
+            num_rounds=20, num_matches=5, policy_seats=[0], worker_id=0,
+        )
+        d = partial.to_dict()
+        restored = PartialEvalMetrics.from_dict(d)
+        assert restored.sum_rank == 10.0
+        assert restored.sum_score == 5000.0
+        assert restored.wins == 3
+        assert restored.deal_ins == 2
+        assert restored.num_rounds == 20
+        assert restored.num_matches == 5
+        assert restored.policy_seats == [0]
+        assert restored.worker_id == 0
+
+    def test_aggregate_single_partial(self):
+        """単一 partial の集約が正しい"""
+        partial = PartialEvalMetrics(
+            sum_rank=8.0, sum_score=2000.0, wins=4, deal_ins=2,
+            num_rounds=10, num_matches=4, policy_seats=[0],
+        )
+        metrics = aggregate_partials([partial])
+        assert metrics.avg_rank == pytest.approx(2.0)
+        assert metrics.avg_score == pytest.approx(500.0)
+        assert metrics.win_rate == pytest.approx(0.4)
+        assert metrics.deal_in_rate == pytest.approx(0.2)
+        assert metrics.num_matches == 4
+        assert metrics.num_rounds == 10
+
+    def test_aggregate_multiple_partials(self):
+        """複数 partial の集約が正しい"""
+        p1 = PartialEvalMetrics(
+            sum_rank=6.0, sum_score=1000.0, wins=2, deal_ins=1,
+            num_rounds=5, num_matches=3, policy_seats=[0],
+        )
+        p2 = PartialEvalMetrics(
+            sum_rank=9.0, sum_score=2000.0, wins=3, deal_ins=2,
+            num_rounds=8, num_matches=3, policy_seats=[0],
+        )
+        metrics = aggregate_partials([p1, p2])
+        assert metrics.avg_rank == pytest.approx(15.0 / 6)
+        assert metrics.avg_score == pytest.approx(3000.0 / 6)
+        assert metrics.win_rate == pytest.approx(5 / 13)
+        assert metrics.deal_in_rate == pytest.approx(3 / 13)
+        assert metrics.num_matches == 6
+        assert metrics.num_rounds == 13
+
+    def test_aggregate_empty_raises(self):
+        """空リストで ValueError"""
+        with pytest.raises(ValueError, match="空"):
+            aggregate_partials([])
+
+    def test_aggregate_preserves_policy_seats(self):
+        """集約後に policy_seats が保持される"""
+        p = PartialEvalMetrics(
+            sum_rank=4.0, sum_score=1000.0, wins=1, deal_ins=0,
+            num_rounds=5, num_matches=2, policy_seats=[1, 3],
+        )
+        metrics = aggregate_partials([p])
+        assert metrics.policy_seats == [1, 3]
+
+    def test_partial_save_load(self, tmp_path: Path):
+        """partial を JSON に保存・読込できる"""
+        partial = PartialEvalMetrics(
+            sum_rank=6.0, sum_score=1500.0, wins=2, deal_ins=1,
+            num_rounds=8, num_matches=3, policy_seats=[0], worker_id=1,
+        )
+        path = tmp_path / "partial.json"
+        partial.save(path)
+        loaded = PartialEvalMetrics.load(path)
+        assert loaded.sum_rank == 6.0
+        assert loaded.worker_id == 1
+
+    def test_single_process_consistency(self):
+        """単一プロセス evaluate と aggregate_partials の結果が一致する"""
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = MLPPolicyValueModel(input_dim=encoder.output_dim, hidden_dims=[32])
+        runner = EvaluationRunner(model=model, encoder=encoder, observation_mode="full")
+
+        # evaluate 経由
+        metrics = runner.evaluate(num_matches=2, seed_start=42, policy_seats=[0])
+
+        # evaluate_partial 経由
+        partial = runner.evaluate_partial(num_matches=2, seed_start=42, policy_seats=[0])
+        metrics_from_partial = aggregate_partials([partial])
+
+        assert metrics.avg_rank == pytest.approx(metrics_from_partial.avg_rank)
+        assert metrics.avg_score == pytest.approx(metrics_from_partial.avg_score)
+        assert metrics.win_rate == pytest.approx(metrics_from_partial.win_rate)
+        assert metrics.deal_in_rate == pytest.approx(metrics_from_partial.deal_in_rate)
+        assert metrics.num_matches == metrics_from_partial.num_matches
+        assert metrics.num_rounds == metrics_from_partial.num_rounds
+
+
+@pytest.mark.smoke
+class TestPartialSaveLoadAggregate:
+    """partial 保存・読込・集約テスト (CQ-0068)"""
+
+    def test_save_and_load_partials(self, tmp_path: Path):
+        """save_partial → load_partials で復元できる"""
+        partials_dir = tmp_path / "partials"
+        p0 = PartialEvalMetrics(
+            sum_rank=4.0, sum_score=500.0, wins=1, deal_ins=0,
+            num_rounds=5, num_matches=2, policy_seats=[0], worker_id=0)
+        p1 = PartialEvalMetrics(
+            sum_rank=6.0, sum_score=1000.0, wins=2, deal_ins=1,
+            num_rounds=5, num_matches=2, policy_seats=[0], worker_id=1)
+        save_partial(p0, partials_dir, worker_id=0)
+        save_partial(p1, partials_dir, worker_id=1)
+
+        loaded = load_partials(partials_dir)
+        assert len(loaded) == 2
+        assert loaded[0].worker_id == 0
+        assert loaded[1].worker_id == 1
+
+    def test_aggregate_and_save_creates_json(self, tmp_path: Path):
+        """aggregate_and_save が eval_metrics.json を生成する"""
+        partials_dir = tmp_path / "partials"
+        eval_dir = tmp_path / "eval"
+        save_partial(
+            PartialEvalMetrics(
+                sum_rank=6.0, sum_score=1000.0, wins=2, deal_ins=1,
+                num_rounds=8, num_matches=3, policy_seats=[0], worker_id=0),
+            partials_dir, worker_id=0)
+        save_partial(
+            PartialEvalMetrics(
+                sum_rank=8.0, sum_score=2000.0, wins=3, deal_ins=1,
+                num_rounds=10, num_matches=4, policy_seats=[0], worker_id=1),
+            partials_dir, worker_id=1)
+
+        metrics = aggregate_and_save(partials_dir, eval_dir)
+        assert (eval_dir / "eval_metrics.json").exists()
+        assert metrics.num_matches == 7
+        assert metrics.avg_rank == pytest.approx(14.0 / 7)
+
+    def test_aggregate_rotation_partials(self, tmp_path: Path):
+        """rotation eval の partial 集約が席別と総合を生成する"""
+        partials_dir = tmp_path / "partials"
+        eval_dir = tmp_path / "eval"
+
+        # 席0 の partial (2 workers)
+        save_partial(
+            PartialEvalMetrics(
+                sum_rank=4.0, sum_score=500.0, wins=1, deal_ins=0,
+                num_rounds=5, num_matches=2, policy_seats=[0], worker_id=0),
+            partials_dir, worker_id=0)
+        save_partial(
+            PartialEvalMetrics(
+                sum_rank=6.0, sum_score=1000.0, wins=2, deal_ins=1,
+                num_rounds=5, num_matches=2, policy_seats=[0], worker_id=1),
+            partials_dir, worker_id=1)
+        # 席1 の partial (2 workers)
+        save_partial(
+            PartialEvalMetrics(
+                sum_rank=5.0, sum_score=800.0, wins=1, deal_ins=1,
+                num_rounds=5, num_matches=2, policy_seats=[1], worker_id=2),
+            partials_dir, worker_id=2)
+        save_partial(
+            PartialEvalMetrics(
+                sum_rank=7.0, sum_score=1200.0, wins=2, deal_ins=0,
+                num_rounds=5, num_matches=2, policy_seats=[1], worker_id=3),
+            partials_dir, worker_id=3)
+
+        result = aggregate_rotation_partials(partials_dir, eval_dir, seats=[0, 1])
+
+        assert len(result.per_seat) == 2
+        assert 0 in result.per_seat
+        assert 1 in result.per_seat
+        assert result.per_seat[0].num_matches == 4
+        assert result.per_seat[1].num_matches == 4
+        assert result.aggregate.num_matches == 8
+        assert result.aggregate.policy_seats == [0, 1]
+
+        # ファイル生成確認
+        assert (eval_dir / "eval_seat0.json").exists()
+        assert (eval_dir / "eval_seat1.json").exists()
+        assert (eval_dir / "eval_rotation.json").exists()
+
+    def test_partials_and_final_coexist(self, tmp_path: Path):
+        """worker 部分結果と最終集約結果が両方 run ディレクトリに残る"""
+        partials_dir = tmp_path / "eval" / "partials"
+        eval_dir = tmp_path / "eval"
+        save_partial(
+            PartialEvalMetrics(
+                sum_rank=4.0, sum_score=500.0, wins=1, deal_ins=0,
+                num_rounds=5, num_matches=2, policy_seats=[0], worker_id=0),
+            partials_dir, worker_id=0)
+
+        aggregate_and_save(partials_dir, eval_dir)
+
+        assert (partials_dir / "worker_0.json").exists()
+        assert (eval_dir / "eval_metrics.json").exists()
 
 
 @pytest.mark.slow

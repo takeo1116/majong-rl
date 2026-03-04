@@ -115,6 +115,72 @@ class TestApplyOverride:
             _apply_override(config, "only_one_part", "value")
 
 
+class TestValidateOnly:
+    """--validate-only テスト (CQ-0071)"""
+
+    def _write_config(self, tmp_path: Path, **overrides) -> Path:
+        config = ExperimentConfig(
+            experiment={"name": "cli_test", "stage": 1, "observation_mode": "full"},
+            feature_encoder={"name": "FlatFeatureEncoder", "observation_mode": "full"},
+            model={"name": "MLPPolicyValueModel", "hidden_dims": [32],
+                   "value_heads": ["round_delta"]},
+            reward={"type": "point_delta"},
+            selfplay={"num_matches": 1, "policy_ratio": 1.0, "temperature": 1.0,
+                      "max_samples_per_shard": 10000},
+            training={"algorithm": "ppo", "lr": 0.001, "batch_size": 32,
+                      "epochs": 1, "gamma": 0.99, "gae_lambda": 0.95,
+                      "clip_epsilon": 0.2, "value_loss_coef": 0.5,
+                      "entropy_coef": 0.01, "max_grad_norm": 0.5},
+            evaluation={"num_matches": 1, "seed_start": 100000},
+        )
+        for k, v in overrides.items():
+            parts = k.split(".")
+            getattr(config, parts[0])[parts[1]] = v
+        yaml_path = tmp_path / "test_config.yaml"
+        config.to_yaml(yaml_path)
+        return yaml_path
+
+    def test_validate_only_success(self, tmp_path: Path, capsys):
+        """有効な config で --validate-only は 0 を返す"""
+        yaml_path = self._write_config(tmp_path)
+        ret = main(["--config", str(yaml_path), "--validate-only"])
+        assert ret == 0
+        captured = capsys.readouterr()
+        assert "OK" in captured.out
+
+    def test_validate_only_no_run_dir(self, tmp_path: Path):
+        """--validate-only で run ディレクトリが生成されない"""
+        yaml_path = self._write_config(tmp_path)
+        runs_dir = tmp_path / "runs"
+        main(["--config", str(yaml_path), "--validate-only",
+              "--base-dir", str(runs_dir)])
+        assert not runs_dir.exists()
+
+    def test_validate_only_invalid_config(self, tmp_path: Path, capsys):
+        """不正な config で --validate-only は 1 を返す"""
+        yaml_path = self._write_config(
+            tmp_path, **{"experiment.phases": ["bad_phase"]})
+        # phases は list なので直接 override ではなく config を書き換え
+        config = ExperimentConfig.from_yaml(yaml_path)
+        config.experiment["phases"] = ["bad_phase"]
+        config.to_yaml(yaml_path)
+        ret = main(["--config", str(yaml_path), "--validate-only"])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "バリデーションエラー" in captured.err
+
+    def test_validate_only_invalid_device(self, tmp_path: Path, capsys):
+        """不正なデバイス指定を --validate-only で検出できる"""
+        yaml_path = self._write_config(tmp_path)
+        config = ExperimentConfig.from_yaml(yaml_path)
+        config.training["device"] = "tpu"
+        config.to_yaml(yaml_path)
+        ret = main(["--config", str(yaml_path), "--validate-only"])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "training.device" in captured.err
+
+
 class TestCLIFailureExitCodes:
     """CLI 失敗系の終了コード管理テスト (CQ-0059)"""
 

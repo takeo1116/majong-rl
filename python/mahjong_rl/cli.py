@@ -29,6 +29,9 @@ def main(argv: list[str] | None = None) -> int:
         "--override", "-o", type=str, nargs="*", default=[],
         help="config の上書き (key=value 形式, 例: experiment.global_seed=42)")
     parser.add_argument(
+        "--validate-only", action="store_true",
+        help="config のバリデーションのみ実行し、実験は開始しない")
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="詳細ログを標準出力に表示する")
 
@@ -65,6 +68,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # 実行
     runner = Stage1Runner(config=config, base_dir=Path(args.base_dir))
+
+    # --validate-only: バリデーションのみ実行
+    if args.validate_only:
+        errors = runner.validate_config()
+        if errors:
+            print("config バリデーションエラー:", file=sys.stderr)
+            for e in errors:
+                print(f"  - {e}", file=sys.stderr)
+            return 1
+        print("config バリデーション OK")
+        return 0
+
     try:
         result = runner.run()
     except ValueError as e:

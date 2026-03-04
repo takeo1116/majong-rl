@@ -59,6 +59,13 @@ python3 -m pytest tests/python/ -v
 - **PR 前 / CI**: `python3 -m pytest` で全テスト実行
 - marker 未指定で `pytest` を実行すると、全テスト（smoke + slow）が実行される
 
+### 実験前の設定検証
+
+```bash
+# config のバリデーションのみ実行（run ディレクトリは作成されない）
+python3 -m mahjong_rl.cli --config configs/stage1_full_flat_mlp_ppo.yaml --validate-only
+```
+
 ## サンプル実行
 
 ```bash
