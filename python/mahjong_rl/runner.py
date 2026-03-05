@@ -912,6 +912,14 @@ class Stage1Runner:
         total_matches = 0
         worker_stats_list = []
 
+        # CQ-0108: 局結果集計キー
+        _round_stat_keys = [
+            "num_rounds", "tsumo_count", "ron_count", "ryukyoku_count",
+            "policy_wins", "policy_deal_ins", "policy_draws",
+            "policy_win_by_tsumo", "policy_win_by_ron",
+        ]
+        round_totals = {k: 0 for k in _round_stat_keys}
+
         for i in range(num_workers):
             stats_path = selfplay_dir / f"worker_{i}" / "stats.json"
             if not stats_path.exists():
@@ -921,15 +929,19 @@ class Stage1Runner:
             total_steps += ws.get("total_steps", 0)
             total_rounds += ws.get("total_rounds", 0)
             total_matches += ws.get("num_matches", 0)
+            for k in _round_stat_keys:
+                round_totals[k] += ws.get(k, 0)
             worker_stats_list.append(ws)
 
-        return {
+        result = {
             "num_matches": total_matches,
             "total_steps": total_steps,
             "total_rounds": total_rounds,
             "output_dir": str(selfplay_dir),
             "worker_stats": worker_stats_list,
         }
+        result.update(round_totals)
+        return result
 
     def _run_learner(self, run_dir: Path, shard_dir: Path, model,
                      profiler=None) -> dict:
@@ -1329,6 +1341,16 @@ class Stage1Runner:
                 "shard_count": shard_count,
                 "num_workers": sp.get("num_workers", 1),
                 "seed_strategy": sp.get("seed_strategy"),
+                # CQ-0106: 局結果集計
+                "num_rounds": sp.get("num_rounds", 0),
+                "tsumo_count": sp.get("tsumo_count", 0),
+                "ron_count": sp.get("ron_count", 0),
+                "ryukyoku_count": sp.get("ryukyoku_count", 0),
+                "policy_wins": sp.get("policy_wins", 0),
+                "policy_deal_ins": sp.get("policy_deal_ins", 0),
+                "policy_draws": sp.get("policy_draws", 0),
+                "policy_win_by_tsumo": sp.get("policy_win_by_tsumo", 0),
+                "policy_win_by_ron": sp.get("policy_win_by_ron", 0),
             }
         if "imitation_metrics" in result:
             imi = result["imitation_metrics"]

@@ -1,6 +1,7 @@
 """Stage 1 Self-Play Worker: 対局生成と shard 書き出し"""
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from pathlib import Path
@@ -86,6 +87,7 @@ class SelfPlayWorker:
         total_rounds = 0
         run_id = uuid.uuid4().hex[:8]
         profiler = self._profiler or Profiler(enabled=False)
+        self._round_results: list[dict] = []
 
         profiler.start("selfplay_match_loop")
         for match_idx in range(num_matches):
@@ -105,13 +107,21 @@ class SelfPlayWorker:
         self._writer.close()
         profiler.stop("selfplay_shard_write")
 
-        return {
+        # round_results.jsonl 出力 (CQ-0105)
+        self._write_round_results()
+
+        # 局結果集計 (CQ-0106)
+        round_stats = self._compute_round_stats()
+
+        result = {
             "num_matches": num_matches,
             "total_steps": total_steps,
             "total_rounds": total_rounds,
             "output_dir": str(self._output_dir),
             "inference_device": str(self._device),
         }
+        result.update(round_stats)
+        return result
 
     def _play_one_match(self, seed: int, episode_id: str, run_id: str) -> dict:
         """1 半荘を実行しサンプルを収集する"""
@@ -157,6 +167,25 @@ class SelfPlayWorker:
             if round_over:
                 round_count += 1
             prev_round_number = round_number
+
+            # 局終了イベント記録 (CQ-0105, CQ-0108)
+            for evt in info.get("round_end_events", []):
+                wps = evt["winner_players"]
+                lp = evt["loser_player"]
+                policy_wps = [w for w in wps if seat_is_policy[w]]
+                self._round_results.append({
+                    "event_type": evt["event_type"],
+                    "winner_players": wps,
+                    "loser_player": lp,
+                    "is_policy_win": len(policy_wps) > 0,
+                    "is_policy_deal_in": (lp >= 0 and seat_is_policy[lp]),
+                    "is_draw": evt["event_type"] == "ryukyoku",
+                    "policy_winner_players": policy_wps,
+                    "round_id": evt["round_id"],
+                    "episode_id": episode_id,
+                    "worker_id": self._worker_id,
+                    "seed": seed,
+                })
 
             # サンプル収集
             should_save = seat_is_policy[current] or (
@@ -223,3 +252,75 @@ class SelfPlayWorker:
         """ベースラインで打牌を選択する"""
         hand = env.env_state.round_state.players[env.current_player].hand
         return self._baseline.select_discard(list(hand), mask)
+
+    def _write_round_results(self) -> None:
+        """round_results.jsonl を出力する (CQ-0105)"""
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        path = self._output_dir / "round_results.jsonl"
+        with open(path, "w") as f:
+            for r in self._round_results:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    def _compute_round_stats(self) -> dict:
+        """局結果から集計統計を計算する (CQ-0106, CQ-0108)
+
+        集計定義:
+        - num_rounds/tsumo_count/ron_count/ryukyoku_count: 全体基準（全局カウント）
+        - policy_wins: winner_players 内の policy 席の人数合計（multi-ron で複数加算）
+        - policy_win_by_tsumo/policy_win_by_ron: 同上（和了種別ごと）
+        - policy_deal_ins/policy_draws: policy 席基準（局単位）
+        """
+        tsumo_count = 0
+        ron_count = 0
+        ryukyoku_count = 0
+        policy_wins = 0
+        policy_deal_ins = 0
+        policy_draws = 0
+        policy_win_by_tsumo = 0
+        policy_win_by_ron = 0
+
+        for r in self._round_results:
+            et = r["event_type"]
+            if et == "tsumo":
+                tsumo_count += 1
+            elif et == "ron":
+                ron_count += 1
+            else:
+                ryukyoku_count += 1
+
+            # winner_players から policy 席の勝者数を直接カウント（multi-ron 対応）
+            wps = r["winner_players"]
+            policy_win_count = sum(
+                1 for w in wps if self._is_policy_seat(r, w))
+            policy_wins += policy_win_count
+            if policy_win_count > 0:
+                if et == "tsumo":
+                    policy_win_by_tsumo += policy_win_count
+                elif et == "ron":
+                    policy_win_by_ron += policy_win_count
+
+            if r["is_policy_deal_in"]:
+                policy_deal_ins += 1
+            if r["is_draw"]:
+                policy_draws += 1
+
+        return {
+            "num_rounds": len(self._round_results),
+            "tsumo_count": tsumo_count,
+            "ron_count": ron_count,
+            "ryukyoku_count": ryukyoku_count,
+            "policy_wins": policy_wins,
+            "policy_deal_ins": policy_deal_ins,
+            "policy_draws": policy_draws,
+            "policy_win_by_tsumo": policy_win_by_tsumo,
+            "policy_win_by_ron": policy_win_by_ron,
+        }
+
+    @staticmethod
+    def _is_policy_seat(round_result: dict, player_id: int) -> bool:
+        """round_result の is_policy_win は配列内に1人でもいれば True だが、
+        個別 player が policy 席かは winner_players と is_policy_win から判断できない。
+        そのため _play_one_match で seat_is_policy 情報を round_result に保持する。
+        """
+        policy_winners = round_result.get("policy_winner_players", [])
+        return player_id in policy_winners

@@ -282,6 +282,174 @@ class TestBaselineTeacherData:
         assert set(tensors["actor_types"]).issubset({"policy", "baseline"})
 
 
+@pytest.mark.smoke
+class TestRoundResultsAndStats:
+    """round_results.jsonl / 局結果集計 smoke テスト (CQ-0107)"""
+
+    def test_round_results_jsonl_generated(self, tmp_path: Path):
+        """self-play 実行後に round_results.jsonl が生成される"""
+        import json
+
+        config = _make_config(observation_mode="full", policy_ratio=0.5)
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+
+        output_dir = tmp_path / "shards"
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=output_dir, worker_id="w0",
+        )
+        worker.run(num_matches=1, seed_start=42)
+
+        jsonl_path = output_dir / "round_results.jsonl"
+        assert jsonl_path.exists()
+
+        lines = jsonl_path.read_text().strip().split("\n")
+        assert len(lines) >= 1
+
+        row = json.loads(lines[0])
+        # 必須フィールド確認
+        for key in ["event_type", "winner_players", "loser_player",
+                     "is_policy_win", "is_policy_deal_in", "is_draw",
+                     "round_id", "episode_id", "worker_id", "seed"]:
+            assert key in row, f"round_results.jsonl に {key} がない"
+
+        assert row["event_type"] in ("tsumo", "ron", "ryukyoku")
+        assert isinstance(row["winner_players"], list)
+
+    def test_stats_has_round_stat_keys(self, tmp_path: Path):
+        """worker stats に局結果集計キーが含まれる"""
+        config = _make_config(observation_mode="full", policy_ratio=0.5)
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=1, seed_start=42)
+
+        expected_keys = [
+            "num_rounds", "tsumo_count", "ron_count", "ryukyoku_count",
+            "policy_wins", "policy_deal_ins", "policy_draws",
+            "policy_win_by_tsumo", "policy_win_by_ron",
+        ]
+        for key in expected_keys:
+            assert key in stats, f"stats に {key} がない"
+            assert isinstance(stats[key], int)
+
+        # num_rounds は少なくとも 1 以上
+        assert stats["num_rounds"] >= 1
+        # 合計は整合する
+        assert (stats["tsumo_count"] + stats["ron_count"]
+                + stats["ryukyoku_count"]) == stats["num_rounds"]
+
+
+@pytest.mark.smoke
+class TestMultiRonStats:
+    """multi-ron 集計ロジックテスト (CQ-0108)"""
+
+    def test_policy_wins_counts_each_policy_winner(self, tmp_path: Path):
+        """multi-ron で policy 席が複数勝者に含まれる場合、
+        policy_wins は勝者人数分カウントされる"""
+        config = _make_config(observation_mode="full", policy_ratio=1.0)
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        # _round_results を直接設定して _compute_round_stats をテスト
+        worker._round_results = [
+            # ダブロン: policy 席 0, 2 が勝者
+            {
+                "event_type": "ron",
+                "winner_players": [0, 2],
+                "loser_player": 1,
+                "is_policy_win": True,
+                "is_policy_deal_in": False,
+                "is_draw": False,
+                "policy_winner_players": [0, 2],
+                "round_id": 0,
+                "episode_id": "ep_0",
+                "worker_id": "w0",
+                "seed": 0,
+            },
+            # シングルロン: policy 席 3 が勝者
+            {
+                "event_type": "ron",
+                "winner_players": [3],
+                "loser_player": 1,
+                "is_policy_win": True,
+                "is_policy_deal_in": False,
+                "is_draw": False,
+                "policy_winner_players": [3],
+                "round_id": 1,
+                "episode_id": "ep_0",
+                "worker_id": "w0",
+                "seed": 0,
+            },
+            # ツモ: policy 席 1
+            {
+                "event_type": "tsumo",
+                "winner_players": [1],
+                "loser_player": -1,
+                "is_policy_win": True,
+                "is_policy_deal_in": False,
+                "is_draw": False,
+                "policy_winner_players": [1],
+                "round_id": 2,
+                "episode_id": "ep_0",
+                "worker_id": "w0",
+                "seed": 0,
+            },
+        ]
+
+        stats = worker._compute_round_stats()
+
+        # ダブロンで 2 + シングルロンで 1 + ツモで 1 = 4
+        assert stats["policy_wins"] == 4
+        assert stats["policy_win_by_ron"] == 3  # ダブロン 2 + シングル 1
+        assert stats["policy_win_by_tsumo"] == 1
+        assert stats["ron_count"] == 2
+        assert stats["tsumo_count"] == 1
+        assert stats["num_rounds"] == 3
+
+    def test_mixed_policy_baseline_multi_ron(self, tmp_path: Path):
+        """multi-ron で policy/baseline 混合の場合、policy 席のみカウント"""
+        config = _make_config(observation_mode="full", policy_ratio=0.5)
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        worker._round_results = [
+            # ダブロン: 席 0 (policy), 席 2 (baseline) が勝者
+            {
+                "event_type": "ron",
+                "winner_players": [0, 2],
+                "loser_player": 1,
+                "is_policy_win": True,
+                "is_policy_deal_in": False,
+                "is_draw": False,
+                "policy_winner_players": [0],  # 席 0 のみ policy
+                "round_id": 0,
+                "episode_id": "ep_0",
+                "worker_id": "w0",
+                "seed": 0,
+            },
+        ]
+
+        stats = worker._compute_round_stats()
+
+        # policy 勝者は 1 人のみ
+        assert stats["policy_wins"] == 1
+        assert stats["policy_win_by_ron"] == 1
+
+
 @pytest.mark.slow
 class TestSelfPlayDevice:
     """SelfPlayWorker デバイス切替テスト (CQ-0064)"""

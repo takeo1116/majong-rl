@@ -11,6 +11,7 @@ from mahjong_rl._mahjong_core import (
     GameEngine, EnvironmentState, Action, ActionType, Phase,
     make_partial_observation, make_full_observation,
     RunMode, RewardPolicyConfig, ErrorCode, NUM_TILE_TYPES,
+    RoundEndReason, EventType,
 )
 from mahjong_rl.legal_mask import make_discard_mask_from_legal_actions
 
@@ -32,6 +33,9 @@ class Stage1Env:
             self._env.reward_policy_config = reward_config
         self._current_player: int = 0
         self._done = False
+        # 局終了イベント蓄積用 (CQ-0105)
+        self._round_end_events: list[dict] = []
+        self._scores_at_round_start: list[int] = []
 
     @property
     def action_space_size(self) -> int:
@@ -58,6 +62,8 @@ class Stage1Env:
         """
         self._engine.reset_match(self._env, seed, self._run_mode)
         self._done = False
+        self._round_end_events = []
+        self._scores_at_round_start = list(self._env.match_state.scores)
         self._auto_advance()
         obs = self._make_observation()
         return obs, self._make_info()
@@ -79,11 +85,17 @@ class Stage1Env:
 
         step_rewards = np.array(result.rewards, dtype=np.float32)
 
+        # 局終了イベントを各 step 呼び出し単位でリセット
+        self._round_end_events = []
+
         if result.round_over:
+            self._capture_round_end(result)
             if result.match_over:
                 self._done = True
             else:
                 self._engine.advance_round(self._env)
+                self._scores_at_round_start = list(
+                    self._env.match_state.scores)
 
         terminated = self._done
         if not terminated:
@@ -143,10 +155,13 @@ class Stage1Env:
             accumulated_rewards += np.array(result.rewards, dtype=np.float32)
 
             if result.round_over:
+                self._capture_round_end(result)
                 if result.match_over:
                     self._done = True
                 else:
                     self._engine.advance_round(self._env)
+                    self._scores_at_round_start = list(
+                        self._env.match_state.scores)
 
         return accumulated_rewards
 
@@ -218,11 +233,58 @@ class Stage1Env:
         else:
             return make_partial_observation(self._env, self._current_player)
 
+    def _capture_round_end(self, result) -> None:
+        """局終了時の情報を蓄積する (CQ-0105)
+
+        advance_round() の前に呼ぶこと（round_state がまだ当該局の情報を保持している間）。
+        """
+        rs = self._env.round_state
+        ms = self._env.match_state
+        end_reason = rs.end_reason
+        scores_after = list(ms.scores)
+
+        # event_type 判定
+        if end_reason == RoundEndReason.Tsumo:
+            event_type = "tsumo"
+        elif end_reason == RoundEndReason.Ron:
+            event_type = "ron"
+        else:
+            event_type = "ryukyoku"
+
+        # winner_players 判定（multi-ron 対応）
+        winner_players: list[int] = []
+        loser_player = -1
+
+        if event_type == "ron":
+            # StepResult.events から Ron イベントを取得し、全勝者を列挙
+            winner_players = [
+                e.actor for e in result.events
+                if e.type == EventType.Ron
+            ]
+            loser_player = rs.last_discarder
+        elif event_type == "tsumo":
+            # 点数変動の最大者を勝者とする
+            deltas = [scores_after[i] - self._scores_at_round_start[i]
+                      for i in range(4)]
+            winner = max(range(4), key=lambda i: deltas[i])
+            winner_players = [winner]
+
+        self._round_end_events.append({
+            "event_type": event_type,
+            "winner_players": winner_players,
+            "loser_player": loser_player,
+            "round_id": rs.round_number,
+        })
+
     def _make_info(self) -> dict:
-        return {
+        info = {
             "current_player": self._current_player,
             "phase": self._env.round_state.phase,
             "round_number": self._env.round_state.round_number,
             "scores": list(self._env.match_state.scores),
             "is_match_over": self._env.match_state.is_match_over,
         }
+        # 局終了イベントがあれば付与 (CQ-0105)
+        if self._round_end_events:
+            info["round_end_events"] = list(self._round_end_events)
+        return info

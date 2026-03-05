@@ -452,6 +452,58 @@ class TestPhaseStats:
         assert isinstance(counts, dict)
 
 
+@pytest.mark.smoke
+class TestRoundStatsInSummary:
+    """summary.json の局結果集計テスト (CQ-0107)"""
+
+    def test_summary_has_round_stat_keys(self, tmp_path: Path):
+        """summary.json の phase_stats.selfplay に局結果集計キーが含まれる"""
+        config = _make_minimal_config()
+        config.selfplay["num_matches"] = 1
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        sp = summary["phase_stats"]["selfplay"]
+        expected_keys = [
+            "num_rounds", "tsumo_count", "ron_count", "ryukyoku_count",
+            "policy_wins", "policy_deal_ins", "policy_draws",
+            "policy_win_by_tsumo", "policy_win_by_ron",
+        ]
+        for key in expected_keys:
+            assert key in sp, f"phase_stats.selfplay に {key} がない"
+
+        assert sp["num_rounds"] >= 1
+        assert (sp["tsumo_count"] + sp["ron_count"]
+                + sp["ryukyoku_count"]) == sp["num_rounds"]
+
+    def test_worker_round_results_jsonl_exists(self, tmp_path: Path):
+        """worker ディレクトリに round_results.jsonl が生成される"""
+        config = _make_minimal_config()
+        config.selfplay["num_matches"] = 1
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        run_dir = Path(result["run_dir"])
+        jsonl_files = list((run_dir / "selfplay").glob(
+            "worker_*/round_results.jsonl"))
+        assert len(jsonl_files) >= 1
+
+        # 中身を軽く検証
+        import json as json_mod
+        for jf in jsonl_files:
+            lines = jf.read_text().strip().split("\n")
+            assert len(lines) >= 1
+            row = json_mod.loads(lines[0])
+            assert "event_type" in row
+            assert "winner_players" in row
+            assert "is_policy_win" in row
+            assert isinstance(row["winner_players"], list)
+
+
 @pytest.mark.slow
 class TestPhaseTiming:
     """phase duration テスト (CQ-0091)"""
@@ -1677,6 +1729,43 @@ class TestParallelSmokeIntegration:
         for wid in range(2):
             stats_path = selfplay_dir / f"worker_{wid}" / "stats.json"
             assert stats_path.exists()
+
+
+    def test_parallel_summary_has_round_stat_keys(self, tmp_path: Path):
+        """parallel self-play の summary に局結果集計キーが正しく反映される (CQ-0108, CQ-0109)"""
+        config = _make_minimal_config()
+        config.selfplay["num_workers"] = 2
+        config.selfplay["num_matches"] = 2
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        # 環境要因（Permission denied 等）で parallel 実行が失敗した場合は skip
+        err = result.get("error", "")
+        if err and any(kw in str(err).lower()
+                       for kw in ["permission denied", "operation not permitted",
+                                  "spawn", "fork"]):
+            pytest.skip(f"parallel 実行が環境制約で失敗: {err}")
+
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        sp = summary["phase_stats"]["selfplay"]
+        expected_keys = [
+            "num_rounds", "tsumo_count", "ron_count", "ryukyoku_count",
+            "policy_wins", "policy_deal_ins", "policy_draws",
+            "policy_win_by_tsumo", "policy_win_by_ron",
+        ]
+        for key in expected_keys:
+            assert key in sp, f"parallel summary に {key} がない"
+
+        # parallel 実行では少なくとも 1 局以上あるはず
+        assert sp["num_rounds"] >= 1
+        # 合計整合
+        assert (sp["tsumo_count"] + sp["ron_count"]
+                + sp["ryukyoku_count"]) == sp["num_rounds"]
 
 
 @pytest.mark.slow
