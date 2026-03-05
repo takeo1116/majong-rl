@@ -31,6 +31,14 @@ cmake --build . -j
 
 ## 2. テスト
 
+### テスト実行レーン
+
+| レーン | コマンド | 実行タイミング | 内容 |
+|--------|---------|---------------|------|
+| **smoke** | `python3 -m pytest tests/python/ -m smoke -v` | 日常開発・変更のたび | 軽量な基本検証（数分） |
+| **core** | `python3 -m pytest tests/python/ -m "not slow" -v` | PR 作成前・機能まとまり確認 | smoke + 中規模テスト |
+| **full** | `python3 -m pytest tests/python/ -v` | マージ前・夜間バッチ | slow 含む全テスト |
+
 ```bash
 # C++ テスト
 cd build
@@ -38,19 +46,41 @@ ctest --output-on-failure
 ```
 
 ```bash
-# Python smoke（推奨: 日常確認）
+# smoke: 日常の最小確認
 python3 -m pytest tests/python/ -m smoke -v
 ```
 
 ```bash
-# Python 全テスト
+# core: PR 前の中間確認（slow を除外）
+python3 -m pytest tests/python/ -m "not slow" -v
+```
+
+```bash
+# full: 全テスト
 python3 -m pytest tests/python/ -v
 ```
 
-テストマーカー:
+```bash
+# multiprocess テストのみ実行（対応環境向け）
+python3 -m pytest tests/python/ -m requires_multiprocess -v
+```
+
+```bash
+# multiprocess テストを除外して実行
+python3 -m pytest tests/python/ -m "not requires_multiprocess" -v
+```
+
+### テストマーカー
 
 - `smoke`: 軽量・日常確認向け
 - `slow`: 重い統合系（`-m "not slow"` で除外可能）
+- `requires_multiprocess`: multiprocess 依存テスト（subprocess 起動不可環境で自動 skip）
+
+### Claude Code への依頼テンプレート
+
+- `「smoke 通してコミットして」` — smoke レーン実行後にコミット
+- `「core 通してから PR 作って」` — core レーン実行後に PR 作成
+- `「full 回して結果教えて」` — full レーン実行して結果報告
 
 ## 3. 実験実行（CLI）
 

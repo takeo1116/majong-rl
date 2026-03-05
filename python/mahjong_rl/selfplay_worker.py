@@ -13,6 +13,7 @@ from mahjong_rl.encoders import FlatFeatureEncoder, ChannelTensorEncoder
 from mahjong_rl.models import MLPPolicyValueModel
 from mahjong_rl.action_selector import ActionSelector, SelectionMode
 from mahjong_rl.baseline import RuleBasedBaseline
+from mahjong_rl.profiler import Profiler
 from mahjong_rl.shard import LearningSample, ShardWriter
 
 
@@ -31,8 +32,10 @@ class SelfPlayWorker:
         output_dir: Path,
         worker_id: str = "worker_0",
         inference_device: torch.device | None = None,
+        profiler: Profiler | None = None,
     ):
         self._config = config
+        self._profiler = profiler
         self._device = inference_device or torch.device("cpu")
         self._model = model.to(self._device)
         self._encoder = encoder
@@ -82,7 +85,9 @@ class SelfPlayWorker:
         total_steps = 0
         total_rounds = 0
         run_id = uuid.uuid4().hex[:8]
+        profiler = self._profiler or Profiler(enabled=False)
 
+        profiler.start("selfplay_match_loop")
         for match_idx in range(num_matches):
             seed = match_seeds[match_idx] if match_seeds is not None else seed_start + match_idx
             episode_id = f"ep_{seed}"
@@ -94,8 +99,11 @@ class SelfPlayWorker:
             )
             total_steps += stats["steps"]
             total_rounds += stats["rounds"]
+        profiler.stop("selfplay_match_loop")
 
+        profiler.start("selfplay_shard_write")
         self._writer.close()
+        profiler.stop("selfplay_shard_write")
 
         return {
             "num_matches": num_matches,

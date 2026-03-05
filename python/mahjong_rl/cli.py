@@ -57,6 +57,16 @@ def main(argv: list[str] | None = None) -> int:
         "--continue-on-error", action="store_true",
         help="バッチ実行中にエラーが発生しても続行する")
 
+    # resume (CQ-0096)
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="既存 batch_dir を指定してバッチ再開（完了 seed をスキップ）")
+
+    # sweep (CQ-0095)
+    parser.add_argument(
+        "--sweep-file", type=str, default=None,
+        help="sweep 設定 YAML ファイルのパス")
+
     args = parser.parse_args(argv)
 
     # ログ設定
@@ -108,9 +118,45 @@ def main(argv: list[str] | None = None) -> int:
         print("config バリデーション OK")
         return 0
 
+    stop_on_error = not args.continue_on_error
+
+    # sweep + resume 実行 (CQ-0101)
+    if args.sweep_file and args.resume:
+        if seeds is None:
+            print("エラー: --sweep-file + --resume には --seeds または"
+                  " --seed-start/--num-seeds が必要です",
+                  file=sys.stderr)
+            return 1
+        sweep_config = _load_sweep_config(Path(args.sweep_file))
+        if sweep_config is None:
+            return 1
+        return run_sweep_resume(config, seeds, sweep_config,
+                                Path(args.resume),
+                                stop_on_error=stop_on_error)
+
+    # sweep 実行 (CQ-0095)
+    if args.sweep_file:
+        if seeds is None:
+            print("エラー: --sweep-file には --seeds または --seed-start/--num-seeds が必要です",
+                  file=sys.stderr)
+            return 1
+        sweep_config = _load_sweep_config(Path(args.sweep_file))
+        if sweep_config is None:
+            return 1
+        return run_sweep(config, seeds, sweep_config, base_dir,
+                         stop_on_error=stop_on_error)
+
+    # resume 実行 (CQ-0096)
+    if args.resume:
+        if seeds is None:
+            print("エラー: --resume には --seeds または --seed-start/--num-seeds が必要です",
+                  file=sys.stderr)
+            return 1
+        return run_batch_resume(config, seeds, Path(args.resume),
+                                stop_on_error=stop_on_error)
+
     # バッチ実行 or 単一実行
     if seeds is not None:
-        stop_on_error = not args.continue_on_error
         return run_batch(config, seeds, base_dir, stop_on_error=stop_on_error)
 
     # 単一 run 経路（従来互換）
@@ -237,6 +283,397 @@ def run_batch(
         print(f"バッチ実行完了 (一部失敗あり): {batch_dir}", file=sys.stderr)
 
     return 0 if all_success else 1
+
+
+def run_batch_resume(
+    config: ExperimentConfig,
+    seeds: list[int],
+    batch_dir: Path,
+    stop_on_error: bool = True,
+) -> int:
+    """バッチ再開: 完了済み seed をスキップして未完了 seed のみ実行する (CQ-0096)
+
+    Returns:
+        終了コード (0: 全成功, 1: 失敗あり)
+    """
+    from mahjong_rl.batch_report import generate_batch_report
+
+    if not batch_dir.exists():
+        print(f"エラー: batch_dir が見つかりません: {batch_dir}", file=sys.stderr)
+        return 1
+
+    # 完了済み seed を検出
+    completed = _detect_completed_seeds(batch_dir)
+    skip_seeds = set(completed.keys())
+    pending_seeds = [s for s in seeds if s not in skip_seeds]
+
+    logger.info(f"resume: 完了済み {len(skip_seeds)} seeds, 未完了 {len(pending_seeds)} seeds")
+    if not pending_seeds:
+        logger.info("全 seed 完了済み")
+        print(f"全 seed 完了済み: {batch_dir}")
+        # レポートを再生成
+        results = [completed[s] for s in seeds if s in completed]
+        generate_batch_report(batch_dir, results)
+        return 0
+
+    # 完了済み seed の結果を収集
+    results: list[dict] = []
+    for seed in seeds:
+        if seed in completed:
+            results.append(completed[seed])
+            continue
+
+        logger.info(f"[Resume] seed={seed}")
+        config_copy = copy.deepcopy(config)
+        config_copy.experiment["global_seed"] = seed
+
+        runner = Stage1Runner(config=config_copy, base_dir=batch_dir)
+        try:
+            result = runner.run()
+            success = "error" not in result
+            entry: dict = {
+                "seed": seed,
+                "success": success,
+                "result": result,
+            }
+            if not success:
+                entry["error"] = result.get("error", "unknown")
+            results.append(entry)
+            if not success:
+                logger.warning(f"  seed={seed} 失敗: {result.get('error')}")
+                if stop_on_error:
+                    logger.info("stop-on-error: バッチ中断")
+                    break
+        except Exception as e:
+            logger.error(f"  seed={seed} 例外: {type(e).__name__}: {e}")
+            results.append({
+                "seed": seed,
+                "success": False,
+                "error": str(e),
+            })
+            if stop_on_error:
+                logger.info("stop-on-error: バッチ中断")
+                break
+
+    # 集約レポート再生成
+    generate_batch_report(batch_dir, results)
+
+    all_success = all(r["success"] for r in results)
+    success_count = sum(1 for r in results if r["success"])
+    logger.info(f"resume 完了: {success_count}/{len(results)} 成功, batch_dir={batch_dir}")
+
+    if all_success:
+        print(f"バッチ再開完了: {batch_dir}")
+    else:
+        print(f"バッチ再開完了 (一部失敗あり): {batch_dir}", file=sys.stderr)
+
+    return 0 if all_success else 1
+
+
+def _detect_completed_seeds(batch_dir: Path) -> dict[int, dict]:
+    """batch_dir 内の完了済み seed を検出する (CQ-0096)
+
+    Returns:
+        seed → result entry dict のマッピング
+    """
+    completed: dict[int, dict] = {}
+    for run_dir in sorted(batch_dir.iterdir()):
+        if not run_dir.is_dir():
+            continue
+        summary_path = run_dir / "summary.json"
+        if not summary_path.exists():
+            continue
+        try:
+            with open(summary_path) as f:
+                summary = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not summary.get("success", False):
+            continue
+        seed = summary.get("global_seed")
+        if seed is None:
+            continue
+        completed[seed] = _restore_result_from_summary(run_dir, summary)
+    return completed
+
+
+def _restore_result_from_summary(run_dir: Path, summary: dict) -> dict:
+    """summary.json から batch result entry を復元する (CQ-0096)"""
+    ps = summary.get("phase_stats", {})
+    eval_stats = ps.get("eval", {})
+    sp_stats = ps.get("selfplay", {})
+
+    result: dict = {
+        "run_dir": str(run_dir),
+        "global_seed": summary.get("global_seed"),
+    }
+    if eval_stats:
+        result["eval_metrics"] = eval_stats
+    if sp_stats:
+        result["selfplay_stats"] = sp_stats
+
+    return {
+        "seed": summary.get("global_seed"),
+        "success": True,
+        "result": result,
+    }
+
+
+def run_sweep(
+    config: ExperimentConfig,
+    seeds: list[int],
+    sweep_config: dict,
+    base_dir: Path,
+    stop_on_error: bool = True,
+) -> int:
+    """sweep 実行: 複数条件を連続でバッチ実行する (CQ-0095)
+
+    Returns:
+        終了コード (0: 全成功, 1: 失敗あり)
+    """
+    import csv as csv_mod
+
+    conditions = sweep_config.get("conditions", [])
+    if not conditions:
+        print("エラー: sweep 設定に conditions がありません", file=sys.stderr)
+        return 1
+
+    sweep_id = uuid.uuid4().hex[:8]
+    date_str = datetime.now().strftime("%Y%m%d")
+    name = config.experiment.get("name", "sweep")
+    sweep_dir = base_dir / f"{date_str}_{name}_sweep_{sweep_id}"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"sweep 開始: {len(conditions)} 条件, {len(seeds)} seeds, sweep_dir={sweep_dir}")
+
+    all_success = True
+    condition_results: list[dict] = []
+
+    for cond in conditions:
+        cond_id = cond.get("condition_id", "unnamed")
+        overrides = cond.get("overrides", {})
+        logger.info(f"[Condition] {cond_id}: {overrides}")
+
+        cond_config = copy.deepcopy(config)
+        for key, value in overrides.items():
+            try:
+                _apply_override(cond_config, key, str(value))
+            except ValueError as e:
+                logger.error(f"  override 適用失敗: {e}")
+                all_success = False
+                condition_results.append({
+                    "condition_id": cond_id,
+                    "success": False,
+                    "error": str(e),
+                })
+                continue
+
+        cond_dir = sweep_dir / cond_id
+        ret = run_batch(cond_config, seeds, cond_dir, stop_on_error=stop_on_error)
+        if ret != 0:
+            all_success = False
+
+        # batch_summary から結果を読み取り
+        cond_entry = {"condition_id": cond_id, "batch_dir": str(cond_dir)}
+        batch_summary_path = _find_batch_summary(cond_dir)
+        if batch_summary_path is not None:
+            with open(batch_summary_path) as f:
+                bs = json.load(f)
+            cond_entry["success_rate"] = bs.get("success_rate", 0.0)
+            cond_entry["aggregate"] = bs.get("aggregate", {})
+        else:
+            cond_entry["success_rate"] = 0.0
+            cond_entry["aggregate"] = {}
+        condition_results.append(cond_entry)
+
+    # ランキング表生成
+    _generate_sweep_ranking(sweep_dir, condition_results)
+
+    logger.info(f"sweep 完了: sweep_dir={sweep_dir}")
+    if all_success:
+        print(f"sweep 完了: {sweep_dir}")
+    else:
+        print(f"sweep 完了 (一部失敗あり): {sweep_dir}", file=sys.stderr)
+
+    return 0 if all_success else 1
+
+
+def run_sweep_resume(
+    config: ExperimentConfig,
+    seeds: list[int],
+    sweep_config: dict,
+    sweep_dir: Path,
+    stop_on_error: bool = True,
+) -> int:
+    """sweep の condition 単位 resume (CQ-0101)
+
+    既存 sweep_dir の各 condition を resume し、未完了 seed のみ再実行する。
+    sweep_dir にない condition は新規実行する。
+
+    Returns:
+        終了コード (0: 全成功, 1: 失敗あり)
+    """
+    if not sweep_dir.exists():
+        print(f"エラー: sweep_dir が見つかりません: {sweep_dir}", file=sys.stderr)
+        return 1
+
+    conditions = sweep_config.get("conditions", [])
+    if not conditions:
+        print("エラー: sweep 設定に conditions がありません", file=sys.stderr)
+        return 1
+
+    logger.info(f"sweep resume 開始: {len(conditions)} 条件, {len(seeds)} seeds, "
+                f"sweep_dir={sweep_dir}")
+
+    all_success = True
+    condition_results: list[dict] = []
+
+    for cond in conditions:
+        cond_id = cond.get("condition_id", "unnamed")
+        overrides = cond.get("overrides", {})
+        logger.info(f"[Condition Resume] {cond_id}: {overrides}")
+
+        cond_config = copy.deepcopy(config)
+        for key, value in overrides.items():
+            try:
+                _apply_override(cond_config, key, str(value))
+            except ValueError as e:
+                logger.error(f"  override 適用失敗: {e}")
+                all_success = False
+                condition_results.append({
+                    "condition_id": cond_id,
+                    "success": False,
+                    "error": str(e),
+                })
+                continue
+
+        cond_dir = sweep_dir / cond_id
+        batch_dir = _find_batch_dir(cond_dir) if cond_dir.exists() else None
+
+        if batch_dir is not None:
+            # 既存 condition を resume
+            logger.info(f"  resume: batch_dir={batch_dir}")
+            ret = run_batch_resume(cond_config, seeds, batch_dir,
+                                   stop_on_error=stop_on_error)
+        else:
+            # 新規 condition を実行
+            logger.info(f"  新規実行: cond_dir={cond_dir}")
+            ret = run_batch(cond_config, seeds, cond_dir,
+                            stop_on_error=stop_on_error)
+
+        if ret != 0:
+            all_success = False
+
+        # batch_summary から結果を読み取り
+        cond_entry: dict = {"condition_id": cond_id, "batch_dir": str(cond_dir)}
+        batch_summary_path = _find_batch_summary(cond_dir)
+        if batch_summary_path is not None:
+            with open(batch_summary_path) as f:
+                bs = json.load(f)
+            cond_entry["success_rate"] = bs.get("success_rate", 0.0)
+            cond_entry["aggregate"] = bs.get("aggregate", {})
+        else:
+            cond_entry["success_rate"] = 0.0
+            cond_entry["aggregate"] = {}
+        condition_results.append(cond_entry)
+
+    # ランキング表再生成
+    _generate_sweep_ranking(sweep_dir, condition_results)
+
+    logger.info(f"sweep resume 完了: sweep_dir={sweep_dir}")
+    if all_success:
+        print(f"sweep resume 完了: {sweep_dir}")
+    else:
+        print(f"sweep resume 完了 (一部失敗あり): {sweep_dir}", file=sys.stderr)
+
+    return 0 if all_success else 1
+
+
+def _find_batch_dir(cond_dir: Path) -> Path | None:
+    """condition ディレクトリ内の batch_dir を探す (CQ-0101)
+
+    run_batch は cond_dir 配下に日付付き batch_dir を作るため、
+    1 階層下を探す。batch_summary.json がある dir を優先。
+    """
+    if not cond_dir.exists():
+        return None
+    # batch_summary.json がある dir を優先
+    for d in sorted(cond_dir.iterdir()):
+        if d.is_dir() and (d / "batch_summary.json").exists():
+            return d
+    # なければ最初のサブディレクトリを返す
+    for d in sorted(cond_dir.iterdir()):
+        if d.is_dir():
+            return d
+    return None
+
+
+def _find_batch_summary(cond_dir: Path) -> Path | None:
+    """条件ディレクトリ内の batch_summary.json を探す"""
+    # run_batch は cond_dir 配下に batch_dir を作る
+    for d in sorted(cond_dir.iterdir()):
+        if d.is_dir():
+            p = d / "batch_summary.json"
+            if p.exists():
+                return p
+    return None
+
+
+def _generate_sweep_ranking(sweep_dir: Path, condition_results: list[dict]) -> None:
+    """条件間ランキング表を生成する (CQ-0095)"""
+    import csv as csv_mod
+
+    metrics_keys = ["avg_rank", "avg_score", "win_rate", "deal_in_rate"]
+    rows = []
+    for cr in condition_results:
+        row: dict = {"condition_id": cr.get("condition_id", "")}
+        row["success_rate"] = cr.get("success_rate", 0.0)
+        agg = cr.get("aggregate", {})
+        for key in metrics_keys:
+            m = agg.get(key, {})
+            row[f"{key}_mean"] = m.get("mean", "")
+            row[f"{key}_ci_95_lower"] = m.get("ci_95_lower", "")
+            row[f"{key}_ci_95_upper"] = m.get("ci_95_upper", "")
+        rows.append(row)
+
+    # avg_rank_mean 昇順ソート（空文字は末尾）
+    rows.sort(key=lambda r: (
+        r["avg_rank_mean"] if isinstance(r["avg_rank_mean"], (int, float)) else float("inf")
+    ))
+
+    # JSON
+    with open(sweep_dir / "sweep_ranking.json", "w") as f:
+        json.dump({"conditions": rows}, f, indent=2, ensure_ascii=False)
+
+    # CSV
+    fieldnames = ["condition_id", "success_rate"]
+    for key in metrics_keys:
+        fieldnames.extend([f"{key}_mean", f"{key}_ci_95_lower", f"{key}_ci_95_upper"])
+
+    with open(sweep_dir / "sweep_ranking.csv", "w", newline="") as f:
+        writer = csv_mod.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _load_sweep_config(path: Path) -> dict | None:
+    """sweep 設定 YAML を読み込む (CQ-0095)"""
+    import yaml
+
+    if not path.exists():
+        print(f"エラー: sweep ファイルが見つかりません: {path}", file=sys.stderr)
+        return None
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+    except Exception as e:
+        print(f"エラー: sweep ファイル読み込み失敗: {e}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict) or "conditions" not in data:
+        print("エラー: sweep ファイルに conditions キーが必要です", file=sys.stderr)
+        return None
+    return data
 
 
 def _apply_override(config: ExperimentConfig, key: str, value: str) -> None:

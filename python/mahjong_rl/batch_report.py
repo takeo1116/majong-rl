@@ -21,16 +21,26 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
     success_runs = [r for r in results if r["success"]]
     failure_runs = [r for r in results if not r["success"]]
 
-    # 成功 run から eval_metrics を収集
-    eval_metrics_list = []
+    # 成功 run から eval_metrics を収集（run とペアで保持: CQ-0099）
+    eval_metrics_list: list[dict] = []
+    eval_metrics_runs: list[dict] = []
     for r in success_runs:
         result = r.get("result", {})
         em = result.get("eval_metrics")
         if em is not None:
             eval_metrics_list.append(em)
+            eval_metrics_runs.append(r)
 
     # 集約統計
     aggregate = _compute_aggregate(eval_metrics_list)
+
+    # eval_mode を集約に付加 (CQ-0092)
+    if eval_metrics_list:
+        modes = set(em.get("eval_mode", "single") for em in eval_metrics_list)
+        aggregate["eval_mode"] = modes.pop() if len(modes) == 1 else "mixed"
+
+    # outlier 情報を付加 (CQ-0094, CQ-0099)
+    _attach_outlier_info(aggregate, eval_metrics_list, eval_metrics_runs)
 
     # runs 一覧
     runs_info = []
@@ -50,6 +60,7 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
                     "win_rate": em.get("win_rate"),
                     "deal_in_rate": em.get("deal_in_rate"),
                 }
+                entry["eval_mode"] = em.get("eval_mode", "single")
             # eval_before/after 差分
             ed = result.get("eval_diff")
             if ed is not None:
@@ -116,9 +127,22 @@ def _compute_aggregate(eval_metrics_list: list[dict]) -> dict:
             std = math.sqrt(variance)
         else:
             std = 0.0
+        # SE / 95% CI (CQ-0094)
+        if n > 1:
+            se = std / math.sqrt(n)
+            t = _t_value_95(n)
+            ci_lower = mean - t * se
+            ci_upper = mean + t * se
+        else:
+            se = 0.0
+            ci_lower = mean
+            ci_upper = mean
         aggregate[key] = {
             "mean": round(mean, 6),
             "std": round(std, 6),
+            "se": round(se, 6),
+            "ci_95_lower": round(ci_lower, 6),
+            "ci_95_upper": round(ci_upper, 6),
             "min": round(min(values), 6),
             "max": round(max(values), 6),
             "count": n,
@@ -127,10 +151,69 @@ def _compute_aggregate(eval_metrics_list: list[dict]) -> dict:
     return aggregate
 
 
+# 簡易 t 分布テーブル: 自由度 → 95% 両側臨界値 (CQ-0094)
+_T_TABLE_95: dict[int, float] = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+    6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+    15: 2.131, 20: 2.086, 25: 2.060, 30: 2.042,
+}
+
+
+def _t_value_95(n: int) -> float:
+    """自由度 n-1 の t 分布 95% 両側臨界値を返す"""
+    if n <= 1:
+        return 0.0
+    df = n - 1
+    if df in _T_TABLE_95:
+        return _T_TABLE_95[df]
+    if df > 30:
+        return 1.96
+    # テーブルにない df は、それ以下の最大の df の値を使う（保守的）
+    candidates = [k for k in _T_TABLE_95 if k <= df]
+    return _T_TABLE_95[max(candidates)] if candidates else 1.96
+
+
+def _attach_outlier_info(
+    aggregate: dict,
+    eval_metrics_list: list[dict],
+    success_runs: list[dict],
+) -> None:
+    """aggregate の各メトリクスに outlier_min/outlier_max を付加する (CQ-0094)"""
+    metrics_keys = ["avg_rank", "avg_score", "win_rate", "deal_in_rate"]
+    for key in metrics_keys:
+        if key not in aggregate:
+            continue
+        min_val = aggregate[key]["min"]
+        max_val = aggregate[key]["max"]
+        outlier_min: dict | None = None
+        outlier_max: dict | None = None
+        for em, r in zip(eval_metrics_list, success_runs):
+            v = em.get(key)
+            if v is None:
+                continue
+            result = r.get("result", {})
+            if outlier_min is None or round(v, 6) == min_val:
+                outlier_min = {
+                    "seed": r["seed"],
+                    "run_dir": result.get("run_dir", ""),
+                    "value": round(v, 6),
+                }
+            if outlier_max is None or round(v, 6) == max_val:
+                outlier_max = {
+                    "seed": r["seed"],
+                    "run_dir": result.get("run_dir", ""),
+                    "value": round(v, 6),
+                }
+        if outlier_min is not None:
+            aggregate[key]["outlier_min"] = outlier_min
+        if outlier_max is not None:
+            aggregate[key]["outlier_max"] = outlier_max
+
+
 def _write_batch_table_csv(path: Path, runs_info: list[dict]) -> None:
     """バッチ結果の CSV テーブルを書き出す"""
     fieldnames = [
-        "seed", "success", "run_dir",
+        "seed", "success", "run_dir", "eval_mode",
         "avg_rank", "avg_score", "win_rate", "deal_in_rate",
     ]
     with open(path, "w", newline="") as f:
@@ -141,6 +224,7 @@ def _write_batch_table_csv(path: Path, runs_info: list[dict]) -> None:
                 "seed": run["seed"],
                 "success": run["success"],
                 "run_dir": run.get("run_dir", ""),
+                "eval_mode": run.get("eval_mode", ""),
             }
             em = run.get("eval_metrics", {})
             if em:

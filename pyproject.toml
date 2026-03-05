@@ -20,4 +20,5 @@ testpaths = ["tests/python"]
 markers = [
     "slow: 重い評価・統合テスト（-m 'not slow' で除外）",
     "smoke: 軽量な基本検証テスト（-m smoke で選択実行）",
+    "requires_multiprocess: multiprocess 依存テスト（subprocess 起動不可環境で skip）",
 ]

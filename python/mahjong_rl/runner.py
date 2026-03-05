@@ -6,17 +6,24 @@ import logging
 import os
 import random
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from mahjong_rl.experiment import ExperimentConfig, RunDirectory
+from mahjong_rl.profiler import Profiler
 
 import hashlib
 import traceback
 
 VALID_DEVICES = {"cpu", "cuda", "auto"}
+
+
+def _utc_now_str() -> str:
+    """UTC タイムスタンプを ISO8601 Z 形式で返す (ミリ秒精度)"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def derive_worker_seed(base_seed: int, worker_id: int) -> int:
@@ -453,6 +460,12 @@ class Stage1Runner:
                 f"不正な experiment.seed_strategy '{ss}'"
                 f" (有効値: derive)")
 
+        # profiling チェック (CQ-0098)
+        prof_enabled = cfg.profiling.get("enabled", False)
+        if not isinstance(prof_enabled, bool):
+            errors.append(
+                f"profiling.enabled は bool で指定してください: {prof_enabled}")
+
         return errors
 
     def run(self) -> dict:
@@ -496,39 +509,74 @@ class Stage1Runner:
         result["resolved_devices"] = self._resolve_all_devices()
         logger.info(f"  devices: {result['resolved_devices']}")
 
+        # プロファイラ (CQ-0098)
+        profiler = Profiler(
+            enabled=self._config.profiling.get("enabled", False))
+        result["_profiler"] = profiler
+
+        run_start = datetime.now(timezone.utc)
+        phase_timing: dict[str, dict] = {}
+        result["phase_timing"] = phase_timing
+
+        def _record_start(name: str) -> str:
+            ts = _utc_now_str()
+            phase_timing[name] = {"start_ts": ts, "end_ts": None, "duration_sec": None}
+            return ts
+
+        def _record_end(name: str) -> None:
+            ts = _utc_now_str()
+            entry = phase_timing[name]
+            entry["end_ts"] = ts
+            start_dt = datetime.fromisoformat(entry["start_ts"].replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            entry["duration_sec"] = round((end_dt - start_dt).total_seconds(), 3)
+
         for phase in phases:
             phase_num += 1
             label = f"[Phase {phase_num}/{total_phases}]"
 
             if phase == "imitation":
                 logger.info(f"{label} imitation warm start")
+                _record_start("imitation")
+                profiler.start("imitation_total")
                 try:
                     result["imitation_metrics"] = self._run_imitation(
-                        run_dir, model, encoder)
+                        run_dir, model, encoder, profiler)
                     phase_status["imitation"] = "success"
+                    profiler.stop("imitation_total")
+                    _record_end("imitation")
                 except Exception as e:
                     logger.error(f"  imitation フェーズで失敗: {e}")
                     result["error"] = f"imitation: {e}"
                     phase_status["imitation"] = "failed"
+                    result["total_duration_sec"] = round(
+                        (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
                     self._finalize(run_dir, result, phase_status, file_handler)
                     return result
 
             elif phase == "selfplay":
                 logger.info(f"{label} self-play データ生成")
+                _record_start("selfplay")
+                profiler.start("selfplay_total")
                 try:
                     result["selfplay_stats"] = self._run_selfplay(
-                        run_dir, model, encoder)
+                        run_dir, model, encoder, profiler)
                     phase_status["selfplay"] = "success"
+                    profiler.stop("selfplay_total")
+                    _record_end("selfplay")
                 except Exception as e:
                     logger.error(f"  self-play フェーズで失敗: {e}")
                     result["error"] = f"selfplay: {e}"
                     phase_status["selfplay"] = "failed"
+                    result["total_duration_sec"] = round(
+                        (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
                     self._finalize(run_dir, result, phase_status, file_handler)
                     return result
 
             elif phase == "learner":
                 # 学習前評価 (eval も phases に含まれる場合のみ)
                 if "eval" in phases:
+                    _record_start("eval_before")
                     try:
                         logger.info(f"{label} 学習前評価 (eval_before)")
                         eval_before_dir = run_dir / "eval_before"
@@ -536,28 +584,40 @@ class Stage1Runner:
                             run_dir, model, encoder, obs_mode,
                             eval_dir_override=eval_before_dir)
                         logger.info(f"  eval_before avg_rank: {result['eval_before'].get('avg_rank', '?')}")
+                        _record_end("eval_before")
                     except Exception as e:
                         logger.warning(f"  学習前評価をスキップ: {e}")
+                        _record_end("eval_before")
 
                 logger.info(f"{label} learner 学習")
+                _record_start("learner")
+                profiler.start("learner_total")
                 try:
                     selfplay_dir = run_dir / "selfplay"
                     result["train_metrics"] = self._run_learner(
-                        run_dir, selfplay_dir, model)
+                        run_dir, selfplay_dir, model, profiler)
                     phase_status["learner"] = "success"
+                    profiler.stop("learner_total")
+                    _record_end("learner")
                 except Exception as e:
                     logger.error(f"  learner フェーズで失敗: {e}")
                     result["error"] = f"learner: {e}"
                     phase_status["learner"] = "failed"
+                    result["total_duration_sec"] = round(
+                        (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
                     self._finalize(run_dir, result, phase_status, file_handler)
                     return result
 
             elif phase == "eval":
                 logger.info(f"{label} evaluator 評価")
+                _record_start("eval")
+                profiler.start("eval_total")
                 try:
                     result["eval_metrics"] = self._run_eval(
                         run_dir, model, encoder, obs_mode)
                     phase_status["eval"] = "success"
+                    profiler.stop("eval_total")
+                    _record_end("eval")
 
                     # 学習前後差分レポート生成
                     if "eval_before" in result:
@@ -573,9 +633,13 @@ class Stage1Runner:
                     logger.error(f"  evaluator フェーズで失敗: {e}")
                     result["error"] = f"evaluator: {e}"
                     phase_status["eval"] = "failed"
+                    result["total_duration_sec"] = round(
+                        (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
                     self._finalize(run_dir, result, phase_status, file_handler)
                     return result
 
+        result["total_duration_sec"] = round(
+            (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
         logger.info("実験完了")
         self._finalize(run_dir, result, phase_status, file_handler)
         return result
@@ -583,12 +647,19 @@ class Stage1Runner:
     def _finalize(self, run_dir: Path, result: dict,
                   phase_status: dict[str, str],
                   file_handler: logging.FileHandler) -> None:
-        """run 終了時の共通処理: summary 保存・notes 追記・ログ後始末"""
+        """run 終了時の共通処理: summary 保存・notes 追記・プロファイル保存・ログ後始末"""
+        # プロファイル保存 (CQ-0098)
+        profiler: Profiler | None = result.pop("_profiler", None)
+        if profiler is not None:
+            profiler.save(run_dir / "profile.json")
+            if profiler.enabled:
+                result["profiling"] = profiler.to_dict()
         self._save_summary(run_dir, result, phase_status)
         self._append_notes(run_dir, result, phase_status)
         self._teardown_file_logging(file_handler)
 
-    def _run_imitation(self, run_dir: Path, model, encoder) -> dict:
+    def _run_imitation(self, run_dir: Path, model, encoder,
+                       profiler=None) -> dict:
         """imitation warm start フェーズ
 
         imitation.num_workers > 1 の場合は multi-process で教師データを生成する。
@@ -619,6 +690,7 @@ class Stage1Runner:
                 encoder=encoder,
                 output_dir=imitation_dir,
                 inference_device=sp_device,
+                profiler=profiler,
             )
             sp_stats = worker.run(
                 num_matches=imi_matches,
@@ -649,6 +721,7 @@ class Stage1Runner:
             num_epochs=imi_epochs,
             filter_actor_type="baseline",
             imitation_filter=imi_filter,
+            profiler=profiler,
         )
         learner.save_checkpoint(tag="imitation")
         logger.info(f"  imitation loss: {metrics['policy_loss']:.4f}")
@@ -729,7 +802,8 @@ class Stage1Runner:
             if model_path.exists():
                 model_path.unlink()
 
-    def _run_selfplay(self, run_dir: Path, model, encoder) -> dict:
+    def _run_selfplay(self, run_dir: Path, model, encoder,
+                      profiler=None) -> dict:
         """self-play フェーズ
 
         selfplay.num_workers > 1 の場合は multi-process 実行。
@@ -752,6 +826,7 @@ class Stage1Runner:
             output_dir=worker_output_dir,
             worker_id="worker_0",
             inference_device=sp_device,
+            profiler=profiler,
         )
         sp_stats = worker.run(
             num_matches=sp_cfg.get("num_matches", 10),
@@ -856,7 +931,8 @@ class Stage1Runner:
             "worker_stats": worker_stats_list,
         }
 
-    def _run_learner(self, run_dir: Path, shard_dir: Path, model) -> dict:
+    def _run_learner(self, run_dir: Path, shard_dir: Path, model,
+                     profiler=None) -> dict:
         """learner フェーズ"""
         training_device = resolve_device(
             self._config.training.get("device", "auto"))
@@ -866,7 +942,7 @@ class Stage1Runner:
             run_dir=run_dir,
             device=training_device,
         )
-        train_metrics = learner.train(shard_dir)
+        train_metrics = learner.train(shard_dir, profiler=profiler)
         learner.save_checkpoint(tag="final")
         logger.info(f"  policy_loss: {train_metrics['policy_loss']:.4f}")
         return train_metrics
@@ -1322,10 +1398,17 @@ class Stage1Runner:
             "has_checkpoint": has_checkpoint,
             "has_eval": has_eval,
             "phase_stats": phase_stats,
+            "phase_timing": result.get("phase_timing", {}),
+            "total_duration_sec": result.get("total_duration_sec"),
             "actor_type_counts": actor_type_counts,
             "device_info": device_info,
             "env_info": self._collect_env_info(),
         }
+
+        # プロファイル情報 (CQ-0098)
+        profiling = result.get("profiling")
+        if profiling is not None:
+            summary["profiling"] = profiling
 
         with open(run_dir / "summary.json", "w") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -1380,6 +1463,20 @@ class Stage1Runner:
         if dg.get("num_workers", 1) > 1:
             lines.append(f"- imitation: num_workers={dg['num_workers']}, "
                          f"seed_strategy={dg.get('seed_strategy', {}).get('method', '?')}")
+
+        # phase duration
+        pt = result.get("phase_timing", {})
+        if pt:
+            lines.append("- phase duration:")
+            for pname, pinfo in pt.items():
+                dur = pinfo.get("duration_sec")
+                if dur is not None:
+                    lines.append(f"  - {pname}: {dur:.1f}s")
+                else:
+                    lines.append(f"  - {pname}: (未完了)")
+        td = result.get("total_duration_sec")
+        if td is not None:
+            lines.append(f"- total_duration: {td:.1f}s")
 
         # エラー情報
         if "error" in result:
@@ -1470,4 +1567,5 @@ class Stage1Runner:
             "evaluation": self._config.evaluation,
             "imitation": self._config.imitation,
             "export": self._config.export,
+            "profiling": self._config.profiling,
         }

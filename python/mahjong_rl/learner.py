@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from mahjong_rl.profiler import Profiler
 from mahjong_rl.shard import ShardReader
 
 
@@ -50,6 +51,7 @@ class Learner:
         num_epochs: int | None = None,
         filter_actor_type: str | None = None,
         imitation_filter: dict | None = None,
+        profiler: Profiler | None = None,
     ) -> dict:
         """shard データを読み込んで学習を実行する
 
@@ -58,12 +60,16 @@ class Learner:
             imitation_filter: imitation 用品質フィルタ設定
                 - min_legal_actions: legal action 数の最小値
                 - enabled: フィルタの有効/無効 (デフォルト True)
+            profiler: 簡易プロファイラ (CQ-0102)
 
         Returns:
             metrics dict: mode, policy_loss, value_loss, entropy, total_steps
         """
+        if profiler is None:
+            profiler = Profiler(enabled=False)
         epochs = num_epochs if num_epochs is not None else self._epochs
 
+        profiler.start("shard_read")
         reader = ShardReader(shard_dir)
         data = reader.read_as_tensors(filter_actor_type=filter_actor_type)
 
@@ -74,6 +80,7 @@ class Learner:
         old_log_probs = torch.from_numpy(data["log_probs"]).to(self._device)
         old_values = torch.from_numpy(data["values"]).to(self._device)
         terminateds = torch.from_numpy(data["terminateds"]).to(self._device)
+        profiler.stop("shard_read")
 
         n_before_filter = len(observations)
 
@@ -105,6 +112,7 @@ class Learner:
                 result["filter_stats"] = filter_stats
             return result
 
+        profiler.start("model_forward")
         if self._mode == "imitation":
             metrics = self._train_imitation(
                 observations, legal_masks, actions, n, epochs)
@@ -112,6 +120,7 @@ class Learner:
             metrics = self._train_ppo(
                 observations, legal_masks, actions, rewards,
                 old_log_probs, old_values, terminateds, n, epochs)
+        profiler.stop("model_forward")
 
         metrics["mode"] = self._mode
         metrics["total_steps"] = n

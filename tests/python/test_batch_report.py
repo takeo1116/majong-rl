@@ -104,6 +104,63 @@ class TestGenerateBatchReport:
         assert summary["num_seeds"] == 0
         assert summary["aggregate"] == {}
 
+    def test_outlier_info_in_aggregate(self, tmp_path: Path):
+        """outlier_min/outlier_max に seed と run_dir がある (CQ-0094)"""
+        results = [
+            self._make_success_result(42, avg_rank=2.0),
+            self._make_success_result(43, avg_rank=3.0),
+            self._make_success_result(44, avg_rank=4.0),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        ar = summary["aggregate"]["avg_rank"]
+        assert ar["outlier_min"]["seed"] == 42
+        assert ar["outlier_min"]["value"] == 2.0
+        assert ar["outlier_max"]["seed"] == 44
+        assert ar["outlier_max"]["value"] == 4.0
+        assert "run_dir" in ar["outlier_min"]
+        assert "run_dir" in ar["outlier_max"]
+
+    def test_outlier_single_seed(self, tmp_path: Path):
+        """1件の場合 outlier_min == outlier_max (CQ-0094)"""
+        results = [self._make_success_result(42, avg_rank=2.5)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        ar = summary["aggregate"]["avg_rank"]
+        assert ar["outlier_min"]["seed"] == 42
+        assert ar["outlier_max"]["seed"] == 42
+        assert ar["outlier_min"]["value"] == ar["outlier_max"]["value"]
+
+    def test_outlier_with_missing_eval_metrics(self, tmp_path: Path):
+        """eval_metrics 欠損 run 混在時も outlier の seed 対応が正しい (CQ-0099)"""
+        results = [
+            self._make_success_result(42, avg_rank=2.0),
+            # seed=43 は成功だが eval_metrics なし
+            {
+                "seed": 43,
+                "success": True,
+                "result": {
+                    "run_dir": "/tmp/run_43",
+                    "global_seed": 43,
+                },
+            },
+            self._make_success_result(44, avg_rank=4.0),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        ar = summary["aggregate"]["avg_rank"]
+        # seed=43 をスキップしても outlier_max は seed=44 を正しく指す
+        assert ar["outlier_min"]["seed"] == 42
+        assert ar["outlier_min"]["value"] == 2.0
+        assert ar["outlier_max"]["seed"] == 44
+        assert ar["outlier_max"]["value"] == 4.0
+
 
 class TestComputeAggregate:
     """集約統計計算テスト"""
@@ -141,6 +198,30 @@ class TestComputeAggregate:
         assert "avg_rank" in result
         assert result["avg_rank"]["count"] == 2
         assert result["win_rate"]["count"] == 1
+
+    def test_se_and_ci_with_multiple_values(self):
+        """複数件で SE > 0、CI が mean を挟む (CQ-0094)"""
+        metrics = [
+            {"avg_rank": 2.0, "win_rate": 0.3},
+            {"avg_rank": 4.0, "win_rate": 0.5},
+            {"avg_rank": 3.0, "win_rate": 0.4},
+        ]
+        result = _compute_aggregate(metrics)
+        ar = result["avg_rank"]
+        assert ar["se"] > 0
+        assert ar["ci_95_lower"] < ar["mean"]
+        assert ar["ci_95_upper"] > ar["mean"]
+        # CI が mean を中心に対称
+        assert abs((ar["mean"] - ar["ci_95_lower"])
+                    - (ar["ci_95_upper"] - ar["mean"])) < 1e-6
+
+    def test_se_single_value(self):
+        """1件で SE=0、CI lower == CI upper == mean (CQ-0094)"""
+        result = _compute_aggregate([{"avg_rank": 2.5}])
+        ar = result["avg_rank"]
+        assert ar["se"] == 0.0
+        assert ar["ci_95_lower"] == ar["mean"]
+        assert ar["ci_95_upper"] == ar["mean"]
 
 
 class TestWorkerSettingsAndFailureReason:
@@ -220,3 +301,81 @@ class TestWorkerSettingsAndFailureReason:
         assert run_entry["device_info"]["training"]["resolved"] == "cuda"
         assert "env_info" in run_entry
         assert run_entry["env_info"]["torch_version"] == "2.0.0"
+
+
+class TestRotationEvalBatchAggregation:
+    """rotation eval の batch 集約テスト (CQ-0092)"""
+
+    def _make_result(self, seed: int, eval_mode: str = "single",
+                     avg_rank: float = 2.5) -> dict:
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": f"/tmp/run_{seed}",
+                "global_seed": seed,
+                "eval_metrics": {
+                    "eval_mode": eval_mode,
+                    "avg_rank": avg_rank,
+                    "avg_score": 100.0,
+                    "win_rate": 0.3,
+                    "deal_in_rate": 0.1,
+                },
+            },
+        }
+
+    def test_rotation_eval_mode_in_summary(self, tmp_path: Path):
+        """rotation eval の eval_mode が batch_summary に記録される"""
+        results = [
+            self._make_result(42, eval_mode="rotation", avg_rank=2.0),
+            self._make_result(43, eval_mode="rotation", avg_rank=3.0),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+
+        # per-seed entry に eval_mode がある
+        assert summary["runs"][0]["eval_mode"] == "rotation"
+        assert summary["runs"][1]["eval_mode"] == "rotation"
+
+        # aggregate に eval_mode がある
+        assert summary["aggregate"]["eval_mode"] == "rotation"
+
+    def test_single_eval_mode_in_summary(self, tmp_path: Path):
+        """single eval の eval_mode が batch_summary に記録される"""
+        results = [
+            self._make_result(42, eval_mode="single"),
+            self._make_result(43, eval_mode="single"),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+
+        assert summary["aggregate"]["eval_mode"] == "single"
+
+    def test_mixed_eval_mode(self, tmp_path: Path):
+        """single と rotation 混在時は mixed"""
+        results = [
+            self._make_result(42, eval_mode="single"),
+            self._make_result(43, eval_mode="rotation"),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+
+        assert summary["aggregate"]["eval_mode"] == "mixed"
+
+    def test_csv_has_eval_mode_column(self, tmp_path: Path):
+        """CSV に eval_mode 列がある"""
+        results = [
+            self._make_result(42, eval_mode="rotation"),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_table.csv") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        assert rows[0]["eval_mode"] == "rotation"

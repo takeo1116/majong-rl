@@ -23,6 +23,7 @@ class ExperimentConfig:
     imitation: dict = field(default_factory=dict)
     export: dict = field(default_factory=dict)
     distillation: dict = field(default_factory=dict)
+    profiling: dict = field(default_factory=dict)
 
     @staticmethod
     def from_yaml(path: Path) -> ExperimentConfig:
@@ -40,6 +41,7 @@ class ExperimentConfig:
             imitation=data.get("imitation", {}),
             export=data.get("export", {}),
             distillation=data.get("distillation", {}),
+            profiling=data.get("profiling", {}),
         )
 
     def to_yaml(self, path: Path) -> None:
@@ -58,6 +60,8 @@ class ExperimentConfig:
             data["imitation"] = self.imitation
         if self.distillation:
             data["distillation"] = self.distillation
+        if self.profiling:
+            data["profiling"] = self.profiling
         with open(path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 

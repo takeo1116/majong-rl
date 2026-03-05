@@ -453,6 +453,57 @@ class TestPhaseStats:
 
 
 @pytest.mark.slow
+class TestPhaseTiming:
+    """phase duration テスト (CQ-0091)"""
+
+    def test_phase_timing_in_summary(self, tmp_path: Path):
+        """summary.json に phase_timing が保存される"""
+        config = _make_minimal_config()
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        assert "phase_timing" in summary
+        pt = summary["phase_timing"]
+        # デフォルト phases: selfplay, learner, eval + eval_before
+        for phase_name in ["selfplay", "learner", "eval"]:
+            assert phase_name in pt, f"{phase_name} が phase_timing にない"
+            entry = pt[phase_name]
+            assert entry["start_ts"].endswith("Z")
+            assert entry["end_ts"].endswith("Z")
+            assert entry["duration_sec"] > 0
+
+    def test_total_duration_positive(self, tmp_path: Path):
+        """total_duration_sec が正の値"""
+        config = _make_minimal_config()
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        assert summary["total_duration_sec"] > 0
+
+    def test_eval_before_timing_recorded(self, tmp_path: Path):
+        """eval_before の timing も記録される"""
+        config = _make_minimal_config()
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        pt = result["phase_timing"]
+        assert "eval_before" in pt
+        assert pt["eval_before"]["start_ts"].endswith("Z")
+        assert pt["eval_before"]["end_ts"].endswith("Z")
+
+
+@pytest.mark.slow
 class TestNotesAppend:
     """notes.md 追記テスト (CQ-0057)"""
 
@@ -543,17 +594,94 @@ class TestPresetConfigs:
         assert config.evaluation["mode"] == "rotation"
         assert config.evaluation["rotation_seats"] == [0, 1, 2, 3]
 
+    def test_eval_fast_preset_loads(self):
+        """eval_fast プリセットが読み込める (CQ-0093)"""
+        config = ExperimentConfig.from_yaml(
+            Path("configs/stage1_full_flat_mlp_ppo_eval_fast.yaml"))
+        assert config.evaluation["num_matches"] == 20
+        assert config.evaluation.get("mode", "single") == "single"
+
+    def test_eval_strict_preset_loads(self):
+        """eval_strict プリセットが読み込める (CQ-0093)"""
+        config = ExperimentConfig.from_yaml(
+            Path("configs/stage1_full_flat_mlp_ppo_eval_strict.yaml"))
+        assert config.evaluation["num_matches"] == 100
+        assert config.evaluation["mode"] == "rotation"
+        assert config.evaluation["rotation_seats"] == [0, 1, 2, 3]
+
     def test_all_presets_pass_validation(self):
         """全プリセットがバリデーションを通る"""
         import glob
         preset_files = glob.glob("configs/stage1_*.yaml")
-        assert len(preset_files) >= 3
+        assert len(preset_files) >= 5
 
         for path in preset_files:
             config = ExperimentConfig.from_yaml(Path(path))
             runner = Stage1Runner(config=config, base_dir=Path("/tmp"))
             errors = runner.validate_config()
             assert errors == [], f"{path}: {errors}"
+
+
+@pytest.mark.smoke
+class TestProfiling:
+    """簡易プロファイルテスト (CQ-0098)"""
+
+    def test_profiling_disabled_no_file(self, tmp_path: Path):
+        """profiling OFF で profile.json が生成されない"""
+        config = _make_minimal_config()
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        run_dir = Path(result["run_dir"])
+        assert not (run_dir / "profile.json").exists()
+
+    def test_profiling_enabled_creates_file(self, tmp_path: Path):
+        """profiling ON で profile.json が生成され entries がある"""
+        config = _make_minimal_config()
+        config.profiling = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        run_dir = Path(result["run_dir"])
+        assert (run_dir / "profile.json").exists()
+
+        with open(run_dir / "profile.json") as f:
+            profile = json.load(f)
+        assert profile["enabled"] is True
+        assert len(profile["entries"]) > 0
+        # selfplay_total は必ず記録される
+        assert "selfplay_total" in profile["entries"]
+
+    def test_profiling_validation_rejects_non_bool(self):
+        """profiling.enabled が bool 以外でバリデーションエラー"""
+        config = _make_minimal_config()
+        config.profiling = {"enabled": "yes"}
+        runner = Stage1Runner(config=config, base_dir=Path("/tmp"))
+        errors = runner.validate_config()
+        assert any("profiling.enabled" in e for e in errors)
+
+    def test_profiling_has_granular_entries(self, tmp_path: Path):
+        """profiling ON で主要処理粒度の計測点が profile.json に含まれる (CQ-0102)"""
+        config = _make_minimal_config()
+        config.profiling = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        run_dir = Path(result["run_dir"])
+
+        with open(run_dir / "profile.json") as f:
+            profile = json.load(f)
+
+        entries = profile["entries"]
+        # phase 合計レベル
+        assert "selfplay_total" in entries
+        assert "learner_total" in entries
+        # 主要処理粒度 (CQ-0102)
+        assert "selfplay_match_loop" in entries
+        assert "selfplay_shard_write" in entries
+        assert "shard_read" in entries
+        assert "model_forward" in entries
+        # count >= 1
+        for key in ["selfplay_match_loop", "selfplay_shard_write",
+                     "shard_read", "model_forward"]:
+            assert entries[key]["count"] >= 1
 
 
 @pytest.mark.smoke
@@ -1030,6 +1158,7 @@ class TestEvalNumWorkers1:
 
 
 @pytest.mark.slow
+@pytest.mark.requires_multiprocess
 class TestEvalMultiProcess:
     """multi-process eval テスト (CQ-0069)"""
 
@@ -1145,6 +1274,7 @@ class TestEvalMultiProcess:
 
 
 @pytest.mark.slow
+@pytest.mark.requires_multiprocess
 class TestSelfPlayMultiProcess:
     """multi-process self-play テスト (CQ-0072)"""
 
@@ -1460,6 +1590,7 @@ class TestParallelConfigValidation:
 
 
 @pytest.mark.slow
+@pytest.mark.requires_multiprocess
 class TestParallelSmokeIntegration:
     """parallel eval / self-play の統合 smoke test (CQ-0075)"""
 
@@ -1549,6 +1680,7 @@ class TestParallelSmokeIntegration:
 
 
 @pytest.mark.slow
+@pytest.mark.requires_multiprocess
 class TestImitationMultiProcess:
     """imitation 教師データ生成の multi-process テスト (CQ-0082)"""
 
