@@ -407,6 +407,7 @@ class Stage1Runner:
         # num_workers チェック
         for section_name, key in [
             ("selfplay", "num_workers"),
+            ("imitation", "num_workers"),
             ("evaluation", "num_workers"),
         ]:
             section = getattr(cfg, section_name, {})
@@ -588,9 +589,13 @@ class Stage1Runner:
         self._teardown_file_logging(file_handler)
 
     def _run_imitation(self, run_dir: Path, model, encoder) -> dict:
-        """imitation warm start フェーズ"""
+        """imitation warm start フェーズ
+
+        imitation.num_workers > 1 の場合は multi-process で教師データを生成する。
+        """
         sp_cfg = self._config.selfplay
         imitation_dir = run_dir / "imitation"
+        num_workers = self._config.imitation.get("num_workers", 1)
 
         # baseline 教師データ生成
         imi_config = dict(self._as_dict())
@@ -599,22 +604,28 @@ class Stage1Runner:
         imi_sp["policy_ratio"] = 0.0  # 全席 baseline
         imi_config["selfplay"] = imi_sp
 
-        sp_device = resolve_device(
-            self._config.selfplay.get("inference_device", "auto"))
-        worker = SelfPlayWorker(
-            config=imi_config,
-            model=model,
-            encoder=encoder,
-            output_dir=imitation_dir,
-            inference_device=sp_device,
-        )
         imi_matches = sp_cfg.get("imitation_matches",
                                  sp_cfg.get("num_matches", 10))
-        sp_stats = worker.run(
-            num_matches=imi_matches,
-            seed_start=sp_cfg.get("imitation_seed_start",
-                                  sp_cfg.get("seed_start", 0)),
-        )
+
+        if num_workers > 1:
+            sp_stats = self._run_imitation_parallel(
+                imitation_dir, model, imi_config, imi_matches, num_workers)
+        else:
+            sp_device = resolve_device(
+                sp_cfg.get("inference_device", "auto"))
+            worker = SelfPlayWorker(
+                config=imi_config,
+                model=model,
+                encoder=encoder,
+                output_dir=imitation_dir,
+                inference_device=sp_device,
+            )
+            sp_stats = worker.run(
+                num_matches=imi_matches,
+                seed_start=sp_cfg.get("imitation_seed_start",
+                                      sp_cfg.get("seed_start", 0)),
+            )
+
         logger.info(f"  imitation data: {sp_stats['total_steps']} steps")
 
         # imitation 学習
@@ -641,7 +652,82 @@ class Stage1Runner:
         )
         learner.save_checkpoint(tag="imitation")
         logger.info(f"  imitation loss: {metrics['policy_loss']:.4f}")
+        # データ生成統計を学習 metrics に付加
+        metrics["data_generation"] = {
+            "total_steps": sp_stats.get("total_steps", 0),
+            "num_matches": sp_stats.get("num_matches", 0),
+            "num_workers": sp_stats.get("num_workers", 1),
+            "seed_strategy": sp_stats.get("seed_strategy"),
+        }
         return metrics
+
+    def _run_imitation_parallel(
+        self, imitation_dir: Path, model, imi_config: dict,
+        num_matches: int, num_workers: int,
+    ) -> dict:
+        """multi-process imitation 教師データ生成
+
+        _run_selfplay_parallel と同じパターンで worker を起動し、
+        imitation/worker_<id>/shard_*.parquet に保存する。
+        """
+        sp_cfg = self._config.selfplay
+        imitation_dir.mkdir(parents=True, exist_ok=True)
+        num_threads = sp_cfg.get("worker_num_threads", 1)
+        base_seed = self._global_seed or 0
+        obs_mode = self._config.experiment.get("observation_mode", "full")
+
+        # model を一時ファイルに保存
+        model_path = imitation_dir / "_imitation_model.pt"
+        state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+        torch.save(state_dict_cpu, model_path)
+
+        model_config = dict(self._config.model)
+        encoder_config = dict(self._config.feature_encoder)
+
+        matches_per_worker = self._distribute_matches(num_matches, num_workers)
+
+        ctx = mp.get_context("spawn")
+        error_queue = ctx.Queue()
+        processes = []
+
+        try:
+            for i, wm in enumerate(matches_per_worker):
+                if wm == 0:
+                    continue
+                worker_seed = derive_worker_seed(base_seed, i)
+                match_seeds = [derive_match_seed(worker_seed, j) for j in range(wm)]
+                worker_output_dir = imitation_dir / f"worker_{i}"
+
+                p = ctx.Process(
+                    target=_selfplay_worker_fn,
+                    args=(
+                        i, str(model_path), imi_config, model_config,
+                        encoder_config, obs_mode, wm, match_seeds,
+                        str(worker_output_dir), num_threads, base_seed,
+                        worker_seed, error_queue,
+                    ),
+                )
+                p.start()
+                processes.append(p)
+
+            self._wait_and_check_workers(
+                processes, error_queue=error_queue,
+                worker_label="imitation worker")
+
+            # 統計集約
+            aggregated = self._aggregate_selfplay_stats(imitation_dir, num_workers)
+            aggregated["num_workers"] = num_workers
+            aggregated["seed_strategy"] = {
+                "base_seed": base_seed,
+                "method": "derive_worker_seed + derive_match_seed",
+            }
+            logger.info(
+                f"  imitation data generated: {aggregated['total_steps']} steps "
+                f"({num_workers} workers)")
+            return aggregated
+        finally:
+            if model_path.exists():
+                model_path.unlink()
 
     def _run_selfplay(self, run_dir: Path, model, encoder) -> dict:
         """self-play フェーズ
@@ -1170,14 +1256,22 @@ class Stage1Runner:
             }
         if "imitation_metrics" in result:
             imi = result["imitation_metrics"]
-            # imitation shard 数
+            # imitation shard 数 (平坦 + worker サブディレクトリ)
             imi_dir = run_dir / "imitation"
-            imi_shard_count = len(list(imi_dir.glob("shard_*.parquet"))) if imi_dir.exists() else 0
+            if imi_dir.exists():
+                imi_flat = list(imi_dir.glob("shard_*.parquet"))
+                imi_nested = list(imi_dir.glob("worker_*/shard_*.parquet"))
+                imi_shard_count = len(set(imi_flat) | set(imi_nested))
+            else:
+                imi_shard_count = 0
+            dg = imi.get("data_generation", {})
             phase_stats["imitation"] = {
-                "total_steps": imi.get("total_steps", 0),
+                "total_steps": dg.get("total_steps", imi.get("total_steps", 0)),
                 "num_updates": imi.get("num_updates", 0),
                 "shard_count": imi_shard_count,
                 "policy_loss": imi.get("policy_loss"),
+                "num_workers": dg.get("num_workers", 1),
+                "seed_strategy": dg.get("seed_strategy"),
             }
         if "train_metrics" in result:
             tm = result["train_metrics"]
@@ -1280,6 +1374,13 @@ class Stage1Runner:
         # Python 実行環境情報
         lines.append(f"- python: {sys.version.split()[0]} ({sys.executable})")
 
+        # imitation 並列情報
+        imi = result.get("imitation_metrics", {})
+        dg = imi.get("data_generation", {})
+        if dg.get("num_workers", 1) > 1:
+            lines.append(f"- imitation: num_workers={dg['num_workers']}, "
+                         f"seed_strategy={dg.get('seed_strategy', {}).get('method', '?')}")
+
         # エラー情報
         if "error" in result:
             lines.append(f"- エラー: {result['error']}")
@@ -1367,5 +1468,6 @@ class Stage1Runner:
             "selfplay": self._config.selfplay,
             "training": self._config.training,
             "evaluation": self._config.evaluation,
+            "imitation": self._config.imitation,
             "export": self._config.export,
         }

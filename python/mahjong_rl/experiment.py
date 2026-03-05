@@ -20,6 +20,7 @@ class ExperimentConfig:
     selfplay: dict = field(default_factory=dict)
     training: dict = field(default_factory=dict)
     evaluation: dict = field(default_factory=dict)
+    imitation: dict = field(default_factory=dict)
     export: dict = field(default_factory=dict)
     distillation: dict = field(default_factory=dict)
 
@@ -36,6 +37,7 @@ class ExperimentConfig:
             selfplay=data.get("selfplay", {}),
             training=data.get("training", {}),
             evaluation=data.get("evaluation", {}),
+            imitation=data.get("imitation", {}),
             export=data.get("export", {}),
             distillation=data.get("distillation", {}),
         )
@@ -52,6 +54,8 @@ class ExperimentConfig:
             "evaluation": self.evaluation,
             "export": self.export,
         }
+        if self.imitation:
+            data["imitation"] = self.imitation
         if self.distillation:
             data["distillation"] = self.distillation
         with open(path, "w") as f:

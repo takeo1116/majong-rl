@@ -1435,6 +1435,22 @@ class TestParallelConfigValidation:
         errors = runner.validate_config()
         assert any("seed_strategy" in e for e in errors)
 
+    def test_imitation_workers_zero_rejected(self, tmp_path: Path):
+        """imitation.num_workers=0 は拒否される"""
+        config = _make_minimal_config()
+        config.imitation["num_workers"] = 0
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert any("imitation.num_workers" in e for e in errors)
+
+    def test_imitation_workers_valid(self, tmp_path: Path):
+        """imitation.num_workers=2 は正常に通る"""
+        config = _make_minimal_config()
+        config.imitation["num_workers"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        errors = runner.validate_config()
+        assert errors == []
+
     def test_default_config_passes(self, tmp_path: Path):
         """既存の最小 config がそのまま通る"""
         config = _make_minimal_config()
@@ -1530,3 +1546,117 @@ class TestParallelSmokeIntegration:
         for wid in range(2):
             stats_path = selfplay_dir / f"worker_{wid}" / "stats.json"
             assert stats_path.exists()
+
+
+@pytest.mark.slow
+class TestImitationMultiProcess:
+    """imitation 教師データ生成の multi-process テスト (CQ-0082)"""
+
+    def test_parallel_imitation_completes(self, tmp_path: Path):
+        """imitation.num_workers=2 で imitation → selfplay → learner → eval が完走する"""
+        config = _make_minimal_config()
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 4
+        config.imitation["num_workers"] = 2
+        config.training["imitation_epochs"] = 1
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert "imitation_metrics" in result
+        assert "selfplay_stats" in result
+        assert "train_metrics" in result
+
+    def test_parallel_imitation_shards_in_worker_dirs(self, tmp_path: Path):
+        """各 worker のサブディレクトリに shard が生成される"""
+        config = _make_minimal_config()
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 4
+        config.imitation["num_workers"] = 2
+        config.training["imitation_epochs"] = 1
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        imi_dir = run_dir / "imitation"
+
+        # 各 worker にサブディレクトリと shard がある
+        for wid in range(2):
+            worker_dir = imi_dir / f"worker_{wid}"
+            assert worker_dir.exists()
+            shards = list(worker_dir.glob("shard_*.parquet"))
+            assert len(shards) >= 1
+
+    def test_parallel_imitation_learner_reads_nested_shards(self, tmp_path: Path):
+        """並列生成された imitation shard を learner が読み取れる"""
+        config = _make_minimal_config()
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 4
+        config.imitation["num_workers"] = 2
+        config.training["imitation_epochs"] = 1
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        imi_metrics = result["imitation_metrics"]
+        assert imi_metrics["policy_loss"] > 0  # 学習が実行された
+
+    def test_single_worker_fallback(self, tmp_path: Path):
+        """imitation.num_workers=1 で従来経路が動作する"""
+        config = _make_minimal_config()
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 2
+        config.imitation["num_workers"] = 1
+        config.training["imitation_epochs"] = 1
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        assert "imitation_metrics" in result
+
+    def test_summary_records_imitation_workers(self, tmp_path: Path):
+        """summary.json に imitation の num_workers と seed_strategy が記録される (CQ-0083)"""
+        config = _make_minimal_config()
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 4
+        config.imitation["num_workers"] = 2
+        config.training["imitation_epochs"] = 1
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        imi_stats = summary["phase_stats"]["imitation"]
+        assert imi_stats["num_workers"] == 2
+        assert imi_stats["shard_count"] >= 2
+        # seed_strategy が記録されている (CQ-0083)
+        ss = imi_stats["seed_strategy"]
+        assert ss is not None
+        assert "base_seed" in ss
+        assert ss["base_seed"] == 42
+        assert "method" in ss
+
+    def test_notes_records_imitation_parallel_info(self, tmp_path: Path):
+        """notes.md に imitation 並列情報が記録される (CQ-0083)"""
+        config = _make_minimal_config()
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 4
+        config.imitation["num_workers"] = 2
+        config.training["imitation_epochs"] = 1
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        notes_content = (run_dir / "notes.md").read_text()
+        assert "imitation" in notes_content
+        assert "num_workers=2" in notes_content
