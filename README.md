@@ -1,144 +1,158 @@
 # majong-rl
 
-麻雀の強化学習をゲームエンジンから作る
+日本式リーチ麻雀の C++ ゲームエンジンと、Python/PyTorch ベースの強化学習基盤を統合したプロジェクト。
 
-## 概要
+現時点の中心スコープは Stage 1（打牌学習）で、以下の実験ループを提供する。
 
-日本式リーチ麻雀（4人打ち）のゲームエンジンを C++ で構築し、その上で動作する強化学習基盤を Python で整備するプロジェクト。
+- self-play（multi-process 対応）
+- learner（PPO / imitation）
+- evaluation（single / rotation、multi-process 対応）
+- multi-seed batch / sweep / resume
 
-- **ゲームエンジン**: C++20 製。半荘進行・合法手列挙・和了判定・符計算・点数計算・精算を実装
-- **学習基盤**: PyTorch ベース。pybind11 経由でエンジンを呼び出し、self-play → shard 保存 → PPO/Imitation 学習 → 評価のパイプラインを提供
-- **並列実行**: self-play / eval の multi-process 並列化、マルチ seed バッチ実行に対応
-- **段階的設計**: Stage 1 (打牌のみ学習) から段階的に拡張する構成
+## 1. セットアップ
 
-## ビルド方法
+前提:
 
-```bash
-# C++ エンジンのビルド
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-```
+- Python 3.10+
+- CMake / C++20 コンパイラ
 
 ```bash
-# Python パッケージのインストール（開発モード）
+# 開発用依存込みでインストール
 pip install -e ".[dev]"
 ```
 
-## テスト実行
+```bash
+# C++ 側をビルド
+mkdir -p build
+cd build
+cmake ..
+cmake --build . -j
+```
+
+## 2. テスト
 
 ```bash
-# C++ テスト (361 tests)
+# C++ テスト
 cd build
 ctest --output-on-failure
 ```
 
 ```bash
-# Python smoke テスト（軽量・日常確認用）
+# Python smoke（推奨: 日常確認）
 python3 -m pytest tests/python/ -m smoke -v
 ```
 
 ```bash
-# Python slow 除外テスト（smoke + unmarked テスト）
-python3 -m pytest tests/python/ -m "not slow" -v
-```
-
-```bash
-# Python 全テスト（smoke + slow 含む完全網羅）
+# Python 全テスト
 python3 -m pytest tests/python/ -v
 ```
 
-### テスト分類
+テストマーカー:
 
-| マーカー | 対象 | 実行時間目安 |
-|---|---|---|
-| `smoke` | 軽量な基本検証テスト（単体・変換・バリデーション） | 約3分 |
-| `slow` | 重い評価・統合テスト（runner.run / 半荘実行 / parallel） | 約25分 |
-| 未指定 | 全テスト（smoke + slow） | 約28分 |
+- `smoke`: 軽量・日常確認向け
+- `slow`: 重い統合系（`-m "not slow"` で除外可能）
 
-- **日常開発**: `python3 -m pytest -m smoke` で高速確認
-- **PR 前 / CI**: `python3 -m pytest` で全テスト実行
-- marker 未指定で `pytest` を実行すると、全テスト（smoke + slow）が実行される
+## 3. 実験実行（CLI）
 
-### 実験前の設定検証
+エントリポイント: `python3 -m mahjong_rl.cli`
+
+### 3.1 config バリデーションのみ
 
 ```bash
-# config のバリデーションのみ実行（run ディレクトリは作成されない）
-python3 -m mahjong_rl.cli --config configs/stage1_full_flat_mlp_ppo.yaml --validate-only
+python3 -m mahjong_rl.cli \
+  --config configs/stage1_full_flat_mlp_ppo.yaml \
+  --validate-only
 ```
 
-### マルチ seed バッチ実行
+### 3.2 単一 run
 
 ```bash
-# seed を明示列挙
-python3 -m mahjong_rl.cli --config configs/stage1_full_flat_mlp_ppo.yaml --seeds 42,43,44
-
-# seed 範囲を指定
-python3 -m mahjong_rl.cli --config configs/stage1_full_flat_mlp_ppo.yaml --seed-start 42 --num-seeds 5
-
-# エラー時も続行（夜間実行向け）
-python3 -m mahjong_rl.cli --config config.yaml --seeds 42,43,44 --continue-on-error
+python3 -m mahjong_rl.cli \
+  --config configs/stage1_full_flat_mlp_ppo.yaml
 ```
 
-バッチ実行結果は `batch_summary.json`（集約統計）と `batch_table.csv`（seed 一覧）として batch_dir に保存される。
-
-## サンプル実行
+### 3.3 multi-seed batch
 
 ```bash
-cd build
-./mahjong_example
+# 明示 seed
+python3 -m mahjong_rl.cli \
+  --config configs/stage1_full_flat_mlp_ppo.yaml \
+  --seeds 42,43,44
+
+# 範囲指定
+python3 -m mahjong_rl.cli \
+  --config configs/stage1_full_flat_mlp_ppo.yaml \
+  --seed-start 42 \
+  --num-seeds 5
 ```
 
-## ディレクトリ構成
+### 3.4 batch resume
 
-```
-src/
-  core/       - 牌・副露・状態・行動・イベントの基礎構造
-  rules/      - 和了判定、役判定、符計算、点数計算
-  engine/     - reset/step、合法手列挙、応答解決
-  rl/         - Observation、Reward、環境ラッパー (C++)
-  io/         - ログ、文字列表現、CLI
-
-bindings/     - pybind11 バインディング
-
-python/mahjong_rl/
-  env/        - Stage1Env (打牌専用環境ラッパー)
-  encoders/   - FlatFeatureEncoder, ChannelTensorEncoder
-  models/     - MLPPolicyValueModel
-  baseline/   - 向聴数ベースライン
-  shard.py    - 学習サンプル Parquet 入出力
-  selfplay_worker.py  - Self-play データ生成
-  learner.py          - PPO / Imitation 学習
-  evaluator.py        - 評価対戦ランナー（parallel eval 対応）
-  runner.py           - Stage1Runner（selfplay/learner/eval 統合、parallel 対応）
-  experiment.py       - 実験設定 YAML・Run ディレクトリ管理
-  cli.py              - CLI エントリポイント（マルチ seed バッチ対応）
-  batch_report.py     - バッチ集約レポート生成
-  action_selector.py  - 行動選択 (argmax / sampling)
-
-configs/      - 実験設定 YAML テンプレート
-tests/
-  unit/         - C++ 単体テスト
-  integration/  - C++ 統合テスト
-  replay/       - C++ 再現テスト
-  python/       - Python テスト
-docs/         - GAME_RULE.md, GAME_SPEC.md, RL_RULE.md, RL_SPEC.md
-examples/     - サンプル実行
+```bash
+python3 -m mahjong_rl.cli \
+  --config configs/stage1_full_flat_mlp_ppo.yaml \
+  --seeds 42,43,44,45,46 \
+  --resume runs/<existing_batch_dir>
 ```
 
-## ドキュメント
+### 3.5 sweep（条件比較）
 
-| ファイル | 内容 |
-|---|---|
-| `docs/GAME_RULE.md` | 採用する麻雀ルールの定義 |
-| `docs/GAME_SPEC.md` | ゲームエンジン実装仕様 |
-| `docs/RL_RULE.md` | 学習方針・研究方針 |
-| `docs/RL_SPEC.md` | 学習システム実装仕様 |
-| `docs/EXPERIMENT_STAGE1_RUNBOOK.md` | Stage 1 実験の実行手順 Runbook |
+```bash
+python3 -m mahjong_rl.cli \
+  --config configs/stage1_full_flat_mlp_ppo.yaml \
+  --sweep-file sweep.yaml \
+  --seeds 42,43,44
+```
 
-## 技術スタック
+### 3.6 sweep resume（condition 単位）
 
-- **ゲームエンジン**: C++20, CMake, GoogleTest
-- **学習基盤**: Python, PyTorch, pybind11
-- **データ保存**: Apache Parquet (PyArrow)
-- **実験設定**: YAML (PyYAML)
+```bash
+python3 -m mahjong_rl.cli \
+  --config configs/stage1_full_flat_mlp_ppo.yaml \
+  --sweep-file sweep.yaml \
+  --seeds 42,43,44 \
+  --resume runs/<existing_sweep_dir>
+```
+
+## 4. 主な config
+
+- `configs/stage1_full_flat_mlp_ppo.yaml`
+- `configs/stage1_full_flat_mlp_imitation_then_ppo.yaml`
+- `configs/stage1_full_flat_mlp_ppo_rotation_eval.yaml`
+- `configs/stage1_full_flat_mlp_ppo_eval_fast.yaml`
+- `configs/stage1_full_flat_mlp_ppo_eval_strict.yaml`
+
+## 5. 生成物
+
+- `runs/`: 実験の生データ（run_dir、batch_dir、sweep_dir）
+  - `summary.json`, `run.log`, `notes.md`, `checkpoints/`, `selfplay/`, `eval/`, `profile.json` など
+- `experiments/`: runbook と report（Git 管理）
+  - `exp_XXX/runbook.md`
+  - `exp_XXX/report.md`
+
+運用ルールは `experiments/README.md` を参照。
+
+## 6. ディレクトリ概要
+
+```text
+src/                 C++ ゲームエンジン
+bindings/            pybind11 バインディング
+python/mahjong_rl/   RL 実装（env/encoders/models/runner/cli など）
+configs/             実験設定 YAML
+tests/               C++/Python テスト
+docs/                仕様・ルール・運用ドキュメント
+experiments/         runbook/report（実験ごとの記録）
+runs/                実験生データ（Git 管理外）
+```
+
+## 7. 仕様ドキュメント
+
+- `docs/GAME_RULE.md`: ゲームルール定義
+- `docs/GAME_SPEC.md`: ゲーム実装仕様
+- `docs/RL_RULE.md`: RL 側ルール
+- `docs/RL_SPEC.md`: RL 実装仕様
+
+## 8. 補足
+
+- `python` コマンドがない環境では `python3` を使用する。
+- GPU 利用時は PyTorch 側の CUDA 可用性に依存する（`torch.cuda.is_available()`）。

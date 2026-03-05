@@ -23,6 +23,5 @@ docs/CHANGE_QUEUE.md
 docs/CLAUDE.md
 docs/EXPERIMENT_STAGE1_RUNBOOK.md
 
-# 実験レポート
-experiments/
-reports/
+# 実験実行の生データ
+runs/
