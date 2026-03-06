@@ -1881,3 +1881,445 @@ class TestImitationMultiProcess:
         notes_content = (run_dir / "notes.md").read_text()
         assert "imitation" in notes_content
         assert "num_workers=2" in notes_content
+
+
+# --- CQ-0112: manifest / resume / reuse テスト ---
+
+
+def _run_minimal(tmp_path: Path, phases=None) -> tuple:
+    """最小 run を実行して (config, result, run_dir) を返すヘルパー"""
+    config = _make_minimal_config()
+    if phases is not None:
+        config.experiment["phases"] = phases
+    config.experiment["global_seed"] = 42
+    runner = Stage1Runner(config=config, base_dir=tmp_path)
+    result = runner.run()
+    run_dir = Path(result["run_dir"])
+    return config, result, run_dir
+
+
+@pytest.mark.smoke
+class TestManifest:
+    """artifacts_manifest.json 生成テスト (CQ-0109, CQ-0112)"""
+
+    def test_manifest_generated(self, tmp_path: Path):
+        """通常 run で artifacts_manifest.json が生成される"""
+        _, result, run_dir = _run_minimal(tmp_path)
+        assert "error" not in result
+        assert (run_dir / "artifacts_manifest.json").exists()
+
+    def test_manifest_keys(self, tmp_path: Path):
+        """manifest に必須キーが含まれる"""
+        _, result, run_dir = _run_minimal(tmp_path)
+        assert "error" not in result
+        with open(run_dir / "artifacts_manifest.json") as f:
+            manifest = json.load(f)
+        assert manifest["manifest_version"] == 1
+        assert "phase_completion" in manifest
+        assert "artifacts" in manifest
+        assert "config_fingerprint" in manifest
+        assert len(manifest["config_fingerprint"]) == 64  # SHA-256 hex
+        assert "reuse_metadata" in manifest
+        # reuse_metadata のキー
+        rm = manifest["reuse_metadata"]
+        assert "global_seed" in rm
+        assert "policy_ratio" in rm
+        assert "selfplay_num_matches" in rm
+
+    def test_manifest_phase_completion_matches_status(self, tmp_path: Path):
+        """manifest.phase_completion と summary.json.phase_status が一致する"""
+        _, result, run_dir = _run_minimal(tmp_path)
+        assert "error" not in result
+        with open(run_dir / "artifacts_manifest.json") as f:
+            manifest = json.load(f)
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        pc = manifest["phase_completion"]
+        ps = summary["phase_status"]
+        # phase_status のキーは全て manifest にある
+        for phase, status in ps.items():
+            assert pc.get(phase) == status, f"{phase}: {pc.get(phase)} != {status}"
+
+
+@pytest.mark.smoke
+class TestPhaseResume:
+    """phase 単位 resume テスト (CQ-0111, CQ-0112)"""
+
+    def test_resume_skips_completed_phases(self, tmp_path: Path):
+        """正常完了 run_dir で resume → 全 phase スキップ (CQ-0115)"""
+        config, result1, run_dir = _run_minimal(tmp_path)
+        assert "error" not in result1
+
+        # resume 実行
+        runner2 = Stage1Runner(config=config, base_dir=tmp_path,
+                               resume_run_dir=run_dir)
+        result2 = runner2.run()
+        assert "error" not in result2
+        assert result2["run_dir"] == str(run_dir)
+
+        # summary を再読み込み
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        # CQ-0115: phase_status は過去の success を維持
+        for phase in ["selfplay", "learner", "eval"]:
+            assert summary["phase_status"][phase] == "success", \
+                f"{phase}: phase_status={summary['phase_status'][phase]} (expected success)"
+        # CQ-0115: phase_action に skipped が記録される
+        assert "phase_action" in summary
+        for phase in ["selfplay", "learner", "eval"]:
+            assert summary["phase_action"][phase] == "skipped", \
+                f"{phase}: phase_action={summary['phase_action'].get(phase)} (expected skipped)"
+
+    def test_resume_missing_artifact_fails(self, tmp_path: Path):
+        """完了マークがあるが成果物欠落 → ValueError"""
+        import shutil
+
+        config, result1, run_dir = _run_minimal(tmp_path)
+        assert "error" not in result1
+
+        # selfplay ディレクトリを削除
+        sp_dir = run_dir / "selfplay"
+        if sp_dir.exists():
+            shutil.rmtree(sp_dir)
+
+        # resume → 成果物不足でエラー
+        runner2 = Stage1Runner(config=config, base_dir=tmp_path,
+                               resume_run_dir=run_dir)
+        with pytest.raises(ValueError, match="成果物整合エラー"):
+            runner2.run()
+
+    def test_resume_no_manifest_fails(self, tmp_path: Path):
+        """manifest がない run_dir で resume → ValueError"""
+        run_dir = tmp_path / "fake_run"
+        run_dir.mkdir()
+        config = _make_minimal_config()
+        runner = Stage1Runner(config=config, base_dir=tmp_path,
+                              resume_run_dir=run_dir)
+        with pytest.raises(ValueError, match="artifacts_manifest.json"):
+            runner.run()
+
+
+@pytest.mark.smoke
+class TestArtifactReuse:
+    """成果物再利用テスト (CQ-0110, CQ-0112)"""
+
+    def test_reuse_runs_remaining_phases(self, tmp_path: Path):
+        """ref run の成果物を再利用して後続 phase のみ実行"""
+        ref_config, ref_result, ref_dir = _run_minimal(tmp_path / "ref")
+        assert "error" not in ref_result
+
+        # reuse 実行: imitation+selfplay+eval_before 再利用 → learner+eval のみ
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        reuse_from = {
+            "run_dir": str(ref_dir),
+            "phases": ["selfplay", "eval_before"],
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path / "new",
+                              reuse_from=reuse_from)
+        result = runner.run()
+        assert "error" not in result
+
+        new_dir = Path(result["run_dir"])
+        # selfplay shard がコピーされている
+        sp_shards = list((new_dir / "selfplay").glob("**/shard_*.parquet"))
+        assert len(sp_shards) >= 1
+
+        # summary に reuse_info が記録される
+        with open(new_dir / "summary.json") as f:
+            summary = json.load(f)
+        assert "reuse_info" in summary
+        assert summary["reuse_info"]["ref_run_dir"] == str(ref_dir)
+        assert "selfplay" in summary["reuse_info"]["reused_phases"]
+
+    def test_reuse_missing_ref_fails(self, tmp_path: Path):
+        """参照元 run_dir が存在しない → エラー"""
+        config = _make_minimal_config()
+        reuse_from = {
+            "run_dir": str(tmp_path / "nonexistent"),
+            "phases": ["selfplay"],
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path,
+                              reuse_from=reuse_from)
+        with pytest.raises(ValueError, match="artifacts_manifest.json"):
+            runner.run()
+
+
+@pytest.mark.smoke
+class TestValidateArtifactsStrict:
+    """成果物整合チェック厳密化テスト (CQ-0113)"""
+
+    def test_selfplay_shard_missing_fails(self, tmp_path: Path):
+        """selfplay ディレクトリはあるが shard がない → エラー"""
+        import shutil
+
+        config, result, run_dir = _run_minimal(tmp_path)
+        assert "error" not in result
+
+        # shard ファイルを全削除（ディレクトリは残す）
+        sp_dir = run_dir / "selfplay"
+        for f in sp_dir.glob("**/*.parquet"):
+            f.unlink()
+
+        runner2 = Stage1Runner(config=config, base_dir=tmp_path,
+                               resume_run_dir=run_dir)
+        with pytest.raises(ValueError, match="shard ファイルがありません"):
+            runner2.run()
+
+    def test_eval_before_missing_fails_on_reuse(self, tmp_path: Path):
+        """eval_before が欠落した状態で reuse 指定 → エラー"""
+        # imitation 付き run で eval_before を生成
+        config = _make_minimal_config()
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 2
+        config.training["imitation_epochs"] = 1
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path / "ref")
+        ref_result = runner.run()
+        ref_dir = Path(ref_result["run_dir"])
+
+        if "error" in ref_result:
+            pytest.skip("ref run が失敗")
+
+        # eval_before ディレクトリを削除
+        import shutil
+        eb_dir = ref_dir / "eval_before"
+        if eb_dir.exists():
+            shutil.rmtree(eb_dir)
+        # manifest を書き換えて eval_before の avg_rank を消す
+        manifest_path = ref_dir / "artifacts_manifest.json"
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        manifest["artifacts"]["eval_before"] = {"exists": False, "path": "eval_before", "avg_rank": None}
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f)
+        # summary からも eval_before を消す
+        summary_path = ref_dir / "summary.json"
+        with open(summary_path) as f:
+            summary = json.load(f)
+        summary.get("phase_stats", {}).pop("eval_before", None)
+        with open(summary_path, "w") as f:
+            json.dump(summary, f)
+
+        # reuse で eval_before を指定 → 失敗
+        config2 = _make_minimal_config()
+        config2.experiment["global_seed"] = 42
+        reuse_from = {
+            "run_dir": str(ref_dir),
+            "phases": ["eval_before"],
+        }
+        runner2 = Stage1Runner(config=config2, base_dir=tmp_path / "new",
+                               reuse_from=reuse_from)
+        with pytest.raises(ValueError, match="成果物整合エラー"):
+            runner2.run()
+
+    def test_normal_run_passes_validation(self, tmp_path: Path):
+        """正常 run は厳密化後も成功する"""
+        _, result, _ = _run_minimal(tmp_path)
+        assert "error" not in result
+
+
+@pytest.mark.smoke
+class TestCheckpointIntegrity:
+    """checkpoint 初期化整合テスト (CQ-0114)"""
+
+    def test_reuse_selfplay_loads_checkpoint(self, tmp_path: Path):
+        """selfplay 再利用時に checkpoint がロードされ記録される"""
+        # imitation 付き ref run
+        config = _make_minimal_config()
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 2
+        config.training["imitation_epochs"] = 1
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path / "ref")
+        ref_result = runner.run()
+        if "error" in ref_result:
+            pytest.skip("ref run が失敗")
+        ref_dir = Path(ref_result["run_dir"])
+
+        # reuse: selfplay を再利用
+        config2 = _make_minimal_config()
+        config2.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config2.selfplay["imitation_matches"] = 2
+        config2.training["imitation_epochs"] = 1
+        config2.experiment["global_seed"] = 42
+        reuse_from = {
+            "run_dir": str(ref_dir),
+            "phases": ["imitation", "selfplay"],
+        }
+        runner2 = Stage1Runner(config=config2, base_dir=tmp_path / "new",
+                               reuse_from=reuse_from)
+        result2 = runner2.run()
+        assert "error" not in result2
+
+        # summary に loaded_checkpoint が記録される
+        new_dir = Path(result2["run_dir"])
+        with open(new_dir / "summary.json") as f:
+            summary = json.load(f)
+        assert "loaded_checkpoint" in summary
+        assert "checkpoint_imitation.pt" in summary["loaded_checkpoint"]
+
+
+@pytest.mark.smoke
+class TestPhaseActionSeparation:
+    """phase_status / phase_action 分離テスト (CQ-0115)"""
+
+    def test_resume_preserves_phase_status(self, tmp_path: Path):
+        """resume 後も過去成功 phase が phase_status=success のまま保持される"""
+        config, _, run_dir = _run_minimal(tmp_path)
+
+        # resume
+        runner2 = Stage1Runner(config=config, base_dir=tmp_path,
+                               resume_run_dir=run_dir)
+        result2 = runner2.run()
+        assert "error" not in result2
+
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        # phase_status は全て success
+        for phase in ["selfplay", "learner", "eval"]:
+            assert summary["phase_status"][phase] == "success"
+
+        # phase_action は全て skipped
+        assert "phase_action" in summary
+        for phase in ["selfplay", "learner", "eval"]:
+            assert summary["phase_action"][phase] == "skipped"
+
+    def test_reuse_records_reused_action(self, tmp_path: Path):
+        """reuse 時に phase_action に reused が記録される"""
+        _, ref_result, ref_dir = _run_minimal(tmp_path / "ref")
+        assert "error" not in ref_result
+
+        config2 = _make_minimal_config()
+        config2.experiment["global_seed"] = 42
+        reuse_from = {
+            "run_dir": str(ref_dir),
+            "phases": ["selfplay"],
+        }
+        runner2 = Stage1Runner(config=config2, base_dir=tmp_path / "new",
+                               reuse_from=reuse_from)
+        result2 = runner2.run()
+        assert "error" not in result2
+
+        new_dir = Path(result2["run_dir"])
+        with open(new_dir / "summary.json") as f:
+            summary = json.load(f)
+        assert summary.get("phase_action", {}).get("selfplay") == "reused"
+
+    def test_normal_run_no_phase_action(self, tmp_path: Path):
+        """通常 run では phase_action が空（記録されない）"""
+        _, result, run_dir = _run_minimal(tmp_path)
+        assert "error" not in result
+
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        # 通常 run では phase_action が存在しないか空
+        assert "phase_action" not in summary or summary["phase_action"] == {}
+
+
+@pytest.mark.smoke
+class TestRotationReuseEvalDiff:
+    """rotation + 再利用 (eval_before 含む) で eval_diff が生成されることを検証 (CQ-0118)"""
+
+    def test_rotation_reuse_generates_eval_diff(self, tmp_path: Path):
+        """rotation 条件で eval_before を再利用した run で eval_diff.json が生成される"""
+        # 参照元 run: rotation 評価付き
+        ref_config = _make_minimal_config()
+        ref_config.experiment["global_seed"] = 42
+        ref_config.evaluation["mode"] = "rotation"
+        ref_config.evaluation["rotation_seats"] = [0, 1]
+        ref_config.evaluation["num_matches"] = 1
+        ref_runner = Stage1Runner(config=ref_config, base_dir=tmp_path / "ref")
+        ref_result = ref_runner.run()
+        assert "error" not in ref_result
+        ref_dir = Path(ref_result["run_dir"])
+
+        # 参照元に eval_rotation.json が存在することを確認
+        assert (ref_dir / "eval_before" / "eval_rotation.json").exists(), \
+            "参照元 run に eval_rotation.json がありません"
+
+        # 再利用 run: eval_before を reuse
+        config2 = _make_minimal_config()
+        config2.experiment["global_seed"] = 42
+        config2.evaluation["mode"] = "rotation"
+        config2.evaluation["rotation_seats"] = [0, 1]
+        config2.evaluation["num_matches"] = 1
+        reuse_from = {
+            "run_dir": str(ref_dir),
+            "phases": ["selfplay", "eval_before"],
+        }
+        runner2 = Stage1Runner(config=config2, base_dir=tmp_path / "new",
+                               reuse_from=reuse_from)
+        result2 = runner2.run()
+        assert "error" not in result2
+
+        new_dir = Path(result2["run_dir"])
+
+        # eval_diff.json が生成されていること
+        diff_path = new_dir / "eval" / "eval_diff.json"
+        assert diff_path.exists(), "eval_diff.json が生成されていません"
+
+        with open(diff_path) as f:
+            diff = json.load(f)
+
+        # 主要4指標の delta が null でないこと
+        for key in ("avg_rank", "avg_score", "win_rate", "deal_in_rate"):
+            assert key in diff, f"{key} が eval_diff にありません"
+            assert diff[key]["delta"] is not None, \
+                f"{key}.delta が null です"
+            assert diff[key]["before"] is not None, \
+                f"{key}.before が null です"
+            assert diff[key]["after"] is not None, \
+                f"{key}.after が null です"
+
+    def test_single_reuse_eval_diff_not_regressed(self, tmp_path: Path):
+        """single 条件の既存 eval_diff 生成が退行しない"""
+        # 参照元 run: single 評価（デフォルト）
+        ref_config = _make_minimal_config()
+        ref_config.experiment["global_seed"] = 42
+        ref_runner = Stage1Runner(config=ref_config, base_dir=tmp_path / "ref")
+        ref_result = ref_runner.run()
+        assert "error" not in ref_result
+        ref_dir = Path(ref_result["run_dir"])
+
+        # 再利用 run: eval_before を reuse
+        config2 = _make_minimal_config()
+        config2.experiment["global_seed"] = 42
+        reuse_from = {
+            "run_dir": str(ref_dir),
+            "phases": ["selfplay", "eval_before"],
+        }
+        runner2 = Stage1Runner(config=config2, base_dir=tmp_path / "new",
+                               reuse_from=reuse_from)
+        result2 = runner2.run()
+        assert "error" not in result2
+
+        new_dir = Path(result2["run_dir"])
+        diff_path = new_dir / "eval" / "eval_diff.json"
+        assert diff_path.exists(), "single 条件で eval_diff.json が生成されていません"
+
+        with open(diff_path) as f:
+            diff = json.load(f)
+        for key in ("avg_rank", "avg_score", "win_rate", "deal_in_rate"):
+            assert diff[key]["delta"] is not None, \
+                f"single 条件: {key}.delta が null です"
+
+    def test_rotation_manifest_stores_all_metrics(self, tmp_path: Path):
+        """rotation run の manifest に主要4指標が記録される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.evaluation["mode"] = "rotation"
+        config.evaluation["rotation_seats"] = [0, 1]
+        config.evaluation["num_matches"] = 1
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+
+        with open(run_dir / "artifacts_manifest.json") as f:
+            manifest = json.load(f)
+        eb = manifest["artifacts"]["eval_before"]
+        for key in ("avg_rank", "avg_score", "win_rate", "deal_in_rate"):
+            assert eb.get(key) is not None, \
+                f"manifest の eval_before に {key} がありません"

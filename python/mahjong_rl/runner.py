@@ -314,10 +314,14 @@ class Stage1Runner:
     imitation 付き: ["imitation", "selfplay", "learner", "eval"]
     """
 
-    def __init__(self, config: ExperimentConfig, base_dir: Path = Path("runs")):
+    def __init__(self, config: ExperimentConfig, base_dir: Path = Path("runs"),
+                 resume_run_dir: Path | str | None = None,
+                 reuse_from: dict | None = None):
         self._config = config
         self._base_dir = base_dir
         self._global_seed: int | None = None
+        self._resume_run_dir = Path(resume_run_dir) if resume_run_dir else None
+        self._reuse_from = reuse_from  # {"run_dir": str, "phases": list[str]}
 
     def _get_phases(self) -> list[str]:
         """実行フェーズのリストを取得する"""
@@ -485,15 +489,43 @@ class Stage1Runner:
         result["phases"] = phases
         total_phases = len(phases) + 1  # +1 for init
         phase_status: dict[str, str] = {}
+        # CQ-0115: phase_action は今回の実行動作を記録（skipped/reused/executed）
+        phase_action: dict[str, str] = {}
 
         # Global seed 固定
         self._global_seed = self._setup_global_seed()
         result["global_seed"] = self._global_seed
 
+        # resume / reuse で完了済み phase を判定 (CQ-0110, CQ-0111)
+        completed_phases: set[str] = set()
+
         # 1. Run directory 初期化
         phase_num = 1
         logger.info(f"[Phase {phase_num}/{total_phases}] run directory 初期化")
-        run_dir = RunDirectory(base_dir=self._base_dir).create(self._config)
+
+        if self._resume_run_dir is not None:
+            # CQ-0111: phase 単位 resume
+            run_dir = self._resume_run_dir
+            manifest = self._load_manifest(run_dir)
+            if manifest is None:
+                raise ValueError(
+                    f"resume 対象の run_dir に artifacts_manifest.json がありません: {run_dir}")
+            completed_phases = self._get_completed_phases(manifest)
+            self._validate_artifacts(run_dir, manifest, completed_phases)
+            # CQ-0115: resume 時は過去の phase_status を復元
+            prev_summary_path = run_dir / "summary.json"
+            if prev_summary_path.exists():
+                try:
+                    with open(prev_summary_path) as f:
+                        prev_summary = json.load(f)
+                    for p, s in prev_summary.get("phase_status", {}).items():
+                        phase_status[p] = s
+                except (json.JSONDecodeError, OSError):
+                    pass
+            logger.info(f"  resume モード: 完了済み phase={sorted(completed_phases)}")
+        else:
+            run_dir = RunDirectory(base_dir=self._base_dir).create(self._config)
+
         result["run_dir"] = str(run_dir)
         logger.info(f"  run_dir: {run_dir}")
 
@@ -504,6 +536,61 @@ class Stage1Runner:
         encoder = self._create_encoder()
         model = self._create_model(encoder)
         obs_mode = self._config.experiment.get("observation_mode", "full")
+
+        # CQ-0110: 成果物再利用
+        if self._reuse_from is not None:
+            ref_dir = Path(self._reuse_from["run_dir"])
+            ref_manifest = self._load_manifest(ref_dir)
+            if ref_manifest is None:
+                raise ValueError(
+                    f"参照元に artifacts_manifest.json がありません: {ref_dir}")
+            reuse_phases = set(self._reuse_from.get("phases", []))
+            self._validate_artifacts(ref_dir, ref_manifest, reuse_phases)
+            self._copy_reused_artifacts(
+                run_dir, ref_dir, reuse_phases, ref_manifest, result, phase_status)
+            completed_phases = completed_phases | reuse_phases
+            # CQ-0115: reuse された phase を phase_action に記録
+            for rp in reuse_phases:
+                if phase_status.get(rp) == "reused":
+                    phase_action[rp] = "reused"
+            result["reuse_info"] = {
+                "ref_run_dir": str(ref_dir),
+                "reused_phases": sorted(reuse_phases),
+            }
+            logger.info(f"  reuse モード: ref={ref_dir}, phases={sorted(reuse_phases)}")
+
+        # resume/reuse 時に imitation checkpoint をモデルに読み込む
+        # CQ-0114: selfplay 再利用時は checkpoint_imitation.pt の存在とロードを必須化
+        #   ただし imitation フェーズが実験に含まれない場合はスキップ
+        has_imitation_phase = "imitation" in phases
+        if "imitation" in completed_phases or \
+                ("selfplay" in completed_phases and has_imitation_phase):
+            imi_ckpt = run_dir / "checkpoints" / "checkpoint_imitation.pt"
+            # selfplay 再利用時は参照元からの checkpoint コピーを試みる (CQ-0114)
+            if not imi_ckpt.exists() and self._reuse_from is not None:
+                ref_dir = Path(self._reuse_from["run_dir"])
+                ref_ckpt = ref_dir / "checkpoints" / "checkpoint_imitation.pt"
+                if ref_ckpt.exists():
+                    import shutil
+                    imi_ckpt.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(ref_ckpt, imi_ckpt)
+                    logger.info(f"  参照元から imitation checkpoint をコピー: {ref_ckpt}")
+
+            if imi_ckpt.exists():
+                ckpt_data = torch.load(imi_ckpt, map_location="cpu", weights_only=True)
+                # Learner.save_checkpoint は {"model_state_dict": ..., "optimizer_state_dict": ...} 形式
+                if isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data:
+                    model.load_state_dict(ckpt_data["model_state_dict"])
+                else:
+                    model.load_state_dict(ckpt_data)
+                result["loaded_checkpoint"] = str(imi_ckpt)
+                logger.info(f"  imitation checkpoint を読み込みました: {imi_ckpt}")
+            elif "selfplay" in completed_phases and "learner" not in completed_phases:
+                # selfplay を再利用するのに checkpoint がない場合はエラー (CQ-0114)
+                raise ValueError(
+                    "selfplay 再利用時に checkpoint_imitation.pt が見つかりません。"
+                    " learner 比較には同一初期方策が必要です。"
+                    f" 確認先: {imi_ckpt}")
 
         # デバイス解決と記録
         result["resolved_devices"] = self._resolve_all_devices()
@@ -517,6 +604,8 @@ class Stage1Runner:
         run_start = datetime.now(timezone.utc)
         phase_timing: dict[str, dict] = {}
         result["phase_timing"] = phase_timing
+        # CQ-0115: phase_action を result に格納（_save_summary で利用）
+        result["_phase_action"] = phase_action
 
         def _record_start(name: str) -> str:
             ts = _utc_now_str()
@@ -534,6 +623,18 @@ class Stage1Runner:
         for phase in phases:
             phase_num += 1
             label = f"[Phase {phase_num}/{total_phases}]"
+
+            # CQ-0111: 完了済み phase のスキップ (resume/reuse)
+            if phase in completed_phases:
+                logger.info(f"{label} {phase} はスキップ（完了済み）")
+                # CQ-0115: phase_status は過去の成功を維持、phase_action に今回動作を記録
+                if phase not in phase_status:
+                    phase_status[phase] = "success"
+                # reuse 経由で既に phase_action が設定されている場合はそちらを優先
+                if phase not in phase_action:
+                    phase_action[phase] = "skipped"
+                self._restore_phase_result(run_dir, phase, result)
+                continue
 
             if phase == "imitation":
                 logger.info(f"{label} imitation warm start")
@@ -576,18 +677,25 @@ class Stage1Runner:
             elif phase == "learner":
                 # 学習前評価 (eval も phases に含まれる場合のみ)
                 if "eval" in phases:
-                    _record_start("eval_before")
-                    try:
-                        logger.info(f"{label} 学習前評価 (eval_before)")
-                        eval_before_dir = run_dir / "eval_before"
-                        result["eval_before"] = self._run_eval(
-                            run_dir, model, encoder, obs_mode,
-                            eval_dir_override=eval_before_dir)
-                        logger.info(f"  eval_before avg_rank: {result['eval_before'].get('avg_rank', '?')}")
-                        _record_end("eval_before")
-                    except Exception as e:
-                        logger.warning(f"  学習前評価をスキップ: {e}")
-                        _record_end("eval_before")
+                    if "eval_before" in completed_phases:
+                        # CQ-0111: eval_before スキップ
+                        logger.info(f"{label} eval_before はスキップ（完了済み）")
+                        # CQ-0115: phase_action に記録
+                        phase_action["eval_before"] = "skipped"
+                        self._restore_phase_result(run_dir, "eval_before", result)
+                    else:
+                        _record_start("eval_before")
+                        try:
+                            logger.info(f"{label} 学習前評価 (eval_before)")
+                            eval_before_dir = run_dir / "eval_before"
+                            result["eval_before"] = self._run_eval(
+                                run_dir, model, encoder, obs_mode,
+                                eval_dir_override=eval_before_dir)
+                            logger.info(f"  eval_before avg_rank: {result['eval_before'].get('avg_rank', '?')}")
+                            _record_end("eval_before")
+                        except Exception as e:
+                            logger.warning(f"  学習前評価をスキップ: {e}")
+                            _record_end("eval_before")
 
                 logger.info(f"{label} learner 学習")
                 _record_start("learner")
@@ -655,6 +763,7 @@ class Stage1Runner:
             if profiler.enabled:
                 result["profiling"] = profiler.to_dict()
         self._save_summary(run_dir, result, phase_status)
+        self._save_manifest(run_dir, result, phase_status)  # CQ-0109
         self._append_notes(run_dir, result, phase_status)
         self._teardown_file_logging(file_handler)
 
@@ -1410,6 +1519,9 @@ class Stage1Runner:
             },
         }
 
+        # CQ-0115: phase_action を取り出し（内部キーなので pop）
+        phase_action = result.pop("_phase_action", {})
+
         summary = {
             "global_seed": result.get("global_seed"),
             "phases": result.get("phases", []),
@@ -1427,13 +1539,362 @@ class Stage1Runner:
             "env_info": self._collect_env_info(),
         }
 
+        # CQ-0115: phase_action（今回の実行動作）を記録
+        if phase_action:
+            summary["phase_action"] = phase_action
+
         # プロファイル情報 (CQ-0098)
         profiling = result.get("profiling")
         if profiling is not None:
             summary["profiling"] = profiling
 
+        # CQ-0110: 再利用情報
+        reuse_info = result.get("reuse_info")
+        if reuse_info is not None:
+            summary["reuse_info"] = reuse_info
+
+        # CQ-0114: ロード元 checkpoint パス
+        loaded_checkpoint = result.get("loaded_checkpoint")
+        if loaded_checkpoint is not None:
+            summary["loaded_checkpoint"] = loaded_checkpoint
+
         with open(run_dir / "summary.json", "w") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    def _save_manifest(self, run_dir: Path, result: dict,
+                       phase_status: dict[str, str]) -> None:
+        """artifacts_manifest.json を保存する (CQ-0109)
+
+        phase 完了状態・成果物パス・config fingerprint・再利用メタデータを記録し、
+        再利用判定に必要な情報を機械可読に提供する。
+        """
+        # phase_completion
+        phase_completion = dict(phase_status)
+
+        # eval_before は phase_status に含まれない場合がある
+        if "eval_before" in result:
+            if "eval_before" not in phase_completion:
+                phase_completion["eval_before"] = "success"
+
+        # artifacts 検出
+        artifacts: dict[str, dict] = {}
+
+        # imitation checkpoint
+        imi_ckpt = run_dir / "checkpoints" / "checkpoint_imitation.pt"
+        artifacts["imitation_checkpoint"] = {
+            "exists": imi_ckpt.exists(),
+            "path": "checkpoints/checkpoint_imitation.pt",
+        }
+
+        # imitation shard
+        imi_dir = run_dir / "imitation"
+        if imi_dir.exists():
+            imi_flat = list(imi_dir.glob("shard_*.parquet"))
+            imi_nested = list(imi_dir.glob("worker_*/shard_*.parquet"))
+            imi_shard_count = len(set(imi_flat) | set(imi_nested))
+        else:
+            imi_shard_count = 0
+        artifacts["imitation_shards"] = {
+            "exists": imi_shard_count > 0,
+            "path": "imitation",
+            "shard_count": imi_shard_count,
+        }
+
+        # selfplay shard
+        sp_dir = run_dir / "selfplay"
+        if sp_dir.exists():
+            sp_flat = list(sp_dir.glob("shard_*.parquet"))
+            sp_nested = list(sp_dir.glob("worker_*/shard_*.parquet"))
+            sp_shard_count = len(set(sp_flat) | set(sp_nested))
+        else:
+            sp_shard_count = 0
+        artifacts["selfplay_shards"] = {
+            "exists": sp_shard_count > 0,
+            "path": "selfplay",
+            "shard_count": sp_shard_count,
+        }
+
+        # eval_before
+        eval_before_dir = run_dir / "eval_before"
+        eb_result = result.get("eval_before", {})
+        artifacts["eval_before"] = {
+            "exists": eval_before_dir.exists() and any(eval_before_dir.iterdir()) if eval_before_dir.exists() else False,
+            "path": "eval_before",
+            "avg_rank": eb_result.get("avg_rank"),
+            "avg_score": eb_result.get("avg_score"),
+            "win_rate": eb_result.get("win_rate"),
+            "deal_in_rate": eb_result.get("deal_in_rate"),
+        }
+
+        # learner checkpoint
+        learner_ckpt = run_dir / "checkpoints" / "checkpoint_final.pt"
+        artifacts["learner_checkpoint"] = {
+            "exists": learner_ckpt.exists(),
+            "path": "checkpoints/checkpoint_final.pt",
+        }
+
+        # eval
+        eval_dir = run_dir / "eval"
+        artifacts["eval"] = {
+            "exists": eval_dir.exists() and any(eval_dir.iterdir()) if eval_dir.exists() else False,
+            "path": "eval",
+        }
+
+        # config fingerprint
+        config_fingerprint = self._compute_config_fingerprint(run_dir)
+
+        # reuse_metadata
+        sp_cfg = self._config.selfplay
+        eval_cfg = self._config.evaluation
+        reuse_metadata = {
+            "global_seed": result.get("global_seed"),
+            "num_workers": sp_cfg.get("num_workers", 1),
+            "policy_ratio": sp_cfg.get("policy_ratio", 0.5),
+            "save_baseline_actions": sp_cfg.get("save_baseline_actions", False),
+            "selfplay_num_matches": sp_cfg.get("num_matches", 10),
+            "eval_mode": eval_cfg.get("mode", "fixed"),
+            "eval_rotation_seats": eval_cfg.get("rotation_seats"),
+            "eval_num_matches": eval_cfg.get("num_matches", 10),
+            "imitation_matches": sp_cfg.get("imitation_matches",
+                                            sp_cfg.get("num_matches", 10)),
+        }
+
+        manifest = {
+            "manifest_version": 1,
+            "phase_completion": phase_completion,
+            "artifacts": artifacts,
+            "config_fingerprint": config_fingerprint,
+            "reuse_metadata": reuse_metadata,
+        }
+
+        # CQ-0114: ロード元 checkpoint パス
+        loaded_checkpoint = result.get("loaded_checkpoint")
+        if loaded_checkpoint is not None:
+            manifest["loaded_checkpoint"] = loaded_checkpoint
+
+        with open(run_dir / "artifacts_manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _compute_config_fingerprint(run_dir: Path) -> str:
+        """config.yaml の SHA-256 ハッシュを算出する (CQ-0109)"""
+        config_path = run_dir / "config.yaml"
+        if config_path.exists():
+            return hashlib.sha256(config_path.read_bytes()).hexdigest()
+        return ""
+
+    @staticmethod
+    def _load_manifest(run_dir: Path) -> dict | None:
+        """artifacts_manifest.json を読み込む (CQ-0111)"""
+        path = run_dir / "artifacts_manifest.json"
+        if not path.exists():
+            return None
+        with open(path) as f:
+            return json.load(f)
+
+    @staticmethod
+    def _get_completed_phases(manifest: dict) -> set[str]:
+        """manifest から完了済み phase の set を返す (CQ-0111)"""
+        pc = manifest.get("phase_completion", {})
+        completed = set()
+        for phase, status in pc.items():
+            if status in ("success", "skipped", "reused"):
+                completed.add(phase)
+        return completed
+
+    @staticmethod
+    def _validate_artifacts(run_dir: Path, manifest: dict,
+                            phases: set[str]) -> None:
+        """完了 phase の成果物が実際に存在するか検証する (CQ-0111, CQ-0113)
+
+        CQ-0113: eval_before / selfplay の検証を厳密化。
+        - selfplay: ディレクトリ存在 + shard ファイル実在まで確認
+        - eval_before: ディレクトリまたは復元可能な指標ファイル存在を必須化
+
+        Raises:
+            ValueError: 成果物が不足している場合
+        """
+        artifacts = manifest.get("artifacts", {})
+        missing = []
+
+        if "imitation" in phases:
+            # imitation checkpoint または shard が必要
+            imi_ckpt = artifacts.get("imitation_checkpoint", {})
+            imi_shards = artifacts.get("imitation_shards", {})
+            ckpt_path = run_dir / imi_ckpt.get("path", "checkpoints/checkpoint_imitation.pt")
+            shard_path = run_dir / imi_shards.get("path", "imitation")
+            if not ckpt_path.exists() and not shard_path.exists():
+                missing.append("imitation: checkpoint も shard も見つかりません")
+
+        if "selfplay" in phases:
+            sp_shards = artifacts.get("selfplay_shards", {})
+            sp_path = run_dir / sp_shards.get("path", "selfplay")
+            if not sp_path.exists():
+                missing.append(f"selfplay: ディレクトリ {sp_path} が見つかりません")
+            else:
+                # CQ-0113: shard ファイルが実在するか確認
+                flat = list(sp_path.glob("shard_*.parquet"))
+                nested = list(sp_path.glob("worker_*/shard_*.parquet"))
+                if not flat and not nested:
+                    missing.append(
+                        f"selfplay: {sp_path} に shard ファイルがありません")
+
+        if "eval_before" in phases:
+            # CQ-0113: eval_before はディレクトリまたは復元可能な指標が必要
+            eb = artifacts.get("eval_before", {})
+            eb_path = run_dir / eb.get("path", "eval_before")
+            eb_has_dir = eb_path.exists() and eb_path.is_dir() and any(eb_path.iterdir())
+            # CQ-0117: rotation は eval_rotation.json, single は eval_metrics.json
+            eb_has_results = False
+            if eb_path.exists():
+                eb_has_results = (eb_path / "eval_rotation.json").exists() or \
+                    (eb_path / "eval_metrics.json").exists()
+            # summary から復元可能かもチェック
+            summary_path = run_dir / "summary.json"
+            eb_has_summary = False
+            if summary_path.exists():
+                try:
+                    with open(summary_path) as f:
+                        summary = json.load(f)
+                    eb_has_summary = "eval_before" in summary.get("phase_stats", {}) or \
+                        eb.get("avg_rank") is not None
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if not eb_has_dir and not eb_has_results and not eb_has_summary:
+                missing.append(
+                    "eval_before: ディレクトリ・結果ファイル・復元可能な指標のいずれも見つかりません")
+
+        if missing:
+            raise ValueError(
+                "成果物整合エラー:\n" + "\n".join(f"  - {m}" for m in missing))
+
+    def _restore_phase_result(self, run_dir: Path, phase: str,
+                              result: dict) -> None:
+        """スキップされた phase の結果を復元する (CQ-0111, CQ-0117)
+
+        後続 phase で必要な値（eval_before の avg_rank など）を result に設定する。
+        eval_before はファイルベース復元を優先する（summary.json 不在でも動作）。
+        """
+        # eval_before はファイルベース復元を優先 (CQ-0117)
+        if phase == "eval_before" and "eval_before" not in result:
+            # 優先順: eval_rotation.json → eval_metrics.json → manifest fallback
+            eb_dir = run_dir / "eval_before"
+            restored = False
+
+            # 1. eval_rotation.json (rotation モード出力)
+            eb_rotation_path = eb_dir / "eval_rotation.json"
+            if eb_rotation_path.exists():
+                try:
+                    with open(eb_rotation_path) as f:
+                        data = json.load(f)
+                    data.setdefault("eval_mode", "rotation")
+                    result["eval_before"] = data
+                    restored = True
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            # 2. eval_metrics.json (single モード出力)
+            if not restored:
+                eb_metrics_path = eb_dir / "eval_metrics.json"
+                if eb_metrics_path.exists():
+                    try:
+                        with open(eb_metrics_path) as f:
+                            data = json.load(f)
+                        data.setdefault("eval_mode", "single")
+                        result["eval_before"] = data
+                        restored = True
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+            # 3. manifest fallback (主要4指標)
+            if not restored:
+                manifest = self._load_manifest(run_dir)
+                if manifest:
+                    eb = manifest.get("artifacts", {}).get("eval_before", {})
+                    fb: dict = {}
+                    for key in ("avg_rank", "avg_score", "win_rate",
+                                "deal_in_rate"):
+                        val = eb.get(key)
+                        if val is not None:
+                            fb[key] = val
+                    if fb:
+                        result["eval_before"] = fb
+            return
+
+        # その他の phase は summary.json から復元
+        summary_path = run_dir / "summary.json"
+        if not summary_path.exists():
+            return
+        try:
+            with open(summary_path) as f:
+                summary = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return
+
+        ps = summary.get("phase_stats", {})
+
+        if phase == "imitation" and "imitation_metrics" not in result:
+            imi_stats = ps.get("imitation", {})
+            if imi_stats:
+                result["imitation_metrics"] = imi_stats
+
+        elif phase == "selfplay" and "selfplay_stats" not in result:
+            sp_stats = ps.get("selfplay", {})
+            if sp_stats:
+                result["selfplay_stats"] = sp_stats
+
+        elif phase == "learner" and "train_metrics" not in result:
+            tm = ps.get("learner", {})
+            if tm:
+                result["train_metrics"] = tm
+
+    def _copy_reused_artifacts(
+        self, run_dir: Path, ref_dir: Path, reuse_phases: set[str],
+        ref_manifest: dict, result: dict, phase_status: dict[str, str],
+    ) -> None:
+        """参照元 run_dir から成果物をコピーする (CQ-0110, CQ-0113)
+
+        CQ-0113: コピー成功した phase のみ reused を設定する。
+        """
+        import shutil
+
+        if "imitation" in reuse_phases:
+            copied = False
+            # imitation checkpoint コピー
+            src_ckpt = ref_dir / "checkpoints" / "checkpoint_imitation.pt"
+            if src_ckpt.exists():
+                dst_ckpt = run_dir / "checkpoints" / "checkpoint_imitation.pt"
+                dst_ckpt.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_ckpt, dst_ckpt)
+                copied = True
+            # imitation shard コピー
+            src_imi = ref_dir / "imitation"
+            if src_imi.exists():
+                dst_imi = run_dir / "imitation"
+                shutil.copytree(src_imi, dst_imi, dirs_exist_ok=True)
+                copied = True
+            if copied:
+                phase_status["imitation"] = "reused"
+
+        if "selfplay" in reuse_phases:
+            copied = False
+            src_sp = ref_dir / "selfplay"
+            if src_sp.exists():
+                dst_sp = run_dir / "selfplay"
+                shutil.copytree(src_sp, dst_sp, dirs_exist_ok=True)
+                copied = True
+            if copied:
+                phase_status["selfplay"] = "reused"
+
+        if "eval_before" in reuse_phases:
+            copied = False
+            src_eb = ref_dir / "eval_before"
+            if src_eb.exists():
+                dst_eb = run_dir / "eval_before"
+                shutil.copytree(src_eb, dst_eb, dirs_exist_ok=True)
+                copied = True
+            if copied:
+                phase_status["eval_before"] = "reused"
 
     def _count_actor_types(self, run_dir: Path) -> dict[str, int]:
         """shard ファイルから actor_type ごとの件数を集計する"""

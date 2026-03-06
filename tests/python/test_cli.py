@@ -698,3 +698,70 @@ class TestSweepResume:
         with open(ranking_path) as f:
             ranking = json.load(f)
         assert len(ranking["conditions"]) == 2
+
+
+class TestCLIConflictValidation:
+    """CLI 引数の競合バリデーションテスト (CQ-0116)"""
+
+    def _write_config(self, tmp_path: Path) -> Path:
+        """テスト用 config.yaml を書き出す"""
+        config = _make_cli_config()
+        config_path = tmp_path / "config.yaml"
+        config.to_yaml(config_path)
+        return config_path
+
+    def test_seeds_and_resume_run_conflict(self, tmp_path: Path, capsys):
+        """--seeds と --resume-run の併用はエラー"""
+        config_path = self._write_config(tmp_path)
+        ret = main(["--config", str(config_path),
+                    "--seeds", "42",
+                    "--resume-run", str(tmp_path)])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "--resume-run" in captured.err
+        assert "併用" in captured.err
+
+    def test_seeds_and_reuse_from_conflict(self, tmp_path: Path, capsys):
+        """--seeds と --reuse-from の併用はエラー"""
+        config_path = self._write_config(tmp_path)
+        ret = main(["--config", str(config_path),
+                    "--seeds", "42",
+                    "--reuse-from", str(tmp_path)])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "--reuse-from" in captured.err
+        assert "併用" in captured.err
+
+    def test_resume_run_and_reuse_from_conflict(self, tmp_path: Path, capsys):
+        """--resume-run と --reuse-from の併用はエラー"""
+        config_path = self._write_config(tmp_path)
+        ret = main(["--config", str(config_path),
+                    "--resume-run", str(tmp_path),
+                    "--reuse-from", str(tmp_path)])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "--resume-run" in captured.err
+        assert "--reuse-from" in captured.err
+
+    def test_resume_run_and_batch_resume_conflict(self, tmp_path: Path, capsys):
+        """--resume-run と --resume の併用はエラー"""
+        config_path = self._write_config(tmp_path)
+        ret = main(["--config", str(config_path),
+                    "--resume-run", str(tmp_path),
+                    "--resume", str(tmp_path)])
+        assert ret == 1
+        captured = capsys.readouterr()
+        assert "--resume-run" in captured.err
+        assert "--resume" in captured.err
+
+    def test_reuse_from_and_batch_resume_conflict(self, tmp_path: Path, capsys):
+        """--reuse-from と --resume の併用はエラー"""
+        config_path = self._write_config(tmp_path)
+        ret = main(["--config", str(config_path),
+                    "--reuse-from", str(tmp_path),
+                    "--resume", str(tmp_path),
+                    "--seeds", "42"])
+        assert ret == 1
+        captured = capsys.readouterr()
+        # --seeds と --reuse-from の競合が先に検出される
+        assert "併用" in captured.err

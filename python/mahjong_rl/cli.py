@@ -67,6 +67,19 @@ def main(argv: list[str] | None = None) -> int:
         "--sweep-file", type=str, default=None,
         help="sweep 設定 YAML ファイルのパス")
 
+    # phase 単位 resume (CQ-0111)
+    parser.add_argument(
+        "--resume-run", type=str, default=None,
+        help="既存 run_dir を指定して phase 単位 resume（完了済み phase をスキップ）")
+
+    # 成果物再利用 (CQ-0110)
+    parser.add_argument(
+        "--reuse-from", type=str, default=None,
+        help="参照元 run_dir のパス（成果物を再利用）")
+    parser.add_argument(
+        "--reuse-phases", type=str, default=None,
+        help="再利用する phase のカンマ区切り (例: imitation,selfplay,eval_before)")
+
     args = parser.parse_args(argv)
 
     # ログ設定
@@ -120,6 +133,36 @@ def main(argv: list[str] | None = None) -> int:
 
     stop_on_error = not args.continue_on_error
 
+    # CQ-0116: 競合引数バリデーション
+    _single_run_opts = []
+    if args.resume_run:
+        _single_run_opts.append("--resume-run")
+    if args.reuse_from:
+        _single_run_opts.append("--reuse-from")
+
+    if _single_run_opts and seeds is not None:
+        opts = " と ".join(_single_run_opts)
+        print(f"エラー: {opts} は --seeds/--seed-start と併用できません"
+              "（単一 run 用オプションです）",
+              file=sys.stderr)
+        return 1
+
+    if args.resume_run and args.reuse_from:
+        print("エラー: --resume-run と --reuse-from は同時に指定できません",
+              file=sys.stderr)
+        return 1
+
+    if args.resume_run and args.resume:
+        print("エラー: --resume-run と --resume は同時に指定できません"
+              "（--resume-run は単一 run、--resume は batch 用です）",
+              file=sys.stderr)
+        return 1
+
+    if args.reuse_from and args.resume:
+        print("エラー: --reuse-from と --resume は同時に指定できません",
+              file=sys.stderr)
+        return 1
+
     # sweep + resume 実行 (CQ-0101)
     if args.sweep_file and args.resume:
         if seeds is None:
@@ -158,6 +201,45 @@ def main(argv: list[str] | None = None) -> int:
     # バッチ実行 or 単一実行
     if seeds is not None:
         return run_batch(config, seeds, base_dir, stop_on_error=stop_on_error)
+
+    # phase 単位 resume (CQ-0111)
+    if args.resume_run:
+        runner = Stage1Runner(config=config, base_dir=base_dir,
+                              resume_run_dir=args.resume_run)
+        try:
+            result = runner.run()
+        except ValueError as e:
+            print(f"エラー: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"予期しないエラー: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+        if "error" in result:
+            print(f"実験失敗: {result['error']}", file=sys.stderr)
+            return 1
+        print(f"resume 完了: {result['run_dir']}")
+        return 0
+
+    # 成果物再利用 (CQ-0110)
+    if args.reuse_from:
+        reuse_phases = (args.reuse_phases.split(",") if args.reuse_phases
+                        else ["imitation", "selfplay", "eval_before"])
+        reuse_from = {"run_dir": args.reuse_from, "phases": reuse_phases}
+        runner = Stage1Runner(config=config, base_dir=base_dir,
+                              reuse_from=reuse_from)
+        try:
+            result = runner.run()
+        except ValueError as e:
+            print(f"エラー: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"予期しないエラー: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+        if "error" in result:
+            print(f"実験失敗: {result['error']}", file=sys.stderr)
+            return 1
+        print(f"reuse 実行完了: {result['run_dir']}")
+        return 0
 
     # 単一 run 経路（従来互換）
     try:
