@@ -26,3 +26,9 @@ docs/EXPERIMENT_STAGE1_RUNBOOK.md
 
 # 実験実行の生データ
 runs/
+
+# ローカル実験ドライバ（使い捨て）
+scripts/local/
+
+# ローカル実験ドライバの実行ログ（使い捨て）
+experiments/**/driver_logs/
