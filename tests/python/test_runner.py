@@ -2323,3 +2323,45 @@ class TestRotationReuseEvalDiff:
         for key in ("avg_rank", "avg_score", "win_rate", "deal_in_rate"):
             assert eb.get(key) is not None, \
                 f"manifest の eval_before に {key} がありません"
+
+
+@pytest.mark.smoke
+class TestShantenHintIntegration:
+    """シャンテン補助特徴 on で run 完走テスト (CQ-0120)"""
+
+    def test_shanten_hint_on_run_succeeds(self, tmp_path: Path):
+        """shanten_hint=on で最小 run が完走する"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["shanten_hint"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+
+        # summary に encoder_features が記録される (CQ-0121)
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ef = summary.get("encoder_features", {})
+        assert ef.get("shanten_hint") is True
+        assert ef.get("input_dim") == 489  # full + 34
+
+        # notes に encoder 情報が含まれる (CQ-0121)
+        notes = (run_dir / "notes.md").read_text()
+        assert "shanten_hint=on" in notes
+
+    def test_shanten_hint_off_preserves_dim(self, tmp_path: Path):
+        """shanten_hint=off（既定）で既存挙動維持"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ef = summary.get("encoder_features", {})
+        assert ef.get("shanten_hint") is False
+        assert ef.get("input_dim") == 455  # full

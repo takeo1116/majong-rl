@@ -244,3 +244,165 @@ class TestBothMode:
         enc = ChannelTensorEncoder(observation_mode="both")
         result = enc.encode(full_obs)
         assert result.shape == (32, 4, 9)
+
+
+class TestShantenHint:
+    """シャンテン補助特徴 on/off テスト (CQ-0120)"""
+
+    def test_off_preserves_partial_dim(self):
+        """off 時 partial=353 を維持"""
+        enc = FlatFeatureEncoder(observation_mode="partial", shanten_hint=False)
+        assert enc.metadata().output_shape == (353,)
+
+    def test_off_preserves_full_dim(self):
+        """off 時 full=455 を維持"""
+        enc = FlatFeatureEncoder(observation_mode="full", shanten_hint=False)
+        assert enc.metadata().output_shape == (455,)
+
+    def test_on_adds_34_partial(self):
+        """on 時 partial=387"""
+        enc = FlatFeatureEncoder(observation_mode="partial", shanten_hint=True)
+        assert enc.metadata().output_shape == (387,)
+
+    def test_on_adds_34_full(self):
+        """on 時 full=489"""
+        enc = FlatFeatureEncoder(observation_mode="full", shanten_hint=True)
+        assert enc.metadata().output_shape == (489,)
+
+    def test_metadata_matches_output_partial(self, partial_obs):
+        """on 時 metadata.output_shape と encode() 結果 shape が一致 (partial)"""
+        enc = FlatFeatureEncoder(observation_mode="partial", shanten_hint=True)
+        result = enc.encode(partial_obs)
+        assert result.shape == enc.metadata().output_shape
+        assert result.dtype == np.float32
+
+    def test_metadata_matches_output_full(self, full_obs):
+        """on 時 metadata.output_shape と encode() 結果 shape が一致 (full)"""
+        enc = FlatFeatureEncoder(observation_mode="full", shanten_hint=True)
+        result = enc.encode(full_obs)
+        assert result.shape == enc.metadata().output_shape
+        assert result.dtype == np.float32
+
+    def test_shanten_hint_values(self, partial_obs):
+        """shanten_hint の値が {-1, 0} の範囲にある (CQ-0123: +1 は discard 評価で不発生)"""
+        enc_on = FlatFeatureEncoder(observation_mode="partial", shanten_hint=True)
+        enc_off = FlatFeatureEncoder(observation_mode="partial", shanten_hint=False)
+        result_on = enc_on.encode(partial_obs)
+        result_off = enc_off.encode(partial_obs)
+
+        # off 部分は一致する
+        assert np.array_equal(result_on[:353], result_off)
+
+        # 末尾34次元が shanten hint
+        hint = result_on[353:]
+        assert hint.shape == (34,)
+        # 値は -1, 0 のいずれか（+1 は shanten 単調性により不発生）
+        for v in hint:
+            assert v in (-1.0, 0.0), f"想定外の hint 値: {v}"
+        # 手牌に含まれる牌種のいずれかは非ゼロ（13-14枚あるので）
+        assert np.any(hint != 0.0), "hint が全て0: 手牌があるはず"
+
+
+class TestShantenHintSemantics:
+    """シャンテン補助特徴の意味検証テスト (CQ-0122, CQ-0124)
+
+    delta_shanten_sign の定義:
+      base = shanten(手牌), after = shanten(手牌から t を除去)
+      delta = base - after
+
+    運用値域 (discard 評価):
+      0.0 = 維持（最適打牌候補）または手牌に存在しない牌種
+     -1.0 = 悪化（シャンテン数が増加する打牌）
+
+    +1 (改善) は shanten(n枚) <= shanten(n-1枚) の単調性により、
+    現行の discard 評価では数学的に発生しない。
+    実装上 delta > 0 分岐は将来拡張互換のガード節として残っている。
+    """
+
+    def test_tenpai_hand_worsening(self):
+        """テンパイ手: 面子構成牌を切ると悪化(-1)"""
+        from mahjong_rl.baseline.shanten import compute_shanten
+
+        # 1m2m3m 4p5p6p 7s8s9s 東東南北 (13枚, shanten=1)
+        # 面子牌(1m等)を切ると shanten=2 → 悪化(-1)
+        counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        counts[0] = 1; counts[1] = 1; counts[2] = 1  # 1m2m3m
+        counts[12] = 1; counts[13] = 1; counts[14] = 1  # 4p5p6p
+        counts[24] = 1; counts[25] = 1; counts[26] = 1  # 7s8s9s
+        counts[27] = 2  # 東東 (雀頭)
+        counts[28] = 1  # 南 (浮き)
+        counts[30] = 1  # 北 (浮き)
+        assert compute_shanten(counts) == 1
+
+        hint = FlatFeatureEncoder._compute_shanten_hint(counts.copy())
+
+        # 面子構成牌 (1m=0) を切ると悪化
+        assert hint[0] == -1.0, "1m を切ると悪化するはず"
+        # 雀頭 (東=27) を切っても悪化
+        assert hint[27] == -1.0, "東を切ると悪化するはず"
+
+    def test_tenpai_hand_maintenance(self):
+        """テンパイ手: 浮き牌を切ると維持(0) = 最適打牌"""
+        from mahjong_rl.baseline.shanten import compute_shanten
+
+        # 同上の手牌
+        counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        counts[0] = 1; counts[1] = 1; counts[2] = 1
+        counts[12] = 1; counts[13] = 1; counts[14] = 1
+        counts[24] = 1; counts[25] = 1; counts[26] = 1
+        counts[27] = 2; counts[28] = 1; counts[30] = 1
+        assert compute_shanten(counts) == 1
+
+        hint = FlatFeatureEncoder._compute_shanten_hint(counts.copy())
+
+        # 浮き牌 (南=28, 北=30) を切っても shanten 維持
+        assert hint[28] == 0.0, "南を切ってもシャンテン維持のはず"
+        assert hint[30] == 0.0, "北を切ってもシャンテン維持のはず"
+
+    def test_absent_tile_is_zero(self):
+        """手牌にない牌種は 0.0"""
+        counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        counts[0] = 1; counts[1] = 1; counts[2] = 1
+        counts[12] = 1; counts[13] = 1; counts[14] = 1
+        counts[24] = 1; counts[25] = 1; counts[26] = 1
+        counts[27] = 2; counts[28] = 1; counts[30] = 1
+
+        hint = FlatFeatureEncoder._compute_shanten_hint(counts.copy())
+
+        # 手牌にない牌種 (4m=3, 白=31 等) は 0.0
+        assert hint[3] == 0.0, "4m は手牌にないので 0.0"
+        assert hint[31] == 0.0, "白は手牌にないので 0.0"
+        assert hint[33] == 0.0, "中は手牌にないので 0.0"
+
+    def test_improvement_never_occurs(self):
+        """仕様検証: discard 評価で +1 は非発生（shanten 単調性による不在保証）"""
+        from mahjong_rl.baseline.shanten import compute_shanten
+
+        # 複数の手牌パターンで +1 が出ないことを確認
+        rng = np.random.RandomState(42)
+        for _ in range(20):
+            counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+            for _ in range(13):
+                t = rng.randint(0, NUM_TILE_TYPES)
+                while counts[t] >= 4:
+                    t = rng.randint(0, NUM_TILE_TYPES)
+                counts[t] += 1
+            hint = FlatFeatureEncoder._compute_shanten_hint(counts.copy())
+            assert np.all(hint <= 0.0), \
+                f"+1 (改善) が発生: hint={hint[hint > 0]}"
+
+    def test_mixed_hand_has_both_zero_and_minus(self):
+        """典型的な手牌で 0(維持) と -1(悪化) が混在する"""
+        # 1m2m3m 4p5p6p 7s8s9s 東東南北 (shanten=1)
+        counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        counts[0] = 1; counts[1] = 1; counts[2] = 1
+        counts[12] = 1; counts[13] = 1; counts[14] = 1
+        counts[24] = 1; counts[25] = 1; counts[26] = 1
+        counts[27] = 2; counts[28] = 1; counts[30] = 1
+
+        hint = FlatFeatureEncoder._compute_shanten_hint(counts.copy())
+
+        has_zero = np.any(hint == 0.0)
+        has_minus = np.any(hint == -1.0)
+        assert has_zero, "0.0 (維持/候補外) が存在するはず"
+        assert has_minus, "-1.0 (悪化) が存在するはず"

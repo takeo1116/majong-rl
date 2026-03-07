@@ -157,7 +157,7 @@ Observation は `GAME_SPEC.md` に定義された `PartialObservation` / `FullOb
 学習システムは両方を受け取れること。
 
 ## 6.3 FeatureEncoder
-FeatureEncoder は差し替え可能にする。  
+FeatureEncoder は差し替え可能にする。
 最低限、以下を想定する。
 
 - `FlatFeatureEncoder`
@@ -167,6 +167,22 @@ FeatureEncoder は差し替え可能にする。
 
 - `TokenSequenceEncoder`
 - `HybridFeatureEncoder`
+
+### 6.3.1 FlatFeatureEncoder のオプション特徴量
+
+#### delta_shanten_sign (shanten_hint)
+
+`feature_encoder.shanten_hint.enabled: true` で有効化。既定は `false`。
+有効時、特徴ベクトル末尾に `delta_shanten_sign[34]` を追加する（+34次元）。
+
+- 各打牌候補 t (0〜33) について、手牌から t を1枚除いた場合のシャンテン数変化を符号化する
+- `base = compute_shanten(手牌)`, `after = compute_shanten(手牌 - t)`, `delta = base - after`
+- `0.0`: 維持（最適打牌候補）または手牌に存在しない牌種
+- `-1.0`: 悪化（シャンテン数が増加する打牌）
+- `+1.0`: 定義上は改善だが、`shanten(n枚) <= shanten(n-1枚)` の数学的性質により **現行の discard 評価では発生しない**
+
+この「+1 非発生」は shanten 関数の単調性に由来する。
+将来 draw 評価やツモ牌選択など異なる文脈で同関数を流用する場合は再検討が必要。
 
 ## 6.4 Model
 Model は FeatureEncoder 出力に依存してよいが、Observation に直接依存しないこと。

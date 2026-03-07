@@ -28,19 +28,28 @@ class FlatFeatureEncoder(FeatureEncoder):
     Full 追加:
       - 残り3家手牌 3×34 (102)  ※ Partial の自家手牌を4家手牌に置換
       合計: 353 + 102 = 455
+
+    shanten_hint=True 追加 (CQ-0119):
+      - delta_shanten_sign: 34 (各打牌候補のシャンテン改善/維持/悪化)
+      合計: Partial=387, Full=489
     """
 
     # Partial 特徴量の次元
     _PARTIAL_DIM = 34 + 4 * 34 + 4 * 34 + 34 + 5 + 4 + 4  # 353
     # Full 追加分 (自家手牌34 → 4家手牌136 = +102)
     _FULL_EXTRA_DIM = 3 * 34  # 102
+    # シャンテン補助特徴の次元 (CQ-0119)
+    _SHANTEN_HINT_DIM = 34
 
-    def __init__(self, observation_mode: str = "both"):
+    def __init__(self, observation_mode: str = "both",
+                 shanten_hint: bool = False):
         """
         Args:
             observation_mode: "full", "partial", "both"
+            shanten_hint: True でシャンテン補助特徴を追加 (CQ-0119)
         """
         self._observation_mode = observation_mode
+        self._shanten_hint = shanten_hint
 
     def encode(self, obs: Observation) -> np.ndarray:
         if isinstance(obs, FullObservation):
@@ -58,6 +67,8 @@ class FlatFeatureEncoder(FeatureEncoder):
         else:
             # "both" の場合は Full 側の次元を返す（大きい方）
             dim = self._PARTIAL_DIM + self._FULL_EXTRA_DIM
+        if self._shanten_hint:
+            dim += self._SHANTEN_HINT_DIM
         return EncoderMetadata(
             output_shape=(dim,),
             dtype=np.dtype(np.float32),
@@ -74,6 +85,8 @@ class FlatFeatureEncoder(FeatureEncoder):
         for tid in obs.hand:
             hand_counts[tid // 4] += 1.0
         features.append(hand_counts)
+        # shanten_hint 用にコピーを保持 (CQ-0119)
+        hand_counts_for_hint = hand_counts.copy() if self._shanten_hint else None
 
         # 4家河
         for p in range(NUM_PLAYERS):
@@ -122,17 +135,24 @@ class FlatFeatureEncoder(FeatureEncoder):
         )
         features.append(riichi)
 
+        # シャンテン補助特徴 (CQ-0119)
+        if self._shanten_hint:
+            features.append(self._compute_shanten_hint(hand_counts_for_hint))
+
         return np.concatenate(features)
 
     def _encode_full(self, obs: FullObservation) -> np.ndarray:
         features: list[np.ndarray] = []
 
         # 全4家手牌
+        hand_counts_p0 = None  # shanten_hint 用 (CQ-0119)
         for p in range(NUM_PLAYERS):
             hand_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
             for tid in obs.hands[p]:
                 hand_counts[tid // 4] += 1.0
             features.append(hand_counts)
+            if p == 0 and self._shanten_hint:
+                hand_counts_p0 = hand_counts.copy()
 
         # 4家河
         for p in range(NUM_PLAYERS):
@@ -180,4 +200,49 @@ class FlatFeatureEncoder(FeatureEncoder):
         riichi = np.zeros(NUM_PLAYERS, dtype=np.float32)
         features.append(riichi)
 
+        # シャンテン補助特徴 (CQ-0119)
+        if self._shanten_hint:
+            features.append(self._compute_shanten_hint(hand_counts_p0))
+
         return np.concatenate(features)
+
+    @staticmethod
+    def _compute_shanten_hint(hand_counts: np.ndarray) -> np.ndarray:
+        """各打牌候補のシャンテン維持/悪化を計算する (CQ-0119, CQ-0123, CQ-0124)
+
+        delta = shanten(手牌) - shanten(手牌 - t) の符号を返す。
+
+        運用値域 (現行 discard 評価):
+          0.0 = 維持（最適打牌候補）または手牌に存在しない牌種
+         -1.0 = 悪化（シャンテン数が増加する打牌）
+
+        +1 について:
+          shanten(n枚) <= shanten(n-1枚) の単調性により、1枚減らして改善する
+          ケースは数学的に発生しない。そのため現行の discard 評価では +1.0 は
+          出力されない（テストで不在を保証: test_improvement_never_occurs）。
+          ただし将来 draw 評価やツモ牌選択など異なる文脈で本関数を流用する
+          可能性に備え、delta > 0 分岐はガード節として残している。
+
+        Args:
+            hand_counts: 34種の手牌カウント (float32, 一時的に変更→復元)
+
+        Returns:
+            delta_shanten_sign[34]: 実質 {-1.0, 0.0} のみ（上記参照）
+        """
+        from mahjong_rl.baseline.shanten import compute_shanten
+
+        base = compute_shanten(hand_counts)
+        hint = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        for t in range(NUM_TILE_TYPES):
+            if hand_counts[t] >= 1:
+                hand_counts[t] -= 1
+                after = compute_shanten(hand_counts)
+                hand_counts[t] += 1
+                delta = base - after  # 正=改善
+                # NOTE: delta > 0 は discard 文脈では発生しない（単調性）。
+                # 将来の拡張互換のためガード節として残す (CQ-0124)。
+                if delta > 0:
+                    hint[t] = 1.0
+                elif delta < 0:
+                    hint[t] = -1.0
+        return hint

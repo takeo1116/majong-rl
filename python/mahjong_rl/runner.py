@@ -119,6 +119,19 @@ from mahjong_rl.evaluator import (
 )
 
 
+def _rebuild_encoder(encoder_config: dict, obs_mode: str):
+    """encoder_config からエンコーダを再構築する (worker 用ヘルパー, CQ-0119)"""
+    enc_name = encoder_config.get("name", "FlatFeatureEncoder")
+    enc_obs = encoder_config.get("observation_mode", obs_mode)
+    if enc_name == "ChannelTensorEncoder":
+        return ChannelTensorEncoder(observation_mode=enc_obs)
+    shanten_cfg = encoder_config.get("shanten_hint", {})
+    shanten_enabled = (shanten_cfg.get("enabled", False)
+                       if isinstance(shanten_cfg, dict) else bool(shanten_cfg))
+    return FlatFeatureEncoder(observation_mode=enc_obs,
+                              shanten_hint=shanten_enabled)
+
+
 def _eval_worker_fn(
     worker_id: int,
     model_path: str,
@@ -157,12 +170,7 @@ def _eval_worker_fn(
         match_seeds = [derive_match_seed(worker_seed, i) for i in range(num_matches)]
 
         # モデル・エンコーダ再構築 (ファイルから state_dict を読み込み)
-        enc_name = encoder_config.get("name", "FlatFeatureEncoder")
-        enc_obs = encoder_config.get("observation_mode", obs_mode)
-        if enc_name == "ChannelTensorEncoder":
-            encoder = ChannelTensorEncoder(observation_mode=enc_obs)
-        else:
-            encoder = FlatFeatureEncoder(observation_mode=enc_obs)
+        encoder = _rebuild_encoder(encoder_config, obs_mode)
 
         import math
         meta = encoder.metadata()
@@ -237,12 +245,7 @@ def _selfplay_worker_fn(
             os.environ[key] = val
 
         # エンコーダ再構築
-        enc_name = encoder_config.get("name", "FlatFeatureEncoder")
-        enc_obs = encoder_config.get("observation_mode", obs_mode)
-        if enc_name == "ChannelTensorEncoder":
-            encoder = ChannelTensorEncoder(observation_mode=enc_obs)
-        else:
-            encoder = FlatFeatureEncoder(observation_mode=enc_obs)
+        encoder = _rebuild_encoder(encoder_config, obs_mode)
 
         # モデル再構築
         import math
@@ -536,6 +539,10 @@ class Stage1Runner:
         encoder = self._create_encoder()
         model = self._create_model(encoder)
         obs_mode = self._config.experiment.get("observation_mode", "full")
+
+        # CQ-0121: 入力次元を記録
+        import math
+        result["input_dim"] = math.prod(encoder.metadata().output_shape)
 
         # CQ-0110: 成果物再利用
         if self._reuse_from is not None:
@@ -1382,7 +1389,12 @@ class Stage1Runner:
         )
         if name == "ChannelTensorEncoder":
             return ChannelTensorEncoder(observation_mode=obs_mode)
-        return FlatFeatureEncoder(observation_mode=obs_mode)
+        # CQ-0119: shanten_hint 設定
+        shanten_cfg = enc_cfg.get("shanten_hint", {})
+        shanten_enabled = (shanten_cfg.get("enabled", False)
+                           if isinstance(shanten_cfg, dict) else bool(shanten_cfg))
+        return FlatFeatureEncoder(observation_mode=obs_mode,
+                                  shanten_hint=shanten_enabled)
 
     def _create_model(self, encoder):
         """設定からモデルを生成する"""
@@ -1542,6 +1554,18 @@ class Stage1Runner:
         # CQ-0115: phase_action（今回の実行動作）を記録
         if phase_action:
             summary["phase_action"] = phase_action
+
+        # CQ-0121: encoder_features を記録
+        enc_cfg = self._config.feature_encoder
+        shanten_cfg = enc_cfg.get("shanten_hint", {})
+        shanten_on = (shanten_cfg.get("enabled", False)
+                      if isinstance(shanten_cfg, dict) else bool(shanten_cfg))
+        summary["encoder_features"] = {
+            "name": enc_cfg.get("name", "FlatFeatureEncoder"),
+            "observation_mode": enc_cfg.get("observation_mode", "?"),
+            "shanten_hint": shanten_on,
+            "input_dim": result.get("input_dim"),
+        }
 
         # プロファイル情報 (CQ-0098)
         profiling = result.get("profiling")
@@ -1929,6 +1953,15 @@ class Stage1Runner:
         # フェーズ別ステータス
         for phase, status in phase_status.items():
             lines.append(f"  - {phase}: {status}")
+
+        # CQ-0121: encoder 情報
+        enc_cfg = self._config.feature_encoder
+        shanten_cfg = enc_cfg.get("shanten_hint", {})
+        shanten_on = (shanten_cfg.get("enabled", False)
+                      if isinstance(shanten_cfg, dict) else bool(shanten_cfg))
+        lines.append(f"- encoder: {enc_cfg.get('name', '?')} "
+                     f"(shanten_hint={'on' if shanten_on else 'off'}, "
+                     f"input_dim={result.get('input_dim', '?')})")
 
         # デバイス情報
         resolved = result.get("resolved_devices", {})
