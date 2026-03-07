@@ -32,3 +32,6 @@ scripts/local/
 
 # ローカル実験ドライバの実行ログ（使い捨て）
 experiments/**/driver_logs/
+
+# 実験 run 対応表（ローカル運用）
+experiments/**/run_map.json
