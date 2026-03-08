@@ -504,6 +504,78 @@ Stage 1 では、ルールベース打牌の軽い模倣を少し行った後に
 - Full / Partial
 - 同一設定の別 seed
 
+### 17.5 Imitation 教師再現メトリクス (CQ-0125)
+
+imitation フェーズ完了後、学習済みモデルの教師再現度を測定する。
+
+- `teacher_top1_match_rate`: モデル argmax と教師 action の一致率
+- `teacher_best_set_hit_rate`: モデル argmax が教師最良候補集合に含まれる率
+
+教師最良候補集合（tie 定義）:
+RuleBasedBaseline の評価規則（シャンテン最小 → 受け入れ最大）で同率最良となる全合法手の集合。
+shard に `teacher_best_mask[34]` として保存される。
+
+出力先:
+- `summary.json.phase_stats.imitation.teacher_top1_match_rate`
+- `summary.json.phase_stats.imitation.teacher_best_set_hit_rate`
+- `batch_summary.json.aggregate.imitation` に集約統計
+- `notes.md` に値記載
+
+定義上 `teacher_best_set_hit_rate >= teacher_top1_match_rate` が成立する。
+
+### 17.6 Imitation Loss Mode (CQ-0130)
+
+`training.imitation_loss_mode` で模倣学習の損失関数を切り替える。
+
+| 値 | 説明 |
+|---|---|
+| `strict_top1`（デフォルト） | 教師 action への cross-entropy loss |
+| `tie_aware_best_set` | `-log(sum_{a in best_set} pi(a))` — 教師最良候補集合全体の確率和を最大化 |
+
+`tie_aware_best_set` は shard に `teacher_best_mask` が含まれている必要がある。
+含まれていない場合はエラーとなる。
+
+出力先:
+- `summary.json.phase_stats.imitation.imitation_loss_mode`
+- `batch_summary.json.runs[].imitation_metrics.imitation_loss_mode`
+- `batch_table.csv` の `imitation_loss_mode` 列
+- `notes.md` に loss_mode 記載
+
+#### batch 集約の mode 別統計 (CQ-0133, CQ-0134)
+
+`batch_summary.json.aggregate.imitation_by_loss_mode` に loss mode ごとの集約統計を出力する。
+既存の `aggregate.imitation`（全体集約）は維持される。
+
+mode 正規化ルール:
+- `None`・空文字・未設定は `"unknown"` に正規化される
+- `"unknown"` は旧成果物や CQ-0130 以前の run に由来する
+- runbook で strict vs tie-aware を比較する場合、`"unknown"` カテゴリは除外して解釈すること
+
+### 17.7 PPO Learner 診断統計 (CQ-0135)
+
+PPO learner 実行時に、既に計算済みのテンソルから診断統計を抽出し `ppo_diag` として出力する。
+
+出力キー一覧:
+
+| カテゴリ | キー名 | 説明 |
+|---|---|---|
+| advantage | `advantage_mean`, `advantage_std`, `advantage_p50`, `advantage_p90`, `advantage_p99` | 正規化後 advantage の分布統計 |
+| advantage | `advantage_positive_ratio`, `advantage_negative_ratio` | 正/負 advantage の割合 |
+| return | `return_mean`, `return_std`, `return_p50`, `return_p90`, `return_p99` | GAE return の分布統計 |
+| old_value | `old_value_mean`, `old_value_std` | shard 由来の value 推定 |
+| new_value | `new_value_mean`, `new_value_std` | 全 epoch/batch の forward 出力 value の集約 |
+| value_error | `value_error_mean`, `value_error_std`, `value_error_p50`, `value_error_p90`, `value_error_p99` | `old_value - return` の予測誤差 |
+| ratio | `ratio_mean`, `ratio_std`, `ratio_p50`, `ratio_p90`, `ratio_p99` | 全 epoch/batch の importance sampling ratio |
+| clip | `clip_fraction` | `abs(ratio - 1.0) > clip_epsilon` の割合 |
+
+出力先:
+- `metrics/train_metrics.json` の `ppo_diag` キー（詳細）
+- `summary.json.phase_stats.learner.ppo_diag`（主要キー反映）
+- `batch_summary.json.runs[].learner_diag`（per-run 転記, CQ-0137）
+- `batch_summary.json.aggregate.learner_diag`（mean/std 集約, CQ-0137）
+
+imitation モードでは `ppo_diag` は出力されない。
+
 ---
 
 ## 18. 実験設定仕様
