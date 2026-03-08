@@ -379,3 +379,297 @@ class TestRotationEvalBatchAggregation:
             reader = csv.DictReader(f)
             rows = list(reader)
         assert rows[0]["eval_mode"] == "rotation"
+
+
+class TestImitationLossModeBatch:
+    """imitation_loss_mode の batch レポート追跡テスト (CQ-0132)"""
+
+    def _make_result_with_imitation(self, tmp_path: Path, seed: int,
+                                     loss_mode: str = "strict_top1"):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # summary.json を作成（batch_report はここから imitation_metrics を読む）
+        summary_data = {
+            "phase_stats": {
+                "imitation": {
+                    "teacher_top1_match_rate": 0.5,
+                    "teacher_best_set_hit_rate": 0.7,
+                    "imitation_loss_mode": loss_mode,
+                },
+            },
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_loss_mode_in_batch_summary(self, tmp_path: Path):
+        """batch_summary.json の per-run に imitation_loss_mode が含まれる"""
+        results = [self._make_result_with_imitation(tmp_path, 42, "tie_aware_best_set")]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "imitation_metrics" in run_entry
+        assert run_entry["imitation_metrics"]["imitation_loss_mode"] == "tie_aware_best_set"
+
+    def test_loss_mode_in_csv(self, tmp_path: Path):
+        """batch_table.csv に imitation_loss_mode 列がある"""
+        results = [self._make_result_with_imitation(tmp_path, 42, "strict_top1")]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_table.csv") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        assert rows[0]["imitation_loss_mode"] == "strict_top1"
+
+    def test_mixed_mode_aggregate(self, tmp_path: Path):
+        """strict/tie-aware 混在 batch で mode 別集約が出る (CQ-0133)"""
+        results = [
+            self._make_result_with_imitation(tmp_path, 42, "strict_top1"),
+            self._make_result_with_imitation(tmp_path, 43, "strict_top1"),
+            self._make_result_with_imitation(tmp_path, 44, "tie_aware_best_set"),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+
+        agg = summary["aggregate"]
+        # 既存の全体集約は維持
+        assert "imitation" in agg
+        assert agg["imitation"]["teacher_top1_match_rate"]["count"] == 3
+
+        # mode 別集約
+        assert "imitation_by_loss_mode" in agg
+        by_mode = agg["imitation_by_loss_mode"]
+        assert "strict_top1" in by_mode
+        assert by_mode["strict_top1"]["teacher_top1_match_rate"]["count"] == 2
+        assert "tie_aware_best_set" in by_mode
+        assert by_mode["tie_aware_best_set"]["teacher_top1_match_rate"]["count"] == 1
+
+    def test_single_mode_aggregate(self, tmp_path: Path):
+        """単一 mode batch でも mode 別集約が出る (CQ-0133)"""
+        results = [
+            self._make_result_with_imitation(tmp_path, 42, "tie_aware_best_set"),
+            self._make_result_with_imitation(tmp_path, 43, "tie_aware_best_set"),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+
+        by_mode = summary["aggregate"]["imitation_by_loss_mode"]
+        assert list(by_mode.keys()) == ["tie_aware_best_set"]
+        assert by_mode["tie_aware_best_set"]["teacher_top1_match_rate"]["count"] == 2
+
+    def _make_result_with_imitation_none_mode(self, tmp_path: Path, seed: int):
+        """imitation_loss_mode が None の旧成果物を模擬"""
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        summary_data = {
+            "phase_stats": {
+                "imitation": {
+                    "teacher_top1_match_rate": 0.4,
+                    "teacher_best_set_hit_rate": 0.6,
+                    "imitation_loss_mode": None,
+                },
+            },
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_none_mode_mixed_no_crash(self, tmp_path: Path):
+        """None + strict_top1 混在でクラッシュしない (CQ-0134)"""
+        results = [
+            self._make_result_with_imitation_none_mode(tmp_path, 42),
+            self._make_result_with_imitation(tmp_path, 43, "strict_top1"),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+
+        agg = summary["aggregate"]
+        assert "imitation" in agg
+        assert agg["imitation"]["teacher_top1_match_rate"]["count"] == 2
+
+        by_mode = agg["imitation_by_loss_mode"]
+        assert "unknown" in by_mode
+        assert by_mode["unknown"]["teacher_top1_match_rate"]["count"] == 1
+        assert "strict_top1" in by_mode
+        assert by_mode["strict_top1"]["teacher_top1_match_rate"]["count"] == 1
+
+    def test_none_and_tie_aware_mixed(self, tmp_path: Path):
+        """None + tie_aware 混在で mode 別 count が正しい (CQ-0134)"""
+        results = [
+            self._make_result_with_imitation_none_mode(tmp_path, 42),
+            self._make_result_with_imitation_none_mode(tmp_path, 43),
+            self._make_result_with_imitation(tmp_path, 44, "tie_aware_best_set"),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+
+        by_mode = summary["aggregate"]["imitation_by_loss_mode"]
+        assert by_mode["unknown"]["teacher_top1_match_rate"]["count"] == 2
+        assert by_mode["tie_aware_best_set"]["teacher_top1_match_rate"]["count"] == 1
+
+
+class TestLearnerDiagBatch:
+    """learner 診断統計の batch レポート統合テスト (CQ-0137)"""
+
+    def _make_result_with_ppo_diag(self, tmp_path: Path, seed: int,
+                                    clip_fraction: float = 0.1,
+                                    advantage_mean: float = 0.0):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ppo_diag = {
+            "advantage_mean": advantage_mean,
+            "advantage_std": 1.0,
+            "advantage_p50": 0.0, "advantage_p90": 1.0, "advantage_p99": 2.0,
+            "advantage_positive_ratio": 0.5, "advantage_negative_ratio": 0.5,
+            "return_mean": 0.1, "return_std": 0.5,
+            "return_p50": 0.1, "return_p90": 0.5, "return_p99": 1.0,
+            "old_value_mean": 0.05, "old_value_std": 0.3,
+            "new_value_mean": 0.08, "new_value_std": 0.25,
+            "value_error_mean": -0.05, "value_error_std": 0.4,
+            "value_error_p50": -0.02, "value_error_p90": 0.3, "value_error_p99": 0.8,
+            "ratio_mean": 1.01, "ratio_std": 0.1,
+            "ratio_p50": 1.0, "ratio_p90": 1.1, "ratio_p99": 1.3,
+            "clip_fraction": clip_fraction,
+        }
+        summary_data = {
+            "phase_stats": {
+                "learner": {
+                    "total_steps": 100,
+                    "num_updates": 10,
+                    "policy_loss": 0.5,
+                    "value_loss": 0.3,
+                    "mode": "ppo",
+                    "ppo_diag": ppo_diag,
+                },
+            },
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_learner_diag_in_runs(self, tmp_path: Path):
+        """runs[*].learner_diag が batch_summary に含まれる"""
+        results = [self._make_result_with_ppo_diag(tmp_path, 42, clip_fraction=0.15)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "learner_diag" in run_entry
+        assert run_entry["learner_diag"]["clip_fraction"] == 0.15
+
+    def test_learner_diag_aggregate(self, tmp_path: Path):
+        """aggregate.learner_diag に mean/std が集約される"""
+        results = [
+            self._make_result_with_ppo_diag(tmp_path, 42, clip_fraction=0.1),
+            self._make_result_with_ppo_diag(tmp_path, 43, clip_fraction=0.2),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        agg = summary["aggregate"]
+        assert "learner_diag" in agg
+        assert agg["learner_diag"]["clip_fraction"]["count"] == 2
+        assert agg["learner_diag"]["clip_fraction"]["mean"] == pytest.approx(0.15, abs=1e-6)
+
+    def test_no_learner_diag_no_crash(self, tmp_path: Path):
+        """ppo_diag なし（imitation のみ）でクラッシュしない"""
+        run_dir = tmp_path / "fake_run_42"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        summary_data = {
+            "phase_stats": {
+                "imitation": {
+                    "teacher_top1_match_rate": 0.5,
+                    "teacher_best_set_hit_rate": 0.7,
+                },
+            },
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        results = [{
+            "seed": 42,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": 42,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert "learner_diag" not in summary["runs"][0]
+        assert "learner_diag" not in summary["aggregate"]
+
+    def test_mixed_with_and_without_diag(self, tmp_path: Path):
+        """ppo_diag あり/なし混在でもクラッシュせず、あり分だけ集約される"""
+        # seed 42: ppo_diag あり
+        results = [self._make_result_with_ppo_diag(tmp_path, 42, clip_fraction=0.1)]
+        # seed 43: ppo_diag なし
+        run_dir_43 = tmp_path / "fake_run_43"
+        run_dir_43.mkdir(parents=True, exist_ok=True)
+        with open(run_dir_43 / "summary.json", "w") as f:
+            json.dump({"phase_stats": {}}, f)
+        results.append({
+            "seed": 43,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir_43),
+                "global_seed": 43,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        })
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert "learner_diag" in summary["runs"][0]
+        assert "learner_diag" not in summary["runs"][1]
+        # aggregate は1件のみ
+        assert summary["aggregate"]["learner_diag"]["clip_fraction"]["count"] == 1

@@ -8,7 +8,7 @@ pytestmark = pytest.mark.smoke
 
 from mahjong_rl.encoders import FlatFeatureEncoder
 from mahjong_rl.models import MLPPolicyValueModel
-from mahjong_rl.shard import LearningSample, ShardWriter
+from mahjong_rl.shard import LearningSample, ShardReader, ShardWriter
 from mahjong_rl.learner import Learner
 
 
@@ -473,3 +473,436 @@ class TestLearnerDevice:
             out1 = model(test_input, test_mask)
             out2 = model2(test_input, test_mask)
         torch.testing.assert_close(out1.logits, out2.logits)
+
+
+def _write_shards_with_best_mask(
+    shard_dir: Path, n: int, obs_dim: int,
+    action: int = 0, tie_actions: list[int] | None = None,
+):
+    """teacher_best_mask 付きダミー shard を書き出す"""
+    writer = ShardWriter(shard_dir, max_samples=10000)
+    for i in range(n):
+        mask = np.zeros(34, dtype=np.float32)
+        mask[:10] = 1.0
+        tbm = np.zeros(34, dtype=np.float32)
+        tbm[action] = 1.0
+        if tie_actions:
+            for ta in tie_actions:
+                tbm[ta] = 1.0
+        writer.add(LearningSample(
+            observation=np.random.randn(obs_dim).astype(np.float32),
+            legal_mask=mask,
+            action=action,
+            reward=0.0,
+            log_prob=0.0,
+            value=0.0,
+            terminated=(i == n - 1),
+            round_over=False,
+            experiment_id="test",
+            run_id="run",
+            worker_id="w0",
+            episode_id="ep",
+            step_id=i,
+            actor_type="baseline",
+            teacher_best_mask=tbm,
+        ))
+    writer.close()
+
+
+class TestImitationReproMetrics:
+    """imitation 教師再現メトリクスのテスト (CQ-0126)"""
+
+    def test_metrics_present_with_best_mask(self, tmp_path: Path):
+        """teacher_best_mask 付き shard で両指標が算出される"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_best_mask(shard_dir, n=50, obs_dim=obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[32])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=5, filter_actor_type="baseline")
+
+        assert "teacher_top1_match_rate" in metrics
+        assert 0.0 <= metrics["teacher_top1_match_rate"] <= 1.0
+        assert "teacher_best_set_hit_rate" in metrics
+        assert 0.0 <= metrics["teacher_best_set_hit_rate"] <= 1.0
+
+    def test_best_set_ge_top1(self, tmp_path: Path):
+        """best_set_hit_rate >= top1_match_rate（定義上の整合）"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        # tie候補を追加: action=0 + tie=1
+        _write_shards_with_best_mask(
+            shard_dir, n=50, obs_dim=obs_dim, action=0, tie_actions=[1])
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=3, filter_actor_type="baseline")
+
+        assert metrics["teacher_best_set_hit_rate"] >= metrics["teacher_top1_match_rate"]
+
+    def test_no_teacher_mask_top1_only(self, tmp_path: Path):
+        """teacher_best_mask なし旧データで top1 のみ出力"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=50, obs_dim=obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=1)
+
+        assert "teacher_top1_match_rate" in metrics
+        assert "teacher_best_set_hit_rate" not in metrics
+
+    def test_teacher_best_set_status_available(self, tmp_path: Path):
+        """teacher_best_mask 付きで status=available (CQ-0128)"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_best_mask(shard_dir, n=20, obs_dim=obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=1, filter_actor_type="baseline")
+
+        assert metrics["teacher_best_set_status"] == "available"
+        assert "teacher_best_mask_shard_info" in metrics
+        info = metrics["teacher_best_mask_shard_info"]
+        assert info["available"] == info["total"]
+
+    def test_teacher_best_set_status_missing(self, tmp_path: Path):
+        """teacher_best_mask なしで status=missing (CQ-0128)"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=20, obs_dim=obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=1)
+
+        assert metrics["teacher_best_set_status"] == "missing"
+        assert "teacher_best_mask_shard_info" in metrics
+        info = metrics["teacher_best_mask_shard_info"]
+        assert info["available"] == 0
+
+    def test_teacher_best_set_status_mixed(self, tmp_path: Path):
+        """新旧混在 shard で status=mixed (CQ-0128)"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+
+        # shard_0000: teacher_best_mask あり
+        writer1 = ShardWriter(shard_dir, max_samples=1)
+        mask = np.zeros(34, dtype=np.float32)
+        mask[:10] = 1.0
+        tbm = np.zeros(34, dtype=np.float32)
+        tbm[0] = 1.0
+        writer1.add(LearningSample(
+            observation=np.random.randn(obs_dim).astype(np.float32),
+            legal_mask=mask,
+            action=0, reward=0.0, log_prob=0.0, value=0.0,
+            terminated=False, round_over=False,
+            experiment_id="test", run_id="run", worker_id="w0",
+            episode_id="ep", step_id=0,
+            teacher_best_mask=tbm,
+        ))
+        writer1.close()
+
+        # shard_0001: teacher_best_mask なし（旧形式）
+        writer2 = ShardWriter(shard_dir, max_samples=1)
+        writer2._shard_counter = 1
+        writer2.add(LearningSample(
+            observation=np.random.randn(obs_dim).astype(np.float32),
+            legal_mask=mask.copy(),
+            action=0, reward=0.0, log_prob=0.0, value=0.0,
+            terminated=True, round_over=False,
+            experiment_id="test", run_id="run", worker_id="w0",
+            shard_id="shard_0001",
+            episode_id="ep", step_id=1,
+        ))
+        writer2.close()
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=1)
+
+        assert metrics["teacher_best_set_status"] == "mixed"
+        info = metrics["teacher_best_mask_shard_info"]
+        assert info["available"] == 1
+        assert info["total"] == 2
+
+
+class TestImitationLossMode:
+    """imitation loss mode 切替テスト (CQ-0131)"""
+
+    def test_strict_top1_default(self, tmp_path: Path):
+        """キー省略でデフォルト strict_top1 が使われる"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_best_mask(shard_dir, n=20, obs_dim=obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        # imitation_loss_mode キーを設定しない（デフォルト）
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        assert learner.imitation_loss_mode == "strict_top1"
+        metrics = learner.train(shard_dir, num_epochs=1, filter_actor_type="baseline")
+        assert metrics["imitation_loss_mode"] == "strict_top1"
+        assert metrics["policy_loss"] > 0
+
+    def test_tie_aware_computes_loss(self, tmp_path: Path):
+        """tie_aware_best_set で loss > 0 が計算される"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_best_mask(
+            shard_dir, n=30, obs_dim=obs_dim, action=0, tie_actions=[1, 2])
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["imitation_loss_mode"] = "tie_aware_best_set"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=2, filter_actor_type="baseline")
+
+        assert metrics["imitation_loss_mode"] == "tie_aware_best_set"
+        assert metrics["policy_loss"] > 0
+        assert metrics["num_updates"] > 0
+
+    def test_tie_aware_increases_best_set_prob(self, tmp_path: Path):
+        """tie-aware 学習後に best-set 確率が増加する"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        # best_set = {0, 1, 2}
+        _write_shards_with_best_mask(
+            shard_dir, n=50, obs_dim=obs_dim, action=0, tie_actions=[1, 2])
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["imitation_loss_mode"] = "tie_aware_best_set"
+        config["training"]["lr"] = 1e-3
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        # 学習前の best-set 確率を計測
+        reader = ShardReader(shard_dir)
+        data = reader.read_as_tensors(filter_actor_type="baseline")
+        obs_t = torch.from_numpy(data["observations"])
+        masks_t = torch.from_numpy(data["legal_masks"])
+        tbm_t = torch.from_numpy(data["teacher_best_masks"])
+
+        model.eval()
+        with torch.no_grad():
+            out_before = model(obs_t, masks_t)
+            probs_before = torch.softmax(out_before.logits, dim=-1)
+            bsp_before = (probs_before * tbm_t).sum(dim=-1).mean().item()
+        model.train()
+
+        # 学習実行
+        learner.train(shard_dir, num_epochs=10, filter_actor_type="baseline")
+
+        # 学習後の best-set 確率を計測
+        model.eval()
+        with torch.no_grad():
+            out_after = model(obs_t, masks_t)
+            probs_after = torch.softmax(out_after.logits, dim=-1)
+            bsp_after = (probs_after * tbm_t).sum(dim=-1).mean().item()
+
+        assert bsp_after > bsp_before, (
+            f"best-set prob should increase: {bsp_before:.4f} -> {bsp_after:.4f}")
+
+    def test_missing_mask_tie_aware_raises(self, tmp_path: Path):
+        """teacher_best_mask なしで tie_aware を使うと ValueError"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=20, obs_dim=obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["imitation_loss_mode"] = "tie_aware_best_set"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        with pytest.raises(ValueError, match="requires teacher_best_masks"):
+            learner.train(shard_dir, num_epochs=1)
+
+    def test_unknown_loss_mode_raises(self):
+        """不明な loss mode で ValueError"""
+        config = _make_config()
+        config["training"]["imitation_loss_mode"] = "invalid_mode"
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="Unknown imitation_loss_mode"):
+            Learner(config=config, model=model, run_dir=Path("/tmp/dummy"))
+
+    def test_loss_mode_in_metrics(self, tmp_path: Path):
+        """metrics に imitation_loss_mode が含まれる"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_best_mask(shard_dir, n=20, obs_dim=obs_dim)
+
+        for mode in ["strict_top1", "tie_aware_best_set"]:
+            config = _make_config()
+            config["training"]["algorithm"] = "imitation"
+            config["training"]["imitation_loss_mode"] = mode
+            model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+            learner = Learner(config=config, model=model,
+                              run_dir=tmp_path / f"run_{mode}")
+            metrics = learner.train(shard_dir, num_epochs=1,
+                                    filter_actor_type="baseline")
+            assert metrics["imitation_loss_mode"] == mode
+
+
+class TestTieAwareNumericalStability:
+    """tie-aware loss の数値安定性テスト (CQ-0133)"""
+
+    def test_loss_is_finite(self, tmp_path: Path):
+        """tie-aware loss が NaN/inf にならない"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_best_mask(
+            shard_dir, n=30, obs_dim=obs_dim, action=0, tie_actions=[1])
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["imitation_loss_mode"] = "tie_aware_best_set"
+        config["training"]["epochs"] = 5
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, filter_actor_type="baseline")
+
+        assert np.isfinite(metrics["policy_loss"]), f"policy_loss is not finite: {metrics['policy_loss']}"
+        assert np.isfinite(metrics["entropy"]), f"entropy is not finite: {metrics['entropy']}"
+
+    def test_single_action_best_set(self, tmp_path: Path):
+        """best-set が単一 action でも安定して計算される"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        # tie_actions なし = best_set は {action} のみ
+        _write_shards_with_best_mask(
+            shard_dir, n=20, obs_dim=obs_dim, action=0, tie_actions=None)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["imitation_loss_mode"] = "tie_aware_best_set"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=3, filter_actor_type="baseline")
+
+        assert np.isfinite(metrics["policy_loss"])
+        assert metrics["policy_loss"] > 0
+
+    def test_many_epochs_stable(self, tmp_path: Path):
+        """多エポック学習後も loss が有限値"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_best_mask(
+            shard_dir, n=30, obs_dim=obs_dim, action=0, tie_actions=[1, 2])
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["imitation_loss_mode"] = "tie_aware_best_set"
+        config["training"]["lr"] = 1e-2  # 大きめの学習率で安定性を検証
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=20, filter_actor_type="baseline")
+
+        assert np.isfinite(metrics["policy_loss"])
+        assert np.isfinite(metrics["entropy"])
+
+
+class TestPPODiagnosticStats:
+    """PPO 診断統計テスト (CQ-0136)"""
+
+    _DIAG_KEYS = [
+        "advantage_mean", "advantage_std", "advantage_p50", "advantage_p90", "advantage_p99",
+        "advantage_positive_ratio", "advantage_negative_ratio",
+        "return_mean", "return_std", "return_p50", "return_p90", "return_p99",
+        "old_value_mean", "old_value_std",
+        "new_value_mean", "new_value_std",
+        "value_error_mean", "value_error_std", "value_error_p50", "value_error_p90", "value_error_p99",
+        "ratio_mean", "ratio_std", "ratio_p50", "ratio_p90", "ratio_p99",
+        "clip_fraction",
+    ]
+
+    def _run_ppo(self, tmp_path: Path, n: int = 80, epochs: int = 2) -> dict:
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=n, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["epochs"] = epochs
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        return learner.train(shard_dir)
+
+    def test_ppo_diag_keys_present(self, tmp_path: Path):
+        """PPO run で全診断キーが出力される"""
+        metrics = self._run_ppo(tmp_path)
+        assert "ppo_diag" in metrics
+        diag = metrics["ppo_diag"]
+        for key in self._DIAG_KEYS:
+            assert key in diag, f"missing key: {key}"
+
+    def test_ppo_diag_all_float(self, tmp_path: Path):
+        """全診断値が float"""
+        metrics = self._run_ppo(tmp_path)
+        diag = metrics["ppo_diag"]
+        for key in self._DIAG_KEYS:
+            assert isinstance(diag[key], float), f"{key} is not float: {type(diag[key])}"
+
+    def test_ppo_diag_no_nan_inf(self, tmp_path: Path):
+        """NaN/inf が含まれない"""
+        metrics = self._run_ppo(tmp_path)
+        diag = metrics["ppo_diag"]
+        for key in self._DIAG_KEYS:
+            assert np.isfinite(diag[key]), f"{key} is not finite: {diag[key]}"
+
+    def test_ratio_keys_in_unit_range(self, tmp_path: Path):
+        """比率系キーが [0, 1] 範囲"""
+        metrics = self._run_ppo(tmp_path)
+        diag = metrics["ppo_diag"]
+        for key in ["advantage_positive_ratio", "advantage_negative_ratio", "clip_fraction"]:
+            assert 0.0 <= diag[key] <= 1.0, f"{key} out of range: {diag[key]}"
+
+    def test_quantile_ordering(self, tmp_path: Path):
+        """p50 <= p90 <= p99 の順序が成立"""
+        metrics = self._run_ppo(tmp_path)
+        diag = metrics["ppo_diag"]
+        for prefix in ["advantage", "return", "value_error", "ratio"]:
+            p50 = diag[f"{prefix}_p50"]
+            p90 = diag[f"{prefix}_p90"]
+            p99 = diag[f"{prefix}_p99"]
+            assert p50 <= p90 + 1e-9, f"{prefix}: p50={p50} > p90={p90}"
+            assert p90 <= p99 + 1e-9, f"{prefix}: p90={p90} > p99={p99}"
+
+    def test_imitation_no_ppo_diag(self, tmp_path: Path):
+        """imitation モードでは ppo_diag が出力されない"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=50, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=1)
+        assert "ppo_diag" not in metrics
+
+    def test_ppo_diag_saved_to_train_metrics_json(self, tmp_path: Path):
+        """train_metrics.json に ppo_diag が保存される"""
+        import json
+        metrics = self._run_ppo(tmp_path)
+        json_path = tmp_path / "run" / "metrics" / "train_metrics.json"
+        assert json_path.exists()
+        with open(json_path) as f:
+            saved = json.load(f)
+        assert "ppo_diag" in saved
+        assert saved["ppo_diag"]["clip_fraction"] == metrics["ppo_diag"]["clip_fraction"]

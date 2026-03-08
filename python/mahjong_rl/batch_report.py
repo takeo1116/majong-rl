@@ -73,7 +73,7 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
                 "selfplay_num_workers": sp_stats.get("num_workers", 1),
                 "evaluation_num_workers": eval_m.get("num_workers", 1),
             }
-            # device_info / env_info (CQ-0081)
+            # device_info / env_info (CQ-0081) + imitation_metrics (CQ-0127)
             run_dir_path = Path(result["run_dir"]) if result.get("run_dir") else None
             if run_dir_path is not None:
                 summary_path = run_dir_path / "summary.json"
@@ -86,9 +86,68 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
                     ei = run_summary.get("env_info")
                     if ei is not None:
                         entry["env_info"] = ei
+                    # imitation 教師再現メトリクス (CQ-0127)
+                    imi_stats = run_summary.get("phase_stats", {}).get("imitation", {})
+                    imi_top1 = imi_stats.get("teacher_top1_match_rate")
+                    imi_best_set = imi_stats.get("teacher_best_set_hit_rate")
+                    if imi_top1 is not None or imi_best_set is not None:
+                        entry["imitation_metrics"] = {
+                            "teacher_top1_match_rate": imi_top1,
+                            "teacher_best_set_hit_rate": imi_best_set,
+                            "imitation_loss_mode": imi_stats.get("imitation_loss_mode"),
+                        }
+                    # CQ-0137: learner PPO 診断統計
+                    learner_stats = run_summary.get("phase_stats", {}).get("learner", {})
+                    ppo_diag = learner_stats.get("ppo_diag")
+                    if ppo_diag is not None:
+                        entry["learner_diag"] = ppo_diag
         else:
             entry["error"] = r.get("error", "unknown")
         runs_info.append(entry)
+
+    # imitation 教師再現メトリクス集約 (CQ-0127)
+    imi_metrics_list = [
+        entry["imitation_metrics"]
+        for entry in runs_info
+        if entry.get("imitation_metrics")
+    ]
+    if imi_metrics_list:
+        aggregate["imitation"] = _compute_aggregate_generic(
+            imi_metrics_list,
+            ["teacher_top1_match_rate", "teacher_best_set_hit_rate"],
+        )
+        # CQ-0133, CQ-0134: mode 別集約（None/空文字は "unknown" に正規化）
+        by_mode: dict[str, list[dict]] = {}
+        for m in imi_metrics_list:
+            raw_mode = m.get("imitation_loss_mode")
+            mode = raw_mode if isinstance(raw_mode, str) and raw_mode else "unknown"
+            by_mode.setdefault(mode, []).append(m)
+        if by_mode:
+            aggregate["imitation_by_loss_mode"] = {
+                mode: _compute_aggregate_generic(
+                    entries,
+                    ["teacher_top1_match_rate", "teacher_best_set_hit_rate"],
+                )
+                for mode, entries in sorted(by_mode.items())
+            }
+
+    # CQ-0137: learner 診断統計の集約
+    learner_diag_list = [
+        entry["learner_diag"]
+        for entry in runs_info
+        if entry.get("learner_diag")
+    ]
+    if learner_diag_list:
+        _LEARNER_DIAG_AGG_KEYS = [
+            "advantage_mean", "advantage_std",
+            "clip_fraction",
+            "ratio_mean", "ratio_std",
+            "old_value_mean", "new_value_mean",
+            "value_error_mean", "value_error_std",
+        ]
+        aggregate["learner_diag"] = _compute_aggregate_generic(
+            learner_diag_list, _LEARNER_DIAG_AGG_KEYS,
+        )
 
     summary = {
         "num_seeds": len(seeds),
@@ -106,6 +165,28 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
 
     # batch_table.csv
     _write_batch_table_csv(batch_dir / "batch_table.csv", runs_info)
+
+
+def _compute_aggregate_generic(
+    metrics_list: list[dict], keys: list[str],
+) -> dict:
+    """汎用メトリクス集約 (CQ-0127)"""
+    result = {}
+    for key in keys:
+        values = [m[key] for m in metrics_list if m.get(key) is not None]
+        if not values:
+            continue
+        n = len(values)
+        mean = sum(values) / n
+        std = math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1)) if n > 1 else 0.0
+        result[key] = {
+            "mean": round(mean, 6),
+            "std": round(std, 6),
+            "count": n,
+            "min": round(min(values), 6),
+            "max": round(max(values), 6),
+        }
+    return result
 
 
 def _compute_aggregate(eval_metrics_list: list[dict]) -> dict:
@@ -215,6 +296,8 @@ def _write_batch_table_csv(path: Path, runs_info: list[dict]) -> None:
     fieldnames = [
         "seed", "success", "run_dir", "eval_mode",
         "avg_rank", "avg_score", "win_rate", "deal_in_rate",
+        "teacher_top1_match_rate", "teacher_best_set_hit_rate",
+        "imitation_loss_mode",
     ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -232,4 +315,10 @@ def _write_batch_table_csv(path: Path, runs_info: list[dict]) -> None:
                 row["avg_score"] = em.get("avg_score", "")
                 row["win_rate"] = em.get("win_rate", "")
                 row["deal_in_rate"] = em.get("deal_in_rate", "")
+            # imitation 教師再現メトリクス (CQ-0127)
+            im = run.get("imitation_metrics", {})
+            if im:
+                row["teacher_top1_match_rate"] = im.get("teacher_top1_match_rate", "")
+                row["teacher_best_set_hit_rate"] = im.get("teacher_best_set_hit_rate", "")
+                row["imitation_loss_mode"] = im.get("imitation_loss_mode", "")
             writer.writerow(row)

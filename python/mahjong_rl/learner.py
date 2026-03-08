@@ -39,11 +39,23 @@ class Learner:
         self._entropy_coef = tc.get("entropy_coef", 0.01)
         self._max_grad_norm = tc.get("max_grad_norm", 0.5)
 
+        # CQ-0130: imitation loss mode
+        self._imitation_loss_mode = tc.get("imitation_loss_mode", "strict_top1")
+        _VALID_LOSS_MODES = {"strict_top1", "tie_aware_best_set"}
+        if self._imitation_loss_mode not in _VALID_LOSS_MODES:
+            raise ValueError(
+                f"Unknown imitation_loss_mode: {self._imitation_loss_mode!r}. "
+                f"有効値: {_VALID_LOSS_MODES}")
+
         self._optimizer = torch.optim.Adam(model.parameters(), lr=self._lr)
 
     @property
     def mode(self) -> str:
         return self._mode
+
+    @property
+    def imitation_loss_mode(self) -> str:
+        return self._imitation_loss_mode
 
     def train(
         self,
@@ -84,8 +96,13 @@ class Learner:
 
         n_before_filter = len(observations)
 
+        # teacher_best_masks (CQ-0125, CQ-0128)
+        raw_teacher_best_masks = data.get("teacher_best_masks")
+        tbm_shard_info = data.get("teacher_best_mask_shard_info", {})
+
         # imitation 品質フィルタ適用
         filter_stats = None
+        keep = None
         if self._mode == "imitation" and imitation_filter is not None:
             enabled = imitation_filter.get("enabled", True)
             if enabled:
@@ -114,8 +131,30 @@ class Learner:
 
         profiler.start("model_forward")
         if self._mode == "imitation":
+            # teacher_best_masks 準備 (CQ-0125, CQ-0128, CQ-0130)
+            teacher_best_masks_t = None
+            teacher_best_set_status = "missing"
+            if raw_teacher_best_masks is not None:
+                teacher_best_masks_t = torch.from_numpy(
+                    raw_teacher_best_masks).to(self._device)
+                if keep is not None:
+                    teacher_best_masks_t = teacher_best_masks_t[keep]
+                teacher_best_set_status = "available"
+            else:
+                avail = tbm_shard_info.get("available", 0)
+                total = tbm_shard_info.get("total", 0)
+                if avail > 0 and avail < total:
+                    teacher_best_set_status = "mixed"
+
             metrics = self._train_imitation(
-                observations, legal_masks, actions, n, epochs)
+                observations, legal_masks, actions, n, epochs,
+                teacher_best_masks=teacher_best_masks_t)
+            metrics["teacher_best_set_status"] = teacher_best_set_status
+            if tbm_shard_info:
+                metrics["teacher_best_mask_shard_info"] = tbm_shard_info
+            repro = self._compute_imitation_metrics(
+                observations, legal_masks, actions, teacher_best_masks_t)
+            metrics.update(repro)
         else:
             metrics = self._train_ppo(
                 observations, legal_masks, actions, rewards,
@@ -180,6 +219,9 @@ class Learner:
         all_policy_losses = []
         all_value_losses = []
         all_entropies = []
+        # CQ-0135: 診断統計用テンソル収集
+        all_ratios = []
+        all_new_values = []
         num_updates = 0
 
         for _ in range(epochs):
@@ -226,13 +268,26 @@ class Learner:
                 all_policy_losses.append(policy_loss.item())
                 all_value_losses.append(value_loss.item())
                 all_entropies.append(entropy.item())
+                # CQ-0135: バッチ単位の ratio / new_value を記録
+                all_ratios.append(ratio.detach().cpu())
+                all_new_values.append(value.detach().cpu())
 
-        return {
+        metrics = {
             "policy_loss": float(np.mean(all_policy_losses)) if all_policy_losses else 0.0,
             "value_loss": float(np.mean(all_value_losses)) if all_value_losses else 0.0,
             "entropy": float(np.mean(all_entropies)) if all_entropies else 0.0,
             "num_updates": num_updates,
         }
+
+        # CQ-0135: PPO 診断統計
+        if num_updates > 0:
+            metrics["ppo_diag"] = self._compute_ppo_diagnostics(
+                advantages, returns, old_values,
+                all_ratios, all_new_values,
+                clip_epsilon=self._clip_epsilon,
+            )
+
+        return metrics
 
     def _train_imitation(
         self,
@@ -241,8 +296,19 @@ class Learner:
         actions: torch.Tensor,
         n: int,
         epochs: int,
+        teacher_best_masks: torch.Tensor | None = None,
     ) -> dict:
-        """模倣学習 (cross-entropy loss)"""
+        """模倣学習 (CQ-0130: loss mode 切替対応)
+
+        imitation_loss_mode:
+            strict_top1: 教師 action への cross-entropy loss
+            tie_aware_best_set: -log(sum_{a in best_set} pi(a))
+        """
+        if self._imitation_loss_mode == "tie_aware_best_set" and teacher_best_masks is None:
+            raise ValueError(
+                "imitation_loss_mode='tie_aware_best_set' requires teacher_best_masks, "
+                "but none were found in shard data")
+
         all_policy_losses = []
         all_entropies = []
         num_updates = 0
@@ -259,13 +325,19 @@ class Learner:
 
                 output = self._model(batch_obs, batch_masks)
 
-                # cross-entropy loss (legal mask 適用済みロジットに対して)
-                policy_loss = nn.functional.cross_entropy(output.logits, batch_actions)
+                # loss 計算 (CQ-0130)
+                if self._imitation_loss_mode == "strict_top1":
+                    policy_loss = nn.functional.cross_entropy(output.logits, batch_actions)
+                else:  # tie_aware_best_set
+                    batch_tbm = teacher_best_masks[idx]
+                    probs = torch.softmax(output.logits, dim=-1)
+                    best_set_prob = (probs * batch_tbm).sum(dim=-1)
+                    policy_loss = -torch.log(best_set_prob + 1e-8).mean()
 
                 # エントロピー（モニタリング用）
                 log_probs = torch.log_softmax(output.logits, dim=-1)
-                probs = torch.softmax(output.logits, dim=-1)
-                entropy = -(probs * log_probs).sum(dim=-1).mean()
+                probs_for_ent = torch.softmax(output.logits, dim=-1)
+                entropy = -(probs_for_ent * log_probs).sum(dim=-1).mean()
 
                 loss = policy_loss - self._entropy_coef * entropy
 
@@ -283,7 +355,117 @@ class Learner:
             "value_loss": 0.0,
             "entropy": float(np.mean(all_entropies)) if all_entropies else 0.0,
             "num_updates": num_updates,
+            "imitation_loss_mode": self._imitation_loss_mode,
         }
+
+    @torch.no_grad()
+    def _compute_imitation_metrics(
+        self,
+        observations: torch.Tensor,
+        legal_masks: torch.Tensor,
+        actions: torch.Tensor,
+        teacher_best_masks: torch.Tensor | None,
+    ) -> dict:
+        """学習後モデルの教師再現メトリクスを計算する (CQ-0125)
+
+        Args:
+            observations: (N, obs_dim)
+            legal_masks: (N, 34)
+            actions: (N,) 教師 action
+            teacher_best_masks: (N, 34) or None
+
+        Returns:
+            teacher_top1_match_rate と（mask 存在時）teacher_best_set_hit_rate
+        """
+        self._model.eval()
+        n = len(observations)
+        if n == 0:
+            self._model.train()
+            return {}
+
+        all_preds = []
+        for start in range(0, n, self._batch_size):
+            end = min(start + self._batch_size, n)
+            output = self._model(observations[start:end], legal_masks[start:end])
+            all_preds.append(output.logits.argmax(dim=-1))
+        pred_actions = torch.cat(all_preds)
+
+        metrics: dict = {}
+        top1 = (pred_actions == actions).float().mean().item()
+        metrics["teacher_top1_match_rate"] = float(top1)
+
+        if teacher_best_masks is not None:
+            hits = teacher_best_masks.gather(
+                1, pred_actions.unsqueeze(1)).squeeze(1)
+            metrics["teacher_best_set_hit_rate"] = float(hits.mean().item())
+
+        self._model.train()
+        return metrics
+
+    @staticmethod
+    def _compute_ppo_diagnostics(
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+        old_values: torch.Tensor,
+        all_ratios: list[torch.Tensor],
+        all_new_values: list[torch.Tensor],
+        clip_epsilon: float | None = None,
+    ) -> dict:
+        """PPO 診断統計を計算する (CQ-0135)
+
+        既に計算済みのテンソルから統計量のみを抽出する。
+        生テンソルは保存しない。
+        """
+        adv_np = advantages.cpu().numpy().astype(np.float64)
+        ret_np = returns.cpu().numpy().astype(np.float64)
+        old_val_np = old_values.cpu().numpy().astype(np.float64)
+        ratio_np = np.concatenate([r.numpy().astype(np.float64) for r in all_ratios])
+        new_val_np = np.concatenate([v.numpy().astype(np.float64) for v in all_new_values])
+
+        def _stats(arr: np.ndarray, prefix: str) -> dict:
+            return {
+                f"{prefix}_mean": float(np.mean(arr)),
+                f"{prefix}_std": float(np.std(arr, ddof=0)),
+                f"{prefix}_p50": float(np.percentile(arr, 50)),
+                f"{prefix}_p90": float(np.percentile(arr, 90)),
+                f"{prefix}_p99": float(np.percentile(arr, 99)),
+            }
+
+        diag: dict = {}
+
+        # advantage 統計
+        diag.update(_stats(adv_np, "advantage"))
+        n_pos = int(np.sum(adv_np > 0))
+        n_neg = int(np.sum(adv_np < 0))
+        n_total = len(adv_np)
+        diag["advantage_positive_ratio"] = n_pos / n_total if n_total > 0 else 0.0
+        diag["advantage_negative_ratio"] = n_neg / n_total if n_total > 0 else 0.0
+
+        # return 統計
+        diag.update(_stats(ret_np, "return"))
+
+        # old_value 統計
+        diag["old_value_mean"] = float(np.mean(old_val_np))
+        diag["old_value_std"] = float(np.std(old_val_np, ddof=0))
+
+        # new_value 統計（全 epoch/batch の集約）
+        diag["new_value_mean"] = float(np.mean(new_val_np))
+        diag["new_value_std"] = float(np.std(new_val_np, ddof=0))
+
+        # value_error = old_value - return（GAE 前提の予測誤差）
+        val_err = old_val_np - ret_np
+        diag.update(_stats(val_err, "value_error"))
+
+        # ratio 統計
+        diag.update(_stats(ratio_np, "ratio"))
+
+        # clip_fraction: |ratio - 1| > clip_epsilon の割合
+        if clip_epsilon is None:
+            clip_epsilon = 0.2
+        clipped = np.abs(ratio_np - 1.0) > clip_epsilon
+        diag["clip_fraction"] = float(np.mean(clipped))
+
+        return diag
 
     def _compute_gae(
         self,

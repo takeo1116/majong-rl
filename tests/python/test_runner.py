@@ -2365,3 +2365,124 @@ class TestShantenHintIntegration:
         ef = summary.get("encoder_features", {})
         assert ef.get("shanten_hint") is False
         assert ef.get("input_dim") == 455  # full
+
+
+@pytest.mark.smoke
+class TestImitationReproMetricsIntegration:
+    """imitation 教師再現メトリクスの統合テスト (CQ-0126)"""
+
+    def test_imitation_repro_metrics_in_summary(self, tmp_path: Path):
+        """imitation run で summary.json に再現メトリクスが記録される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 1
+        config.training["imitation_epochs"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        imi_stats = summary.get("phase_stats", {}).get("imitation", {})
+        assert "teacher_top1_match_rate" in imi_stats
+        top1 = imi_stats["teacher_top1_match_rate"]
+        assert isinstance(top1, float) and 0.0 <= top1 <= 1.0
+
+        best_set = imi_stats.get("teacher_best_set_hit_rate")
+        assert best_set is not None
+        assert isinstance(best_set, float) and 0.0 <= best_set <= 1.0
+        assert best_set >= top1
+
+        # notes にも記載
+        notes = (run_dir / "notes.md").read_text()
+        assert "teacher_top1_match_rate" in notes
+
+    def test_teacher_best_set_status_in_summary(self, tmp_path: Path):
+        """summary に teacher_best_set_status が記録される (CQ-0128)"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 1
+        config.training["imitation_epochs"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        imi_stats = summary.get("phase_stats", {}).get("imitation", {})
+        assert "teacher_best_set_status" in imi_stats
+        assert imi_stats["teacher_best_set_status"] in ("available", "missing", "mixed")
+
+        # notes にも teacher_best_set_status が記載
+        notes = (run_dir / "notes.md").read_text()
+        assert "teacher_best_set_status" in notes
+
+
+@pytest.mark.slow
+class TestPPODiagIntegration:
+    """PPO 診断統計の runner 統合テスト (CQ-0138)"""
+
+    def test_ppo_diag_three_path_consistency(self, tmp_path: Path):
+        """result / train_metrics.json / summary.json の3経路で ppo_diag が整合する"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+
+        # 1) result["train_metrics"]["ppo_diag"]
+        tm = result["train_metrics"]
+        assert "ppo_diag" in tm
+        diag_result = tm["ppo_diag"]
+
+        run_dir = Path(result["run_dir"])
+
+        # 2) train_metrics.json
+        with open(run_dir / "metrics" / "train_metrics.json") as f:
+            saved_tm = json.load(f)
+        assert "ppo_diag" in saved_tm
+        diag_json = saved_tm["ppo_diag"]
+
+        # 3) summary.json
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        learner_stats = summary.get("phase_stats", {}).get("learner", {})
+        assert "ppo_diag" in learner_stats
+        diag_summary = learner_stats["ppo_diag"]
+
+        # 主要キーの一致確認
+        for key in ["clip_fraction", "ratio_mean", "advantage_mean"]:
+            assert key in diag_result
+            assert key in diag_json
+            assert key in diag_summary
+            assert diag_result[key] == diag_json[key], f"{key} mismatch result vs json"
+            assert diag_json[key] == diag_summary[key], f"{key} mismatch json vs summary"
+
+    def test_imitation_only_no_ppo_diag(self, tmp_path: Path):
+        """imitation-only 経路では ppo_diag が必須化されていない"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.experiment["phases"] = ["imitation", "selfplay", "eval"]
+        config.selfplay["imitation_matches"] = 1
+        config.training["imitation_epochs"] = 1
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        # learner フェーズがないので train_metrics なし、または imitation 由来のみ
+        tm = result.get("train_metrics")
+        if tm is not None:
+            assert "ppo_diag" not in tm
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        learner_stats = summary.get("phase_stats", {}).get("learner", {})
+        assert "ppo_diag" not in learner_stats

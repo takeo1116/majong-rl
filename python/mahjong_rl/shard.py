@@ -43,6 +43,7 @@ class LearningSample:
     step_id: int = 0
     player_id: int = 0
     actor_type: str = "policy"  # "policy" or "baseline"
+    teacher_best_mask: np.ndarray | None = None  # (34,) float32, 教師最良候補集合 (CQ-0125)
 
 
 def validate_metadata(sample: LearningSample) -> None:
@@ -165,6 +166,15 @@ class ShardWriter:
             "actor_type": [s.actor_type for s in self._buffer],
         }
 
+        # teacher_best_mask: 1つでも非 None があればカラム書き出し (CQ-0125)
+        if any(s.teacher_best_mask is not None for s in self._buffer):
+            data["teacher_best_mask"] = [
+                s.teacher_best_mask.astype(np.float32).tobytes()
+                if s.teacher_best_mask is not None
+                else np.zeros(34, dtype=np.float32).tobytes()
+                for s in self._buffer
+            ]
+
         self._backend.write(data, path)
         self._buffer.clear()
         self._shard_counter += 1
@@ -249,6 +259,11 @@ class ShardReader:
         all_values = []
         all_terminateds = []
         all_actor_types = []
+        all_teacher_best_masks: list[np.ndarray | None] = []
+        has_teacher_best_mask = False
+        # CQ-0128: shard ごとの teacher_best_mask 有無カウント
+        tbm_shard_count = 0
+        tbm_shard_total = 0
 
         for path in self._find_shards():
             table = self._backend.read(path)
@@ -272,6 +287,18 @@ class ShardReader:
             else:
                 all_actor_types.extend(["policy"] * n)
 
+            # teacher_best_mask (CQ-0125): カラム存在時のみ読み込み
+            tbm_shard_total += 1
+            if "teacher_best_mask" in table.column_names:
+                has_teacher_best_mask = True
+                tbm_shard_count += 1
+                for i in range(n):
+                    tbm_bytes = table.column("teacher_best_mask")[i].as_py()
+                    tbm = np.frombuffer(tbm_bytes, dtype=np.float32).copy()
+                    all_teacher_best_masks.append(tbm)
+            else:
+                all_teacher_best_masks.extend([None] * n)
+
         if not all_obs:
             return {
                 "observations": np.zeros((0, 0), dtype=np.float32),
@@ -282,6 +309,8 @@ class ShardReader:
                 "values": np.zeros(0, dtype=np.float32),
                 "terminateds": np.zeros(0, dtype=bool),
                 "actor_types": np.array([], dtype=object),
+                "teacher_best_masks": None,
+                "teacher_best_mask_shard_info": {"available": 0, "total": 0},
             }
 
         result = {
@@ -295,8 +324,23 @@ class ShardReader:
             "actor_types": np.array(all_actor_types, dtype=object),
         }
 
+        # teacher_best_masks (CQ-0125): 全 shard にカラムがある場合のみ配列化
+        if has_teacher_best_mask and all(m is not None for m in all_teacher_best_masks):
+            result["teacher_best_masks"] = np.stack(all_teacher_best_masks)
+        else:
+            result["teacher_best_masks"] = None
+        # CQ-0128: shard ごとの有無情報
+        result["teacher_best_mask_shard_info"] = {
+            "available": tbm_shard_count,
+            "total": tbm_shard_total,
+        }
+
         if filter_actor_type is not None:
-            mask = result["actor_types"] == filter_actor_type
-            result = {k: v[mask] for k, v in result.items()}
+            actor_mask = result["actor_types"] == filter_actor_type
+            tbm = result.pop("teacher_best_masks")
+            shard_info = result.pop("teacher_best_mask_shard_info")
+            result = {k: v[actor_mask] for k, v in result.items()}
+            result["teacher_best_masks"] = tbm[actor_mask] if tbm is not None else None
+            result["teacher_best_mask_shard_info"] = shard_info
 
         return result

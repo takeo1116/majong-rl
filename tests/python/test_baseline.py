@@ -168,6 +168,99 @@ class TestRuleBasedBaseline:
         assert result in (31, 33)
 
 
+@pytest.mark.smoke
+class TestBestSetDiscard:
+    """select_discard_with_best_set テスト (CQ-0126)"""
+
+    def test_best_set_includes_action(self):
+        """戻り action が best_mask に含まれる"""
+        baseline = RuleBasedBaseline()
+        # 1m×4 2m×4 3m×4 4m×2 = 14枚
+        hand = list(range(4)) + list(range(4, 8)) + list(range(8, 12)) + [12, 13]
+        mask = np.zeros(34, dtype=np.float32)
+        mask[0] = 1.0; mask[1] = 1.0; mask[2] = 1.0; mask[3] = 1.0
+        action, best_mask = baseline.select_discard_with_best_set(hand, mask)
+        assert best_mask[action] == 1.0
+        assert best_mask.sum() >= 1.0
+
+    def test_consistent_with_select_discard(self):
+        """select_discard と同じ action を返す"""
+        baseline = RuleBasedBaseline()
+        # テンパイ手 + 孤立牌
+        hand = []
+        for t in range(9):
+            hand.append(t * 4)
+        hand.append(27 * 4); hand.append(27 * 4 + 1)
+        hand.append(31 * 4); hand.append(33 * 4)
+        mask = np.zeros(34, dtype=np.float32)
+        for tid in hand:
+            mask[tid // 4] = 1.0
+        action1 = baseline.select_discard(hand, mask)
+        action2, best_mask = baseline.select_discard_with_best_set(hand, mask)
+        assert action1 == action2
+        assert best_mask[action1] == 1.0
+
+    def test_tie_produces_multiple_candidates(self):
+        """同率候補が複数存在する手牌で best_mask.sum() > 1"""
+        baseline = RuleBasedBaseline()
+        # 1m2m3m 4p5p6p 7s8s9s 東東 + 南 + 北 = 14枚
+        # 南と北は同等の浮き牌 → 同率候補
+        hand = []
+        for t in [0, 1, 2, 12, 13, 14, 24, 25, 26]:
+            hand.append(t * 4)
+        hand.append(27 * 4); hand.append(27 * 4 + 1)
+        hand.append(28 * 4); hand.append(30 * 4)
+        mask = np.zeros(34, dtype=np.float32)
+        for tid in hand:
+            mask[tid // 4] = 1.0
+        action, best_mask = baseline.select_discard_with_best_set(hand, mask)
+        # 南(28) と 北(30) は同率最良候補
+        assert best_mask[28] == 1.0 and best_mask[30] == 1.0
+        assert best_mask.sum() >= 2.0
+
+
+@pytest.mark.smoke
+class TestDefinitionConsistency:
+    """評価規則の定義一致と fast path 検証 (CQ-0128, CQ-0129)"""
+
+    def test_select_discard_consistent_with_best_set(self):
+        """select_discard (fast path) と select_discard_with_best_set が同じ action を返す"""
+        baseline = RuleBasedBaseline()
+        patterns = [
+            # 1m×4 2m×4 3m×4 4m×2
+            (list(range(4)) + list(range(4, 8)) + list(range(8, 12)) + [12, 13],
+             [0, 1, 2, 3]),
+            # メンツ3組 + 雀頭 + 浮き牌2枚 (14枚)
+            ([0*4, 1*4, 2*4, 12*4, 13*4, 14*4, 24*4, 25*4, 26*4, 27*4, 27*4+1, 28*4, 30*4, 31*4],
+             None),
+        ]
+        for hand, legal_types in patterns:
+            mask = np.zeros(34, dtype=np.float32)
+            if legal_types is not None:
+                for t in legal_types:
+                    mask[t] = 1.0
+            else:
+                for tid in hand:
+                    mask[tid // 4] = 1.0
+            action1 = baseline.select_discard(hand, mask)
+            action2, best_mask = baseline.select_discard_with_best_set(hand, mask)
+            assert action1 == action2, f"select_discard と best_set が不一致: {action1} != {action2}"
+            assert best_mask[action1] == 1.0
+
+    def test_fast_path_skips_best_set_collection(self):
+        """select_discard は select_discard_with_best_set を呼ばない (CQ-0129)"""
+        from unittest.mock import patch
+        baseline = RuleBasedBaseline()
+        hand = list(range(4)) + list(range(4, 8)) + list(range(8, 12)) + [12, 13]
+        mask = np.zeros(34, dtype=np.float32)
+        mask[0] = 1.0; mask[1] = 1.0; mask[2] = 1.0; mask[3] = 1.0
+
+        with patch.object(baseline, 'select_discard_with_best_set',
+                          wraps=baseline.select_discard_with_best_set) as mock:
+            baseline.select_discard(hand, mask)
+            mock.assert_not_called()
+
+
 @pytest.mark.slow
 class TestBaselineOnStage1:
     """Stage1Env 上でのベースライン動作テスト"""

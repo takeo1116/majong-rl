@@ -334,3 +334,115 @@ class TestShardReaderSubdirectory:
         reader = ShardReader(tmp_path)
         tensors = reader.read_as_tensors()
         assert tensors["observations"].shape[0] == 5
+
+
+@pytest.mark.smoke
+class TestTeacherBestMask:
+    """teacher_best_mask の shard roundtrip テスト (CQ-0126)"""
+
+    def test_roundtrip_teacher_best_mask(self, tmp_path: Path):
+        """teacher_best_mask の書き出し → 読み込みが一致する"""
+        sample = _make_sample()
+        sample.teacher_best_mask = np.zeros(34, dtype=np.float32)
+        sample.teacher_best_mask[5] = 1.0
+        sample.teacher_best_mask[10] = 1.0
+
+        writer = ShardWriter(tmp_path, max_samples=100)
+        writer.add(sample)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["teacher_best_masks"] is not None
+        assert data["teacher_best_masks"].shape == (1, 34)
+        assert data["teacher_best_masks"][0, 5] == 1.0
+        assert data["teacher_best_masks"][0, 10] == 1.0
+
+    def test_missing_teacher_best_mask_backward_compat(self, tmp_path: Path):
+        """teacher_best_mask なしの旧 shard で None が返る"""
+        sample = _make_sample()
+        assert sample.teacher_best_mask is None
+
+        writer = ShardWriter(tmp_path, max_samples=100)
+        writer.add(sample)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["teacher_best_masks"] is None
+
+    def test_filter_preserves_teacher_best_mask(self, tmp_path: Path):
+        """filter_actor_type 適用時も teacher_best_masks が正しくフィルタされる"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        for i in range(4):
+            s = _make_sample(step_id=i)
+            s.actor_type = "baseline" if i % 2 == 0 else "policy"
+            s.teacher_best_mask = np.zeros(34, dtype=np.float32)
+            s.teacher_best_mask[i] = 1.0
+            writer.add(s)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors(filter_actor_type="baseline")
+        assert data["teacher_best_masks"] is not None
+        assert data["teacher_best_masks"].shape[0] == 2
+        assert data["teacher_best_masks"][0, 0] == 1.0
+        assert data["teacher_best_masks"][1, 2] == 1.0
+
+    def test_shard_info_all_have_mask(self, tmp_path: Path):
+        """全 shard に teacher_best_mask がある場合の shard_info (CQ-0128)"""
+        sample = _make_sample()
+        sample.teacher_best_mask = np.zeros(34, dtype=np.float32)
+        sample.teacher_best_mask[0] = 1.0
+
+        writer = ShardWriter(tmp_path, max_samples=100)
+        writer.add(sample)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        info = data["teacher_best_mask_shard_info"]
+        assert info["available"] == 1
+        assert info["total"] == 1
+
+    def test_shard_info_none_have_mask(self, tmp_path: Path):
+        """全 shard に teacher_best_mask がない場合の shard_info (CQ-0128)"""
+        sample = _make_sample()
+        assert sample.teacher_best_mask is None
+
+        writer = ShardWriter(tmp_path, max_samples=100)
+        writer.add(sample)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        info = data["teacher_best_mask_shard_info"]
+        assert info["available"] == 0
+        assert info["total"] == 1
+        assert data["teacher_best_masks"] is None
+
+    def test_shard_info_mixed_shards(self, tmp_path: Path):
+        """新旧混在 shard で shard_info が混在を検出する (CQ-0128)"""
+        # shard_0000: teacher_best_mask あり
+        writer1 = ShardWriter(tmp_path, max_samples=1)
+        s1 = _make_sample(step_id=0)
+        s1.teacher_best_mask = np.zeros(34, dtype=np.float32)
+        s1.teacher_best_mask[0] = 1.0
+        writer1.add(s1)
+        writer1.close()
+
+        # shard_0001: teacher_best_mask なし（旧形式）
+        writer2 = ShardWriter(tmp_path, max_samples=1)
+        writer2._shard_counter = 1  # shard_0001 として書き出す
+        s2 = _make_sample(step_id=1)
+        s2.shard_id = "shard_0001"
+        writer2.add(s2)
+        writer2.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        info = data["teacher_best_mask_shard_info"]
+        assert info["available"] == 1
+        assert info["total"] == 2
+        # 混在時は teacher_best_masks は None（全 shard 揃わないため）
+        assert data["teacher_best_masks"] is None

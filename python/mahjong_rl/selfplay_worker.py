@@ -142,6 +142,7 @@ class SelfPlayWorker:
             current = env.current_player
             mask = env.get_legal_mask()
 
+            teacher_best_mask = None  # CQ-0125: baseline 席のみ非 None
             if seat_is_policy[current]:
                 # ポリシー席: action 選択前の観測を保存用にエンコード
                 pre_features = self._encoder.encode(obs)
@@ -149,7 +150,7 @@ class SelfPlayWorker:
                 tile_type, log_prob, value = self._policy_step(obs, mask)
             else:
                 # ベースライン席: ルールベースで選択
-                tile_type = self._baseline_step(env, mask)
+                tile_type, teacher_best_mask = self._baseline_step(env, mask)
                 log_prob = 0.0
                 value = 0.0
                 # baseline 保存が有効なら観測をエンコード
@@ -213,6 +214,7 @@ class SelfPlayWorker:
                     step_id=sample_step,
                     player_id=current,
                     actor_type=actor_type,
+                    teacher_best_mask=teacher_best_mask if actor_type == "baseline" else None,
                 )
                 self._writer.add(sample)
                 sample_step += 1
@@ -248,10 +250,21 @@ class SelfPlayWorker:
 
         return tile_type, float(log_prob.item()), value
 
-    def _baseline_step(self, env: Stage1Env, mask: np.ndarray) -> int:
-        """ベースラインで打牌を選択する"""
-        hand = env.env_state.round_state.players[env.current_player].hand
-        return self._baseline.select_discard(list(hand), mask)
+    def _baseline_step(
+        self, env: Stage1Env, mask: np.ndarray,
+    ) -> tuple[int, np.ndarray | None]:
+        """ベースラインで打牌を選択する (CQ-0125: best_set 対応)
+
+        Returns:
+            (tile_type, teacher_best_mask):
+              teacher_best_mask は save_baseline_actions=True 時のみ非 None
+        """
+        hand = list(env.env_state.round_state.players[env.current_player].hand)
+        if self._save_baseline_actions:
+            tile_type, best_mask = self._baseline.select_discard_with_best_set(
+                hand, mask)
+            return tile_type, best_mask
+        return self._baseline.select_discard(hand, mask), None
 
     def _write_round_results(self) -> None:
         """round_results.jsonl を出力する (CQ-0105)"""

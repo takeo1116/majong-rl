@@ -841,6 +841,21 @@ class Stage1Runner:
         )
         learner.save_checkpoint(tag="imitation")
         logger.info(f"  imitation loss: {metrics['policy_loss']:.4f}")
+        # 教師再現メトリクス (CQ-0125, CQ-0128)
+        top1 = metrics.get("teacher_top1_match_rate")
+        best_set = metrics.get("teacher_best_set_hit_rate")
+        if top1 is not None:
+            msg = f"  teacher_top1_match_rate: {top1:.4f}"
+            if best_set is not None:
+                msg += f", teacher_best_set_hit_rate: {best_set:.4f}"
+            logger.info(msg)
+        tbm_status = metrics.get("teacher_best_set_status")
+        if tbm_status is not None:
+            logger.info(f"  teacher_best_set_status: {tbm_status}")
+        # CQ-0132: loss mode ログ
+        loss_mode = metrics.get("imitation_loss_mode")
+        if loss_mode is not None:
+            logger.info(f"  imitation_loss_mode: {loss_mode}")
         # データ生成統計を学習 metrics に付加
         metrics["data_generation"] = {
             "total_steps": sp_stats.get("total_steps", 0),
@@ -1491,6 +1506,13 @@ class Stage1Runner:
                 "policy_loss": imi.get("policy_loss"),
                 "num_workers": dg.get("num_workers", 1),
                 "seed_strategy": dg.get("seed_strategy"),
+                # 教師再現メトリクス (CQ-0125, CQ-0128)
+                "teacher_top1_match_rate": imi.get("teacher_top1_match_rate"),
+                "teacher_best_set_hit_rate": imi.get("teacher_best_set_hit_rate"),
+                "teacher_best_set_status": imi.get("teacher_best_set_status"),
+                "teacher_best_mask_shard_info": imi.get("teacher_best_mask_shard_info"),
+                # CQ-0132: loss mode 追跡
+                "imitation_loss_mode": imi.get("imitation_loss_mode"),
             }
         if "train_metrics" in result:
             tm = result["train_metrics"]
@@ -1501,6 +1523,10 @@ class Stage1Runner:
                 "value_loss": tm.get("value_loss"),
                 "mode": tm.get("mode"),
             }
+            # CQ-0135: PPO 診断統計を phase_stats に転記
+            ppo_diag = tm.get("ppo_diag")
+            if ppo_diag is not None:
+                phase_stats["learner"]["ppo_diag"] = ppo_diag
         if "eval_metrics" in result:
             em = result["eval_metrics"]
             phase_stats["eval"] = {
@@ -1979,6 +2005,35 @@ class Stage1Runner:
         if dg.get("num_workers", 1) > 1:
             lines.append(f"- imitation: num_workers={dg['num_workers']}, "
                          f"seed_strategy={dg.get('seed_strategy', {}).get('method', '?')}")
+
+        # imitation 教師再現メトリクス (CQ-0127, CQ-0128)
+        imi_top1 = imi.get("teacher_top1_match_rate")
+        imi_best_set = imi.get("teacher_best_set_hit_rate")
+        if imi_top1 is not None:
+            line = f"- imitation teacher_top1_match_rate: {imi_top1:.4f}"
+            if imi_best_set is not None:
+                line += f", teacher_best_set_hit_rate: {imi_best_set:.4f}"
+            lines.append(line)
+        # CQ-0128: teacher_best_set_status
+        tbm_status = imi.get("teacher_best_set_status")
+        if tbm_status is not None:
+            tbm_info = imi.get("teacher_best_mask_shard_info", {})
+            line = f"- imitation teacher_best_set_status: {tbm_status}"
+            if tbm_info:
+                line += f" (shards: {tbm_info.get('available', 0)}/{tbm_info.get('total', 0)})"
+            lines.append(line)
+        # CQ-0132: loss mode
+        imi_loss_mode = imi.get("imitation_loss_mode")
+        if imi_loss_mode is not None:
+            lines.append(f"- imitation loss_mode: {imi_loss_mode}")
+
+        # CQ-0135: PPO 診断統計サマリ
+        tm = result.get("train_metrics", {})
+        ppo_diag = tm.get("ppo_diag")
+        if ppo_diag:
+            lines.append(f"- ppo_diag: advantage_mean={ppo_diag.get('advantage_mean', '?'):.4f}, "
+                         f"clip_fraction={ppo_diag.get('clip_fraction', '?'):.4f}, "
+                         f"ratio_mean={ppo_diag.get('ratio_mean', '?'):.4f}")
 
         # phase duration
         pt = result.get("phase_timing", {})
