@@ -1,197 +1,114 @@
-# RL_SPEC.md - 学習システム実装仕様
+# RL_SPEC.md
 
-この文書は、このプロジェクトにおける **強化学習・探索・実験基盤の実装仕様** を定義する。  
-学習方針・研究方針は `RL_RULE.md` に定義し、この文書はそれをどのように実装するかを定義する。
+この文書は、このプロジェクトにおける **学習基盤・評価基盤・実験基盤の長期実装仕様** を定義する。  
+日常の実験判断や優先順位は [PROJECT.md](/home/takeo1116/Git/majong-rl/docs/PROJECT.md) を正とし、個別実験の条件と結果は `experiments/exp_xxx/runbook.md` / `report.md` を正とする。  
+本書はそれらの土台になる **RL システムの設計基準** を扱う。
 
-**学習システム実装と最終的に一致していなければならない正本はこの `RL_SPEC.md` とする。**  
-`RL_RULE.md` と矛盾がある場合は、両者を更新して整合させること。
-
-ゲームルールそのものは `GAME_RULE.md`、ゲームエンジンの実装仕様は `GAME_SPEC.md` を参照する。
+ゲームルールそのものは `GAME_RULE.md`、ゲームエンジン仕様は `GAME_SPEC.md`、研究上の方針は `RL_RULE.md` を参照する。
 
 ---
 
-## 1. 目的
+## 1. この文書の役割
 
-本システムは、日本式リーチ麻雀ゲームエンジンの上で動作する **学習・探索・評価・実験管理基盤** を提供する。  
-主目的は以下のとおりである。
+この文書の用途は次の3つに限定する。
 
-1. Stage 1 から Stage 3 まで段階的に学習可能な構造を提供する
-2. FullObservation / PartialObservation の両実験を比較可能にする
-3. self-play、評価対戦、探索、記録、再現を一貫して扱えるようにする
-4. Python による学習と、将来の C++ 高速推論を両立できる構造を提供する
-5. モデル、特徴量、報酬、実験設定を複数保持し、比較可能な研究基盤とする
+1. RL 基盤を変更する CQ の設計基準にする  
+2. 現在実装済みの学習・評価・実験基盤の境界を明確にする  
+3. 将来拡張時に、どこまでが現仕様でどこからが構想かを分けて記録する  
 
----
-
-## 2. スコープ
-
-## 2.1 初期実装対象
-初期実装では、少なくとも以下を対象とする。
-
-- Stage 1 (DiscardOnly) の学習基盤
-- Python + PyTorch による learner
-- C++ ゲームエンジンの Python 呼び出し
-- FullObservation / PartialObservation 両対応の Observation 入口
-- Observation と FeatureEncoder の分離
-- `DiscardPolicy` 中心の policy-value 学習
-- replay 用データ保存
-- shard file による self-play データ永続化
-- 実験設定 YAML
-- 実験ディレクトリ管理
-- checkpoint / metrics / notes 管理
-- 評価対戦基盤
-- 将来の ONNX export を妨げないモデル設計
-
-## 2.2 初期実装の非対象
-初期段階では以下を必須としない。
-
-- 完全行動学習
-- 分散 learner
-- 高度な league training
-- 本格 MCTS 併用学習
-- ONNX Runtime による本番推論実装
-- GUI ベースの実験管理
-- 大規模 MLOps 基盤
-- クラウド依存のジョブ管理
-
-## 2.3 並列化の初回スコープと非対象
-
-初回の並列化実装は **単機 multi-process** に限定する。以下は初回スコープ外とする。
-
-- learner の分散化（複数 GPU / 複数ノード）
-- 非同期 actor-learner パイプライン
-- ノード間通信管理
-- 障害復旧・再実行制御
-- 高度な動的負荷分散
-
-ただし、将来的に複数サーバへの拡張を妨げない設計（プロセス間で共有メモリに依存しない、file-based model 受け渡し等）を維持する。
+この文書は「今すぐ実験でどう動くか」を毎回説明する文書ではない。  
+その役割は `PROJECT.md` と各 runbook/report が担う。
 
 ---
 
-## 3. 参照文書
+## 2. 文書の読み方
 
-- `GAME_RULE.md`
-- `GAME_SPEC.md`
-- `RL_RULE.md`
-- `CHANGE_QUEUE.md`
+本書では内容を次の2層に分ける。
+
+- **現仕様**
+  - 現在のコードベースで成立している実装仕様
+  - レビュー時に「実装とズレていないか」を確認する対象
+- **将来案**
+  - まだ未実装だが、今後の設計余地として維持したい方向
+  - 現実装への適用を前提に読まない
+
+実装修正を伴う議論では、まず現仕様を優先し、将来案は必要なときだけ参照する。
 
 ---
 
-## 4. システム全体構成
+## 3. スコープ
 
-学習システムは少なくとも以下の層に分ける。
+### 3.1 この文書が扱うもの
+
+- observation / feature / model の境界
+- self-play / imitation / learner / evaluation の責務
+- shard / checkpoint / summary / batch_summary の成果物仕様
+- 実験設定と run 成果物の最低限の追跡仕様
+- 現在の Stage 1 学習基盤
+
+### 3.2 この文書が主対象にしないもの
+
+- ゲームルールの細部
+- 実験優先順位そのもの
+- 個別のハイパラ採否
+- GUI / MLOps / クラウド運用
+
+---
+
+## 4. 現在地の要約
+
+2026-03-08 時点の RL 基盤は次の段階にある。
+
+- Stage 1（DiscardOnly）の学習基盤は成立
+- imitation / self-play / PPO / evaluation / batch 集約 / phase 再利用 / resume は実装済み
+- `shanten_hint`、`teacher_best_mask`、`tie_aware_best_set`、`ppo_diag` などの診断補助は実装済み
+- 現在の主要課題は **PPO が imitation 初期方策を平均的に悪化させること**
+
+したがって本書は、学習基盤の「立ち上げ仕様」ではなく、  
+**診断と拡張に耐える基盤仕様** として維持する。
+
+---
+
+## 5. システム全体構成
+
+学習システムは次の層に分ける。
 
 1. **Game Engine Layer (C++)**
    - 対局進行
    - 合法手列挙
    - 観測生成
-   - 状態複製
-   - determinization 補助
-
+   - 精算・reward 計算
 2. **Binding Layer**
-   - Python から C++ Environment を呼ぶための境界
-   - pybind11 等を想定
-
+   - Python から C++ の環境を呼び出す境界
 3. **Training Layer (Python)**
    - FeatureEncoder
    - Model
-   - Policy/Value 学習
-   - replay / shard 読み込み
-   - optimizer / scheduler
-
+   - Imitation / PPO learner
+   - shard 読み込み
 4. **Self-Play / Evaluation Layer**
    - self-play worker
    - baseline 対戦
-   - checkpoint 評価
-   - metrics 集計
-
+   - rotation evaluation
+   - 集計
 5. **Experiment Management Layer**
-   - YAML 設定
-   - run ディレクトリ
-   - checkpoint 保存
-   - notes / metrics / eval 結果管理
+   - YAML config
+   - run directory
+   - checkpoint / metrics / notes / summary
+   - batch_summary / batch_table
+
+責務の原則:
+
+- ゲーム進行・精算は C++
+- 学習・集計・実験運用は Python
+- observation / feature / model / action selection を密結合にしない
 
 ---
 
-## 5. 学習対象の抽象化
+## 6. 現仕様: 学習対象
 
-## 5.1 Policy 分割
+### 6.1 Stage 1 の正式対象
 
-行動種別の性質が異なるため、policy は分割可能な設計とする。
-
-最低限、以下の抽象単位を想定する。
-
-- `DiscardPolicy`
-- `CallPolicy`
-- `RiichiPolicy`
-- `WinPolicy`
-- 必要に応じて `AbortiveDrawPolicy`
-
-## 5.2 初期実装対象
-- 初期実装で学習対象とするのは `DiscardPolicy` のみ
-- 他の policy は未実装、または固定ルール / ルールベース処理とする
-
-## 5.3 Action 抽象
-学習側では、エンジンの `Action` をそのまま扱うのではなく、  
-各 policy に対応した **学習対象 action 空間** を持てるようにする。
-
-例:
-- `DiscardPolicyAction`
-- 将来の `CallPolicyAction`
-
----
-
-## 6. Observation / FeatureEncoder / Model の分離
-
-## 6.1 原則
-Observation と Feature 表現と Model を密結合にしてはならない。  
-最低限、以下の責務分離を持つ。
-
-- **Observation**: エンジン由来のモデル非依存情報
-- **FeatureEncoder**: Observation をモデル入力へ変換
-- **Model**: 入力特徴量から policy/value を推論
-- **ActionSelector**: policy 出力と legal mask から行動選択
-
-## 6.2 Observation
-Observation は `GAME_SPEC.md` に定義された `PartialObservation` / `FullObservation` を利用する。  
-学習システムは両方を受け取れること。
-
-## 6.3 FeatureEncoder
-FeatureEncoder は差し替え可能にする。
-最低限、以下を想定する。
-
-- `FlatFeatureEncoder`
-- `ChannelTensorEncoder`
-
-将来的には以下を追加可能とする。
-
-- `TokenSequenceEncoder`
-- `HybridFeatureEncoder`
-
-### 6.3.1 FlatFeatureEncoder のオプション特徴量
-
-#### delta_shanten_sign (shanten_hint)
-
-`feature_encoder.shanten_hint.enabled: true` で有効化。既定は `false`。
-有効時、特徴ベクトル末尾に `delta_shanten_sign[34]` を追加する（+34次元）。
-
-- 各打牌候補 t (0〜33) について、手牌から t を1枚除いた場合のシャンテン数変化を符号化する
-- `base = compute_shanten(手牌)`, `after = compute_shanten(手牌 - t)`, `delta = base - after`
-- `0.0`: 維持（最適打牌候補）または手牌に存在しない牌種
-- `-1.0`: 悪化（シャンテン数が増加する打牌）
-- `+1.0`: 定義上は改善だが、`shanten(n枚) <= shanten(n-1枚)` の数学的性質により **現行の discard 評価では発生しない**
-
-この「+1 非発生」は shanten 関数の単調性に由来する。
-将来 draw 評価やツモ牌選択など異なる文脈で同関数を流用する場合は再検討が必要。
-
-## 6.4 Model
-Model は FeatureEncoder 出力に依存してよいが、Observation に直接依存しないこと。
-
----
-
-## 7. Stage 1 の正式学習対象
-
-Stage 1 では以下を固定する。
+現在の正式対象は **DiscardOnly** である。
 
 - 学習対象行動: 自摸直後の打牌のみ
 - 副露なし
@@ -200,566 +117,519 @@ Stage 1 では以下を固定する。
 - 九種九牌なし
 - 通常流局あり
 
-学習システムは、この制約付き対局を扱えること。
+### 6.2 Policy 抽象
+
+将来的には policy を分割可能とする。
+
+- `DiscardPolicy`
+- `CallPolicy`
+- `RiichiPolicy`
+- `WinPolicy`
+
+ただし現仕様で学習しているのは `DiscardPolicy` のみ。
 
 ---
 
-## 8. Observation モード
+## 7. 現仕様: Observation / Feature / Model
 
-## 8.1 対応モード
-少なくとも以下の Observation モードをサポートする。
+### 7.1 原則
+
+Observation、Feature 表現、Model は分離する。
+
+- **Observation**: エンジン由来のモデル非依存情報
+- **FeatureEncoder**: Observation をモデル入力へ変換
+- **Model**: 特徴量から policy / value を出力
+- **ActionSelector**: legal mask を適用して行動を選ぶ
+
+### 7.2 Observation モード
+
+現仕様で扱う observation mode:
 
 - `full`
 - `partial`
 
-## 8.2 推奨開始点
-推奨開始点は `full` とする。  
-ただし `partial` 実験も同一システム上で切り替え可能であること。
+運用上の主系は `full`。  
+`partial` は比較・将来拡張のために維持する。
 
-## 8.3 FullObservation の利用目的
-- 学習基盤の立ち上げ
-- 上限比較
-- teacher 学習
-- 蒸留
+### 7.3 FeatureEncoder
 
-## 8.4 PartialObservation の利用目的
-- 実戦想定学習
-- 不完全情報下の評価
-- 最終 deployment 対応
+現仕様で利用可能:
 
----
+- `FlatFeatureEncoder`
+- `ChannelTensorEncoder`
 
-## 9. Feature 表現仕様
+ただし現在の主力実験は `FlatFeatureEncoder`。
 
-## 9.1 基本方針
-Feature 表現は model ごとに差し替え可能とする。  
-ただし、最低限の共通仕様を持つ。
+#### 7.3.1 FlatFeatureEncoder のオプション特徴量
 
-## 9.2 初期対応形式
-### 9.2.1 Flat Feature
-- フラットな固定長数値ベクトル
-- 手牌、河、副露、点数、局情報などを平坦化する
-- MLP 系向け
+`feature_encoder.shanten_hint.enabled=true` で `delta_shanten_sign[34]` を追加できる。
 
-### 9.2.2 Channel Tensor
-- チャネル分割した固定テンソル
-- 牌種情報、河、ドラ、局情報等をチャネル化する
-- CNN 系向け
+現仕様:
 
-## 9.3 将来形式
-- TokenSequence
-- Hybrid
+- 各打牌候補について、打牌後シャンテン変化の符号を補助特徴として持つ
+- 既定は `false`
+- feature off 時は既存入力次元を維持する
 
-## 9.4 legal mask
-Feature とは別に、合法打牌マスクを扱えること。  
-Stage 1 では 34 種打牌ロジットに対する legal mask を標準とする。
+現運用上の注意:
 
----
+- これはあくまで補助特徴であり、教師方策そのものを直接埋め込むものではない
+- 比較実験では on/off を config 上で明示的に追跡する
 
-## 10. モデル仕様
+### 7.4 Model
 
-## 10.1 初期 policy head
-Stage 1 の初期推奨実装は以下とする。
-
-- **34 種牌ロジット出力**
-- **legal mask による実行可能打牌への射影**
-
-ただし将来の action scoring へ拡張可能な抽象化を持つこと。
-
-## 10.2 初期 value head
-value head は最初から持つ。  
-複数 value head を追加可能な設計とする。
-
-初期推奨:
-- 局点差 value
-- 半荘最終収支 value
-
-将来的に追加可能:
-- 半荘順位 value
-
-## 10.3 モデル候補
-初期候補として以下を想定する。
+現仕様での主系:
 
 - `MLPPolicyValueModel`
-- `CNNPolicyValueModel`
+- FullObservation + FlatFeatureEncoder + MLP
 
-## 10.4 ONNX 配慮
-モデルは将来 ONNX export 可能であることを推奨する。  
-極端に特殊な演算や export 困難な構造へ依存しすぎないこと。
+現在の標準的な value head は:
 
----
+- `round_delta`
 
-## 11. ActionSelector
-
-## 11.1 責務
-ActionSelector は、policy 出力と legal mask から実際の行動を決定する。
-
-## 11.2 Stage 1
-Stage 1 では少なくとも以下を扱う。
-
-- argmax 選択
-- サンプリング選択
-- 探索ノイズ付き選択（任意）
-
-## 11.3 将来拡張
-将来は以下も扱えるようにする。
-
-- MCTS 由来の policy 分布
-- temperature 制御
-- evaluation / training 切り替え
+複数 value head を許容する設計だが、日常実験の主系はまだ単一 head 前提に近い。
 
 ---
 
-## 12. 学習データ仕様
+## 8. 現仕様: Action / legal mask
 
-## 12.1 基本単位
-学習データの基本単位は **ステップサンプル** とする。  
-ただし、局・半荘境界情報を保持する。
+Stage 1 では policy は **34 種の打牌ロジット** を出す。  
+legal mask により、実行可能な打牌へ射影する。
 
-## 12.2 1 サンプルに含める情報
-少なくとも以下を持つ。
+現仕様:
 
-- observation
-- observation_mode
-- feature_encoder_name（必要なら）
-- legal action mask
+- action space は牌種ベース
+- 実際の `Action` との対応付けは env / selector 側が行う
+- legal mask は feature と分離して扱う
+
+---
+
+## 9. 現仕様: reward
+
+### 9.1 現在の主系 reward
+
+現在の主系 config は次である。
+
+- `reward.type = "point_delta"`
+- `reward.point_delta_scale = 0.0001`
+
+意味:
+
+- 点数変化に比例した reward を返す
+- 学習では scale を掛けた値を用いる
+
+### 9.2 Stage 1 での実際の挙動
+
+運用上の理解としては次の通り。
+
+- 局中の大半の打牌 step の reward は 0
+- 和了 / 放銃 / 流局精算 / リーチ棒支払い / 半荘終了時など、点数変化が起きた step に非ゼロ reward が乗る
+- learner はその系列 reward から GAE を計算して advantage / return を作る
+
+したがって現 reward は、
+**点数変化ベースの sparse な即時報酬**
+として扱うのが正確である。
+
+### 9.3 現仕様での reward 関連の既知課題
+
+- sparse
+- tail が強い
+- 打牌ごとの credit assignment が粗い
+
+これは現在の `PROJECT.md` にある主要診断課題の一つであり、  
+reward 設計変更を伴う CQ ではこの節を起点に議論する。
+
+### 9.4 将来案
+
+将来的には以下を許容する。
+
+- `final_rank`
+- `combined`
+- shaped / intermediate reward
+- reward normalization / clipping の明示仕様
+
+ただし現仕様では主系ではない。
+
+---
+
+## 10. 現仕様: 学習データと shard
+
+### 10.1 基本単位
+
+学習データの基本単位は **step sample**。
+
+1 サンプルは少なくとも次を持つ。
+
+- observation / encoded feature に必要な情報
+- legal mask
 - chosen action
-- policy target（必要なら）
-- immediate reward
-- cumulative / target reward
-- terminal flags
-- actor_id
-- episode_id
-- round_id
-- step_id
-- model_version
-- generation
+- reward
+- log_prob
+- value
+- terminated flag
+- round / episode / worker / seed などの追跡情報
 
-## 12.3 補助情報
-必要に応じて以下も持てる。
+### 10.2 shard 方針
 
-- baseline/opponent type
-- experiment_id
-- run_id
-- timestamp
-- seed
-- notes / tags
+現仕様:
 
----
+- self-play データは file-based shard で保存
+- 保存形式は Parquet
+- learner は shard 群を読んで学習する
 
-## 13. replay buffer
+### 10.3 後方互換
 
-## 13.1 役割
-replay buffer は、self-play で生成された学習サンプルを蓄積し、学習に再利用するための層である。
+shard は列追加に耐える方針を取る。  
+既存 reader / learner を壊さない追加を優先する。
 
-## 13.2 初期方針
-初期標準は **file-based shard を replay 的に利用する方式** とする。  
-メモリ内 ring buffer を主要前提にはしない。
+### 10.4 現在追加済みの補助列
 
-## 13.3 データ利用方針
-- shard ファイル群から必要なサンプルを読み込む
-- シャッフルしてミニバッチを作る
-- recent data を優先する戦略を持てるようにする
+現在の主な追加済み情報:
 
-## 13.4 将来拡張
-必要なら、ローカル検証用にメモリ buffer を追加してよい。
+- `teacher_best_mask`
+- self-play round end 系の補助出力（別ログ / stats）
+
+これらは診断・模倣学習改善のための列であり、既存列の意味は変えない。
 
 ---
 
-## 14. shard file / 永続化仕様
+## 11. 現仕様: Self-Play
 
-## 14.1 基本方針
-self-play データは shard file 単位で保存する。  
-将来の複数 CPU / GPU サーバ運用を見据え、共有ストレージ前提で扱えること。
+### 11.1 役割
 
-## 14.2 保存形式
-保存形式は抽象化する。  
-ただし初期推奨実装は **Parquet** とする。
+Self-Play Worker は対局を生成し、学習サンプルと統計を保存する。
 
-## 14.3 shard の粒度
-- ステップ単位サンプルをまとめて shard に格納する
-- 1 ファイル 1 局や 1 半荘に限定しない
-- shard サイズは設定可能とする
+### 11.2 対戦相手構成
 
-## 14.4 必須メタデータ
-各 shard には少なくとも以下を持たせる。
+現運用では設定可能だが、主系では
 
-- `experiment_id`
-- `run_id`
-- `worker_id`
-- `shard_id`
-- `model_version`
-- `generation`
-- `timestamp`
-- `episode_id`
-- `round_id`
-- `step_id`
+- 学習中 policy
+- ルールベース baseline
 
-## 14.5 スキーマ方針
-スキーマは後方互換を意識する。  
-列追加に比較的耐えられる構造を推奨する。
+の混合を用いる。
 
----
+### 11.3 Stage 1 baseline
 
-## 15. Self-Play Worker 仕様
+現行 baseline の設計意図:
 
-## 15.1 役割
-Self-Play Worker は対局を生成し、学習サンプルを shard file として保存する。
-
-## 15.2 入力
-- game engine interface
-- policy / baseline
-- experiment config
-- self-play config
-- current model version
-
-## 15.3 出力
-- shard files
-- worker logs
-- 生成統計
-
-## 15.4 対戦相手構成
-self-play 相手構成は設定可能とする。  
-推奨初期値:
-
-- 学習中ポリシー: 0.5
-- ルールベースベースライン: 0.5
-
-## 15.5 Stage 1 のルールベースベースライン
-最低要件:
-- シャンテン数最小打牌
-
-推奨目標:
 - シャンテン数最小
 - 同点なら受け入れ最大
 - テンパイ時自動立直
 
-## 15.6 対戦モード
-少なくとも以下を許可する。
+この baseline は imitation 教師と self-play 対戦相手の両方に関与するため、  
+変更時は模倣学習と self-play 分布の双方に影響する。
 
-- policy vs policy
-- policy vs baseline
-- baseline mix
-- checkpoint evaluation mode（将来）
+### 11.4 self-play の可観測性
 
----
+現仕様で run 成果物から確認可能:
 
-## 16. Learner 仕様
+- `policy_wins`
+- `policy_deal_ins`
+- `policy_draws`
+- `tsumo_count`
+- `ron_count`
+- `ryukyoku_count`
+- `num_rounds`
+- `round_results.jsonl`
 
-## 16.1 役割
-Learner は shard data を読み込み、policy-value model を学習し、checkpoint を生成する。
-
-## 16.2 入力
-- experiment config
-- model config
-- reward config
-- training config
-- shard data source
-
-## 16.3 出力
-- checkpoints
-- optimizer states（必要なら）
-- training metrics
-- evaluation summary
-- notes 更新情報
-
-## 16.4 学習アルゴリズム
-アルゴリズムは固定しすぎない。  
-推奨は **PPO 系** とする。  
-初期の軽い imitation / supervised warm start も許可する。
-
-## 16.5 warm start
-Stage 1 では、ルールベース打牌の軽い模倣を少し行った後に self-play へ入る方法を推奨する。
+これらは PPO 改善診断の基礎材料として扱う。
 
 ---
 
-## 17. 評価システム
+## 12. 現仕様: Learner
 
-## 17.1 役割
-評価システムは、checkpoint や実験設定ごとの性能比較を行う。
+### 12.1 役割
 
-## 17.2 主指標
-必ず集計すべき主指標:
+Learner は shard を読み込み、model を更新し、training metrics / checkpoint / summary を出力する。
 
-- 平均順位
-- 平均半荘収支
-- 和了率
-- 放銃率
+### 12.2 現在の主系アルゴリズム
 
-## 17.3 補助指標
-必要に応じて以下を集計する。
+- imitation warm start
+- PPO
 
-- 平均局収支
-- テンパイ率
-- 流局率
-- policy entropy
-- value loss
-- self-play 生成速度
-- プレイアウト速度
-- 学習スループット
+### 12.3 warm start
 
-## 17.4 比較対象
-- ルールベースベースライン
-- 過去 checkpoint
-- Full / Partial
-- 同一設定の別 seed
+現運用では、ルールベース打牌の軽い imitation を先に行い、その後 self-play + PPO に入る構成を標準とする。
 
-### 17.5 Imitation 教師再現メトリクス (CQ-0125)
+### 12.4 現在の既知課題
 
-imitation フェーズ完了後、学習済みモデルの教師再現度を測定する。
+現在の実験上の主要課題:
 
-- `teacher_top1_match_rate`: モデル argmax と教師 action の一致率
-- `teacher_best_set_hit_rate`: モデル argmax が教師最良候補集合に含まれる率
+- imitation 改善は見える
+- しかし PPO 後に平均悪化が起きやすい
 
-教師最良候補集合（tie 定義）:
-RuleBasedBaseline の評価規則（シャンテン最小 → 受け入れ最大）で同率最良となる全合法手の集合。
-shard に `teacher_best_mask[34]` として保存される。
+このため learner は、単なる更新器ではなく **診断対象** でもある。
+
+### 12.5 現仕様で成果物に残る learner 情報
+
+- imitation metrics
+- PPO loss 系
+- `ppo_diag`
+
+`ppo_diag` の主なカテゴリ:
+
+- `advantage_*`
+- `return_*`
+- `old_value_*`
+- `new_value_*`
+- `value_error_*`
+- `ratio_*`
+- `clip_fraction`
 
 出力先:
-- `summary.json.phase_stats.imitation.teacher_top1_match_rate`
-- `summary.json.phase_stats.imitation.teacher_best_set_hit_rate`
-- `batch_summary.json.aggregate.imitation` に集約統計
-- `notes.md` に値記載
 
-定義上 `teacher_best_set_hit_rate >= teacher_top1_match_rate` が成立する。
+- `metrics/train_metrics.json`
+- `summary.json.phase_stats.learner.ppo_diag`
+- `batch_summary.json.runs[].learner_diag`
+- `batch_summary.json.aggregate.learner_diag`
 
-### 17.6 Imitation Loss Mode (CQ-0130)
+### 12.6 現仕様での解釈上の注意
 
-`training.imitation_loss_mode` で模倣学習の損失関数を切り替える。
+- reuse 実験では self-play が共通なので `value_error` など一部統計は条件間で同じになりうる
+- learner 診断統計は「改善そのもの」ではなく「悪化理由の候補切り分け」に使う
 
-| 値 | 説明 |
+---
+
+## 13. 現仕様: imitation 診断
+
+### 13.1 教師再現指標
+
+imitation フェーズ完了後、少なくとも次を出力する。
+
+- `teacher_top1_match_rate`
+- `teacher_best_set_hit_rate`
+
+### 13.2 best-set の定義
+
+教師最良候補集合は、RuleBasedBaseline の評価規則
+
+1. シャンテン最小  
+2. 受け入れ最大  
+
+で同率最良となる全合法手の集合。
+
+### 13.3 imitation loss mode
+
+現仕様で利用可能な mode:
+
+| 値 | 意味 |
 |---|---|
-| `strict_top1`（デフォルト） | 教師 action への cross-entropy loss |
-| `tie_aware_best_set` | `-log(sum_{a in best_set} pi(a))` — 教師最良候補集合全体の確率和を最大化 |
+| `strict_top1` | 教師 action への cross-entropy |
+| `tie_aware_best_set` | `-log(sum_{a in best_set} pi(a))` |
 
-`tie_aware_best_set` は shard に `teacher_best_mask` が含まれている必要がある。
-含まれていない場合はエラーとなる。
+### 13.4 現仕様上の原則
 
-出力先:
-- `summary.json.phase_stats.imitation.imitation_loss_mode`
-- `batch_summary.json.runs[].imitation_metrics.imitation_loss_mode`
-- `batch_table.csv` の `imitation_loss_mode` 列
-- `notes.md` に loss_mode 記載
-
-#### batch 集約の mode 別統計 (CQ-0133, CQ-0134)
-
-`batch_summary.json.aggregate.imitation_by_loss_mode` に loss mode ごとの集約統計を出力する。
-既存の `aggregate.imitation`（全体集約）は維持される。
-
-mode 正規化ルール:
-- `None`・空文字・未設定は `"unknown"` に正規化される
-- `"unknown"` は旧成果物や CQ-0130 以前の run に由来する
-- runbook で strict vs tie-aware を比較する場合、`"unknown"` カテゴリは除外して解釈すること
-
-### 17.7 PPO Learner 診断統計 (CQ-0135)
-
-PPO learner 実行時に、既に計算済みのテンソルから診断統計を抽出し `ppo_diag` として出力する。
-
-出力キー一覧:
-
-| カテゴリ | キー名 | 説明 |
-|---|---|---|
-| advantage | `advantage_mean`, `advantage_std`, `advantage_p50`, `advantage_p90`, `advantage_p99` | 正規化後 advantage の分布統計 |
-| advantage | `advantage_positive_ratio`, `advantage_negative_ratio` | 正/負 advantage の割合 |
-| return | `return_mean`, `return_std`, `return_p50`, `return_p90`, `return_p99` | GAE return の分布統計 |
-| old_value | `old_value_mean`, `old_value_std` | shard 由来の value 推定 |
-| new_value | `new_value_mean`, `new_value_std` | 全 epoch/batch の forward 出力 value の集約 |
-| value_error | `value_error_mean`, `value_error_std`, `value_error_p50`, `value_error_p90`, `value_error_p99` | `old_value - return` の予測誤差 |
-| ratio | `ratio_mean`, `ratio_std`, `ratio_p50`, `ratio_p90`, `ratio_p99` | 全 epoch/batch の importance sampling ratio |
-| clip | `clip_fraction` | `abs(ratio - 1.0) > clip_epsilon` の割合 |
-
-出力先:
-- `metrics/train_metrics.json` の `ppo_diag` キー（詳細）
-- `summary.json.phase_stats.learner.ppo_diag`（主要キー反映）
-- `batch_summary.json.runs[].learner_diag`（per-run 転記, CQ-0137）
-- `batch_summary.json.aggregate.learner_diag`（mean/std 集約, CQ-0137）
-
-imitation モードでは `ppo_diag` は出力されない。
+- strict 経路は既定として維持する
+- tie-aware は追加モードとして扱う
+- shard に必要な補助情報がなければ fail-fast する
 
 ---
 
-## 18. 実験設定仕様
+## 14. 現仕様: 評価
 
-## 18.1 正本
-実験設定の人間可読な正本は YAML とする。
+### 14.1 主指標
 
-## 18.2 初期運用
-初期運用は **1 実験 1 YAML** を推奨する。  
-将来的には base + override へ拡張してよい。
+評価の主指標は次。
 
-## 18.3 設定カテゴリ
-少なくとも以下を設定可能にする。
+- `avg_rank`
+- `avg_score`
+- `win_rate`
+- `deal_in_rate`
 
-- experiment
-- observation
-- feature_encoder
-- model
-- reward
-- selfplay
-- training
-- evaluation
-- export
+### 14.2 評価モード
 
-## 18.4 memo
-YAML 側に memo フィールドを持ってよい。  
-実行時に notes へ転写可能であることを推奨する。
+現仕様で特に重要なのは `rotation`。
+
+rotation では:
+
+- aggregate 結果
+- seat 別結果
+
+を保存する。
+
+### 14.3 `eval_before -> eval`
+
+現在の PPO 比較では、after 指標よりも
+
+- `eval_before`
+- `eval`
+- `eval_diff`
+
+の前後差分が主評価になることが多い。
+
+したがって、reuse を含む運用でも `eval_before` の復元と `eval_diff` の生成は後方互換を壊さず維持する必要がある。
 
 ---
 
-## 19. 実験ディレクトリ仕様
+## 15. 現仕様: 実験設定
 
-## 19.1 基本形式
-実験成果物は run 単位で保存する。  
-推奨ディレクトリ名:
+### 15.1 正本
 
-- `runs/<date>_<name>_<id>/`
+人間可読な正本は YAML。
 
-## 19.2 必須構造
-各 run ディレクトリは少なくとも以下を持てるようにする。
+主要カテゴリ:
+
+- `experiment`
+- `feature_encoder`
+- `model`
+- `reward`
+- `selfplay`
+- `training`
+- `evaluation`
+
+### 15.2 運用上の原則
+
+- 個別実験の具体条件は runbook に書く
+- YAML と CLI override の組み合わせで条件を固定する
+- 実験比較で重要な差分は `summary` / `notes` / `batch_summary` から追跡可能であることを重視する
+
+---
+
+## 16. 現仕様: 実験成果物
+
+### 16.1 run directory
+
+run ごとに少なくとも次を持つ。
 
 - `config.yaml`
+- `summary.json`
 - `notes.md`
-- `checkpoints/`
+- `metrics/`
 - `selfplay/`
 - `eval/`
+- `checkpoints/`
 
-## 19.3 notes
-- `notes.md` は実験ごとに持つ
-- checkpoint 比較ログは別管理でよい
-- YAML memo や主要設定を `notes.md` に転写できることを推奨する
+### 16.2 追跡すべき成果物
 
----
+現在の主な分析対象:
 
-## 20. Python / C++ 境界
+- `summary.json`
+- `metrics/train_metrics.json`
+- `eval/eval_rotation.json`
+- `eval/eval_diff.json`
+- `batch_summary.json`
 
-## 20.1 基本方針
-- ゲームエンジンは C++
-- learner は Python
-- 境界は pybind11 等を前提とする
+### 16.3 phase 再利用
 
-## 20.2 Python から使う最小 API
-少なくとも以下を Python 側から利用可能にすることを想定する。
+現仕様では phase 成果物再利用をサポートする。
 
-- `reset()`
-- `step()`
-- `get_legal_actions()`
-- `make_observation()`
-- 状態複製（必要なら）
-- self-play / evaluation に必要な補助 API
+主な再利用パターン:
 
-## 20.3 責務
-- 対局進行・合法手・精算: C++
-- 学習・optimizer・dataset 管理: Python
+- imitation checkpoint 再利用
+- `imitation,selfplay,eval_before` 再利用
+- phase 単位 resume
 
----
+設計原則:
 
-## 21. Full / Partial 学習と蒸留
-
-## 21.1 位置づけ
-FullObservation と PartialObservation は、同一基盤で比較可能であること。
-
-## 21.2 推奨開始点
-推奨開始点は FullObservation とする。
-
-## 21.3 蒸留
-Stage 2 候補として、**FullObservation teacher → PartialObservation student** を明示的にサポート可能な設計にする。
-
-### 蒸留実験で必要な前提
-- Observation と FeatureEncoder の分離
-- teacher/student の別モデル保持
-- 同一局面から Full / Partial を生成可能
-- 実験設定で teacher/student を識別できること
+- 通常 run を壊さない
+- 再利用時は整合性チェックを行う
+- summary / manifest から再利用元を追える
 
 ---
 
-## 22. モデル交換形式
+## 17. 現仕様: batch 集約
 
-## 22.1 初期
-初期学習は PyTorch モデルを標準とする。
+batch 実行時は、run ごとの主要成果物を集約する。
 
-## 22.2 将来
-将来的な C++ 高速推論の第一候補は **ONNX Runtime** とする。
+少なくとも:
 
-## 22.3 設計上の推奨
-- モデルは ONNX export 可能であることを推奨する
-- ONNX 変換困難な演算への依存を避けすぎなくてよいが、最終的な export を常に意識する
-- 必要なら試作段階で他方式を使ってもよいが、正式仕様上の第一候補は ONNX Runtime とする
+- per-run metrics
+- aggregate mean/std
 
----
+を扱えること。
 
-## 23. 探索基盤との接続
+現時点で特に重要なのは:
 
-## 23.1 役割
-探索は RL システムの一部として扱えるようにするが、初期から MCTS を必須にしない。
+- imitation metrics
+- learner diagnostic metrics
+- eval aggregate metrics
 
-## 23.2 初期探索
-初期探索基盤では少なくとも以下を扱えることを想定する。
-
-- プレイアウト速度計測
-- 候補打牌比較
-- 同一局面再評価の安定性確認
-
-## 23.3 将来
-- MCTS
-- policy prior 利用
-- value 利用
-- search policy distillation
-へ拡張可能であること
+batch 集約は「詳細全部を持つ」よりも、
+**runbook / report で横並び比較できる最小十分なキーを固定する**
+ことを優先する。
 
 ---
 
-## 24. テスト要件
+## 18. 現在の既知課題
 
-## 24.1 unit テスト
-- FeatureEncoder
-- legal mask 整合
-- dataset row 変換
-- reward 計算
-- baseline policy
-- config 読み込み
+2026-03-08 時点の主要な既知課題は次の通り。
 
-## 24.2 integration テスト
-- Python から Environment を呼べる
-- self-play worker が shard を書ける
-- learner が shard を読める
-- checkpoint 保存 / 読込ができる
-- Full / Partial 切り替えが機能する
+1. PPO が imitation 初期方策を平均的に悪化させる  
+2. reward が sparse で tail が強い  
+3. learner が見ている target / advantage / value の質が十分良いか未確定  
+4. 更新強度の調整だけでは問題が解けない可能性が高い  
 
-## 24.3 replay / reproducibility テスト
-- 同一 seed + 同一 config で再現性がある
-- shard メタデータが正しい
-- experiment/run 情報が追跡可能
+この節は `PROJECT.md` の判断と整合すること。  
+詳細な優先順位は `PROJECT.md` に置き、本書では「基盤として意識すべき技術課題」に留める。
 
 ---
 
-## 25. CHANGE_QUEUE 運用
+## 19. テスト要件
 
-RL 側の変更も `CHANGE_QUEUE.md` に統合して管理する。  
-必要に応じて以下の Type を使ってよい。
+### 19.1 最低限必要な層
+
+- unit
+- integration
+- runner / batch 集約
+- reproducibility
+
+### 19.2 診断機能追加時の原則
+
+診断メトリクスや補助列を追加するときは、少なくとも次を満たす。
+
+- 既存 run / shard / summary / batch を壊さない
+- 追加のみで入れる
+- NaN / 欠落 / 型不整合を検知する
+- run 単位と batch 単位の最低限の読取り経路をテストする
+
+### 19.3 実行レーン
+
+テストは、
+
+- 変更に直接関係する targeted test
+- 必要時のみ smoke / broader integration
+
+を原則とする。  
+実験速度を不必要に損なう一律実行は避ける。
+
+---
+
+## 20. CHANGE_QUEUE 運用との関係
+
+RL 基盤の仕様変更は `CHANGE_QUEUE.md` で管理する。
+
+推奨 Type:
 
 - `RL`
 - `Training`
 - `Experiment`
 - `Eval`
 
-ゲームエンジン側と同様に、実装後にレビューし、レビュー完了した CQ は queue から削除する。
+レビュー運用上の原則:
+
+- レビュー NG 時は旧 CQ を削除し、新規 CQ を起票する
+- 仕様変更と実験解釈を混ぜない
+- 本書に関わる変更は、必要なら本書も同期更新する
 
 ---
 
-## 26. TODO
+## 21. 将来案
 
-以下は将来拡張または追加検討項目とする。
+以下は保持したい将来拡張の方向であり、現仕様ではない。
 
-- PartialObservation 本命運用時の特徴量最適化
-- Full → Partial 蒸留の具体方式
-- PPO 以外の学習アルゴリズム比較
-- MCTS 併用学習
-- 分散 learner
-- ONNX Runtime 実推論導入
-- 高速専用バイナリ保存形式
-- token / transformer 系 encoder
-- policy 分割の本格実装
-- league training
-- curriculum 学習
+- PartialObservation 主系化
+- Full → Partial 蒸留
+- CNN / token / transformer 系 encoder
+- 複数 policy の本格分離
+- `final_rank` や `combined` の本格運用
+- shaped reward / curriculum
+- search policy / MCTS 接続
+- async actor-learner / distributed learner
+- ONNX Runtime を使った高速推論運用
+
+将来案を実装対象に昇格させるときは、まず CQ と `PROJECT.md` で優先順位を確定し、その後本書の現仕様へ移す。
 
 ---
+
+## 22. 一文要約
+
+**RL_SPEC.md は、現在の Stage 1 学習基盤を壊さず拡張するための長期設計基準であり、日常の実験判断は PROJECT.md、個別条件は runbook/report を正とする。**
