@@ -1,6 +1,6 @@
 # PROJECT.md
 
-最終更新: 2026-03-08  
+最終更新: 2026-03-10  
 この文書の役割: プロジェクトの大目標・現在地・次アクションを短時間で復元する意思決定ハブ。
 
 ---
@@ -14,7 +14,7 @@
 
 ## 2. 現在地（2026-03-08）
 
-フェーズ: **Stage1後半（診断フェーズ）**
+フェーズ: **Stage1後半（reward shaping 固定後の value/target 診断フェーズ）**
 
 - できている
   - runbook/report/driver 運用、phase 再利用、resume
@@ -24,7 +24,8 @@
   - learner 診断統計（`ppo_diag`）の成果物化
 - 未解決
   - warm start + PPO での平均悪化（`eval_before -> eval`）
-  - 改善阻害要因が「更新強度」か「更新方向/target品質」かの確定
+  - 固定した shaping 条件の下でも、`improve/worsen` 群で advantage の符号が整合しない理由
+  - value/target 側でどこまで説明できるかの確定
 
 ---
 
@@ -32,7 +33,7 @@
 
 現在の主目的は次の1点。
 
-> PPO が imitation 初期方策を壊す理由を、統計で切り分ける。
+> reward shaping 条件を固定し、その後に残る PPO 悪化を value/target 側へ切り分ける。特に、改善打牌/悪化打牌ごとの advantage 整合を回復できるかを見る。
 
 現行固定軸（診断基準点）:
 
@@ -75,6 +76,25 @@
   - baseline（`epochs=4, lr=1e-4`）を維持
   - `epochs=2` は明確に悪化、`lr=5e-5` は learner 診断統計を穏やかにするが主評価では更新できず
   - PPO 悪化の主因は更新強度だけではなく、reward / target 品質側も疑う段階へ進んだ
+- `exp_019`（PPO 診断: baseline vs weak-lr）  
+  - `lr=5e-5` でも主評価は baseline を更新できず、`clip_fraction / ratio` の軽減だけでは不十分と確認
+  - reward の sparse 性と target 品質側の診断を優先する方針が強化された
+- `exp_020`（minimal shaping reward）  
+  - `shanten_delta_reward` を加えると、PPO 後悪化は baseline より一貫して小さくなった
+  - `linear_decay` が `constant` より自然で、主評価・after 指標とも最良
+  - sparse reward 主因説はかなり強化されたが、悪化はまだ完全には消えていない
+- `exp_021`（linear_decay scale sweep）
+  - 実用域は `0.01〜0.02`
+  - 総合推奨は `scale=0.01`
+  - `scale=0.1` は過剰 shaping として明確に悪化
+- `exp_022`（mode 比較）
+  - `mode=both` を維持採用
+  - `mode=improve_only` は baseline も更新できず不採用
+  - 暫定標準 reward 条件は `linear_decay + scale=0.01 + mode=both`
+- `exp_023`（shanten-conditioned learner 診断）
+  - `improve` 群の advantage mean は依然として負、`worsen` 群の advantage mean は依然として正
+  - baseline reward と標準 shaping reward で `shanten_diag` はほぼ変わらず、reward sparse 性だけでは残差を説明できない
+  - 次段は reward 探索より value/target 仮説を優先する
 
 ---
 
@@ -86,6 +106,11 @@
 - `value_loss_coef=1.0`（悪化傾向）
 - 極端な更新強度（例: epochs 過大、clip 過大）
 - `epochs=2` の weak-epochs 比較（baseline より明確に悪化）
+- `lr=5e-5` の weak-lr 比較（診断対照としては有用だが、改善条件としては未採用）
+- reward shaping なしの baseline reward 単独運用を「十分」とみなすこと
+- `scale=0.1` の極端 shaping
+- `mode=improve_only`
+- reward shaping の追加比較を続けること（当面は learner/value 仮説を優先）
 
 再検討条件:
 
@@ -100,8 +125,13 @@ run 成果物で確認可能:
 
 - `eval_before/eval/eval_diff`（rotation対応）
 - self-play 統計（wins/deal-ins/draws/tsumo/ron/ryukyoku/num_rounds）
+- reward 内訳統計（`point_delta/shanten_delta/total` の `mean/std/p50/p90/p99`）
+- reward shaping 設定（`enabled/scale/mode/schedule_type`）
 - learner 診断統計 `ppo_diag`
   - `advantage_*`, `return_*`, `old_value_*`, `value_error_*`, `ratio_*`, `clip_fraction`
+  - `shanten_diag`
+    - `improve/same/worsen` ごとの `advantage/return/value_error`
+    - `available_samples/unavailable_samples/status`
 - batch 側 run 別 learner 診断統計
 
 不足が出たら CQ 化して可観測性を先に上げる（推測で進めない）。
@@ -151,4 +181,4 @@ run 成果物で確認可能:
 
 ## 10. 一文要約
 
-**imitation 改善は成立。次の勝負は PPO 悪化の主因（強度か方向か）を診断統計で確定し、改善条件を固定したうえでルール拡張フェーズへ移行すること。**
+**imitation 改善と reward sparse 緩和までは前進したが、`improve/worsen` 群の advantage はまだ整合していない。次は value/target 問題を本命として切り分ける。**

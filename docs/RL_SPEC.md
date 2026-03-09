@@ -188,6 +188,31 @@ Observation、Feature 表現、Model は分離する。
 
 複数 value head を許容する設計だが、日常実験の主系はまだ単一 head 前提に近い。
 
+#### 7.4.1 value head 専用補助特徴 (CQ-0151)
+
+`MLPPolicyValueModel` は `value_aux_dim` パラメータをサポートする。
+
+- `value_aux_dim > 0` の場合、value heads の入力次元は `trunk_out + value_aux_dim` になる
+- `forward(features, legal_mask, value_aux_features=None)` で追加特徴を渡す
+- `value_aux_features` が与えられた場合、trunk 出力 `h` と concat してから value heads に渡す
+- `value_aux_features=None` かつ `value_aux_dim > 0` の場合、zero pad して value head 入力次元を合わせる (CQ-0153)
+- policy head は trunk 出力のみを使用し、value_aux_features の影響を受けない
+- evaluator 推論経路でも `value_shanten_enabled=true` 時は current_shanten を計算して渡す (CQ-0153)
+
+現在サポートする補助特徴:
+
+| 特徴名 | dim | config | 正規化 |
+|---|---|---|---|
+| current_shanten | 1 | `model.value_features.current_shanten.enabled` | raw / 8.0 |
+
+config 例:
+```yaml
+model:
+  value_features:
+    current_shanten:
+      enabled: true
+```
+
 ---
 
 ## 8. 現仕様: Action / legal mask
@@ -238,13 +263,126 @@ legal mask により、実行可能な打牌へ射影する。
 これは現在の `PROJECT.md` にある主要診断課題の一つであり、  
 reward 設計変更を伴う CQ ではこの節を起点に議論する。
 
-### 9.4 将来案
+### 9.4 Reward Shaping (CQ-0139, CQ-0140)
+
+Python `selfplay_worker` 内で shaping reward を計算し、`point_delta` と合成した total を `LearningSample.reward` に格納する。
+shard / learner 側の構造変更はなし（reward は単一 float のまま）。
+
+#### composition
+```
+total_reward = point_delta_reward + shaping_reward
+```
+
+#### shanten_delta_reward
+- 各プレイヤーの打牌後 13 枚手牌のシャンテンを追跡
+- `delta = prev_shanten − current_shanten` （正 = 改善）
+- 初回打牌は delta = 0
+- `mode="both"`: 改善 `+scale*delta`, 悪化 `-scale*|delta|`, 維持 `0`
+- `mode="improve_only"`: 改善 `+scale*delta`, 悪化/維持 `0`
+- match 単位で tracker をリセット
+
+#### schedule
+- `constant`: factor = 1.0
+- `linear_decay`: factor = 1.0 − progress （progress = match_index / num_matches）
+- 有効 scale = base_scale × factor
+
+#### config
+```yaml
+reward:
+  shaping:
+    shanten_delta:
+      enabled: false     # デフォルト off（後方互換）
+      scale: 0.01
+      mode: "both"       # "both" | "improve_only"
+      schedule:
+        type: "constant"  # "constant" | "linear_decay"
+```
+
+#### 成果物キー: reward_composition (CQ-0142)
+各成分 (point_delta, shanten_delta, total) に以下の統計を保持:
+- `count`, `sum`, `mean`, `std`, `nonzero_count`
+- `p50`, `p90`, `p99` （quantile、sparse/tail 診断用）
+
+出力先:
+- `selfplay_stats.reward_composition`: worker 単位
+- `summary.json.phase_stats.selfplay.reward_composition`: run 単位
+- `batch_summary.json.runs[].reward_composition`: per-run
+- `batch_summary.json.aggregate.reward_composition`: cross-run 集約（mean/std/p50/p90/p99 の run 間統計）
+
+multi-worker 時: 各 worker の raw values を `reward_raw_values.npz` に保存し、runner が結合して正確な quantile を計算する。
+
+#### 成果物キー: reward_shaping (CQ-0143)
+shaping 設定を構造化して保存（config.yaml に依存せず比較可能）:
+```json
+{
+  "shanten_delta": {
+    "enabled": true,
+    "scale": 0.01,
+    "mode": "both",
+    "schedule_type": "constant"
+  }
+}
+```
+
+出力先:
+- `summary.json.phase_stats.selfplay.reward_shaping`
+- `batch_summary.json.runs[].reward_shaping`
+
+#### LearningSample.shanten_delta (CQ-0145, CQ-0148)
+selfplay_worker は **raw シャンテン差分** (`prev_shanten - next_shanten`) を `LearningSample.shanten_delta` に格納する。
+この値は reward shaping の `mode` / `scale` / `schedule` に一切依存しない。
+- 正 = 改善、0 = 維持、負 = 悪化
+- 初回打牌（prev 未定義）は NaN（unavailable 扱い、CQ-0149）
+
+shard には条件付きカラムとして書き出す（`teacher_best_mask` と同パターン）。
+shaping 無効時は `shanten_delta = None`（カラム省略）。
+
+#### 成果物キー: shanten_diag (CQ-0145, CQ-0146, CQ-0148)
+PPO learner が shanten_delta 付き shard を受け取った場合、advantage / return / value_error を
+raw `shanten_delta` の符号で 3 群に分割した診断統計を `ppo_diag.shanten_diag` に格納する。
+群分けは raw 差分の符号のみで行い、reward shaping の mode/scale/schedule には依存しない。
+
+3 群:
+- `improve`: delta > 0
+- `same`: delta == 0（真に delta == 0 のサンプルのみ）
+- `worsen`: delta < 0
+
+各群:
+- `count`
+- `advantage`: mean, std, p50, p90, p99, positive_ratio, negative_ratio
+- `return`: mean, std, p50, p90, p99
+- `value_error`: mean, std, p50, p90, p99
+
+count == 0 の群は `{"count": 0}` のみ。
+
+欠落データの扱い (CQ-0146):
+- `shanten_delta` カラムが存在しない shard のサンプルは NaN として読み込まれる
+- NaN サンプルは 3 群のいずれにも分類されない（unavailable として除外）
+- `status` フィールドで状態を明示:
+  - `complete`: 全サンプルに shanten_delta あり
+  - `partial`: 一部のサンプルのみ shanten_delta あり（mixed shard）
+  - `unavailable`: 全サンプルに shanten_delta なし（この場合 shanten_diag 自体は出力される）
+- `total_samples`, `available_samples`, `unavailable_samples` を併記
+
+出力先:
+- `metrics/train_metrics.json.ppo_diag.shanten_diag`
+- `summary.json.phase_stats.learner.ppo_diag.shanten_diag`（既存 ppo_diag 転送パス経由）
+- `batch_summary.json.runs[].learner_diag.shanten_diag`（同上）
+
+#### 後方互換
+- `reward.shaping` 未指定 or `shanten_delta.enabled: false` → shaping 無効、`total = point_delta` のまま
+- 既存 config で動作が変わらないことをテストで保証
+- 新規キーは追加のみ、既存キーの削除・改名なし
+- shanten_delta カラムがない shard → `shanten_deltas = None`、shanten_diag 省略
+- mixed shard（旧/新混在）→ 欠落サンプルは NaN、same 群に混入しない
+
+### 9.5 将来案
 
 将来的には以下を許容する。
 
 - `final_rank`
 - `combined`
-- shaped / intermediate reward
+- shaped / intermediate reward (shanten_delta 以外)
 - reward normalization / clipping の明示仕様
 
 ただし現仕様では主系ではない。
@@ -421,6 +559,49 @@ imitation フェーズ完了後、少なくとも次を出力する。
 - strict 経路は既定として維持する
 - tie-aware は追加モードとして扱う
 - shard に必要な補助情報がなければ fail-fast する
+
+### 13.5 joint imitation (CQ-0150)
+
+imitation フェーズで policy loss に加えて value loss を同時最適化する機能。
+
+config:
+```yaml
+training:
+  imitation_value_warmstart:
+    enabled: false  # デフォルト off（後方互換）
+    coef: 0.5       # value loss の重み
+```
+
+loss 式:
+```
+total_loss = policy_loss + coef * value_loss - entropy_coef * entropy
+```
+
+- value target: `_compute_gae(rewards, old_values, terminateds)` の returns（PPO と同一定義）
+- enabled=false のとき従来通り policy_loss - entropy のみ
+- strict_top1 / tie_aware_best_set とは独立に併用可能
+
+出力先:
+- `summary.json.phase_stats.imitation.value_loss`
+- `summary.json.phase_stats.imitation.imitation_value_warmstart`
+- `batch_summary.json.runs[].imitation_metrics.value_loss`
+- `batch_summary.json.runs[].imitation_metrics.imitation_value_warmstart`
+- `batch_summary.json.aggregate.imitation.value_loss`
+
+### 13.6 成果物追跡 (CQ-0152)
+
+joint imitation / value 補助特徴の設定と指標を追跡するため、以下を成果物に記録する。
+
+summary.json:
+- `phase_stats.imitation.value_loss`
+- `phase_stats.imitation.imitation_value_warmstart.{enabled, coef}`
+- `model_features.value_features.current_shanten.enabled`
+
+batch_summary.json:
+- `runs[].imitation_metrics.value_loss`
+- `runs[].imitation_metrics.imitation_value_warmstart`
+- `runs[].model_features`
+- `aggregate.imitation.value_loss` (mean/std/count/min/max)
 
 ---
 
