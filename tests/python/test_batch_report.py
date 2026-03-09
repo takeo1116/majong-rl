@@ -673,3 +673,441 @@ class TestLearnerDiagBatch:
         assert "learner_diag" not in summary["runs"][1]
         # aggregate は1件のみ
         assert summary["aggregate"]["learner_diag"]["clip_fraction"]["count"] == 1
+
+    def _make_result_with_shanten_diag(self, tmp_path: Path, seed: int):
+        """CQ-0147: shanten_diag 付き ppo_diag を含む結果を生成"""
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ppo_diag = {
+            "advantage_mean": 0.0, "advantage_std": 1.0,
+            "clip_fraction": 0.1,
+            "ratio_mean": 1.0, "ratio_std": 0.05,
+            "old_value_mean": 0.0, "new_value_mean": 0.0,
+            "value_error_mean": 0.0, "value_error_std": 0.1,
+            "shanten_diag": {
+                "status": "complete",
+                "total_samples": 100,
+                "available_samples": 100,
+                "unavailable_samples": 0,
+                "improve": {
+                    "count": 30,
+                    "advantage": {"mean": 0.5, "std": 0.3, "p50": 0.4,
+                                  "p90": 0.8, "p99": 1.0,
+                                  "positive_ratio": 0.8, "negative_ratio": 0.2},
+                    "return": {"mean": 0.3, "std": 0.2, "p50": 0.3,
+                               "p90": 0.5, "p99": 0.7},
+                    "value_error": {"mean": -0.1, "std": 0.1, "p50": -0.1,
+                                    "p90": 0.0, "p99": 0.1},
+                },
+                "same": {"count": 40},
+                "worsen": {"count": 30},
+            },
+        }
+        summary_data = {
+            "phase_stats": {
+                "learner": {
+                    "total_steps": 100,
+                    "num_updates": 10,
+                    "policy_loss": 0.5,
+                    "value_loss": 0.3,
+                    "mode": "ppo",
+                    "ppo_diag": ppo_diag,
+                },
+            },
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_shanten_diag_in_batch_runs(self, tmp_path: Path):
+        """CQ-0147: runs[*].learner_diag.shanten_diag が batch_summary に含まれる"""
+        results = [self._make_result_with_shanten_diag(tmp_path, 42)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "learner_diag" in run_entry
+        assert "shanten_diag" in run_entry["learner_diag"]
+        sd = run_entry["learner_diag"]["shanten_diag"]
+        assert sd["status"] == "complete"
+        assert sd["improve"]["count"] == 30
+
+    def test_shanten_diag_mixed_no_crash(self, tmp_path: Path):
+        """CQ-0147: shanten_diag あり/なし混在でも batch がクラッシュしない"""
+        results = [self._make_result_with_shanten_diag(tmp_path, 42)]
+        # seed 43: shanten_diag なし
+        results.append(self._make_result_with_ppo_diag(tmp_path, 43))
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        # seed 42 には shanten_diag あり
+        assert "shanten_diag" in summary["runs"][0]["learner_diag"]
+        # seed 43 には shanten_diag なし（通常の ppo_diag のみ）
+        assert "learner_diag" in summary["runs"][1]
+        # aggregate は落ちない
+        assert "learner_diag" in summary["aggregate"]
+
+
+class TestRewardCompositionBatch:
+    """reward composition の batch レポート統合テスト (CQ-0141)"""
+
+    def _make_result_with_rc(self, tmp_path: Path, seed: int,
+                              shanten_delta_mean: float = 0.001,
+                              include_shaping: bool = False):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        sp_data: dict = {
+            "total_steps": 500,
+            "total_matches": 2,
+            "reward_composition": {
+                "shanten_delta_enabled": True,
+                "point_delta": {
+                    "count": 500, "sum": 0.05, "mean": 0.0001,
+                    "std": 0.001, "nonzero_count": 50,
+                    "p50": 0.0, "p90": 0.0002, "p99": 0.01,
+                },
+                "shanten_delta": {
+                    "count": 500, "sum": shanten_delta_mean * 500,
+                    "mean": shanten_delta_mean,
+                    "std": 0.002, "nonzero_count": 100,
+                    "p50": 0.0, "p90": shanten_delta_mean * 2, "p99": shanten_delta_mean * 5,
+                },
+                "total": {
+                    "count": 500, "sum": 0.05 + shanten_delta_mean * 500,
+                    "mean": 0.0001 + shanten_delta_mean,
+                    "std": 0.002, "nonzero_count": 120,
+                    "p50": 0.0, "p90": 0.0003, "p99": 0.012,
+                },
+            },
+        }
+        if include_shaping:
+            sp_data["reward_shaping"] = {
+                "shanten_delta": {
+                    "enabled": True,
+                    "scale": 0.01,
+                    "mode": "both",
+                    "schedule_type": "constant",
+                },
+            }
+        summary_data = {"phase_stats": {"selfplay": sp_data}}
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_reward_composition_in_runs(self, tmp_path: Path):
+        """runs[*].reward_composition が batch_summary に含まれる"""
+        results = [self._make_result_with_rc(tmp_path, 42)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "reward_composition" in run_entry
+        assert run_entry["reward_composition"]["shanten_delta_enabled"] is True
+
+    def test_mixed_with_without_no_crash(self, tmp_path: Path):
+        """reward_composition あり/なし混在でもクラッシュせず集約される"""
+        results = [self._make_result_with_rc(tmp_path, 42, shanten_delta_mean=0.002)]
+        # seed 43: reward_composition なし
+        run_dir_43 = tmp_path / "fake_run_43"
+        run_dir_43.mkdir(parents=True, exist_ok=True)
+        with open(run_dir_43 / "summary.json", "w") as f:
+            json.dump({"phase_stats": {"selfplay": {"total_steps": 100}}}, f)
+        results.append({
+            "seed": 43,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir_43),
+                "global_seed": 43,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        })
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert "reward_composition" in summary["runs"][0]
+        assert "reward_composition" not in summary["runs"][1]
+        # aggregate にあり分の集約がある
+        agg_rc = summary["aggregate"].get("reward_composition", {})
+        assert "shanten_delta" in agg_rc
+
+    def test_quantile_in_aggregate(self, tmp_path: Path):
+        """aggregate.reward_composition に quantile 系の集約がある (CQ-0142)"""
+        results = [
+            self._make_result_with_rc(tmp_path, 42, shanten_delta_mean=0.001),
+            self._make_result_with_rc(tmp_path, 43, shanten_delta_mean=0.003),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        agg_rc = summary["aggregate"]["reward_composition"]
+        # p50/p90/p99 が集約されている
+        for comp in ("point_delta", "shanten_delta", "total"):
+            assert comp in agg_rc
+            for qk in ("p50", "p90", "p99"):
+                assert qk in agg_rc[comp], f"aggregate.reward_composition.{comp}.{qk} missing"
+                assert agg_rc[comp][qk]["count"] == 2
+
+    def test_reward_shaping_in_runs(self, tmp_path: Path):
+        """runs[*].reward_shaping が batch_summary に含まれる (CQ-0143)"""
+        results = [self._make_result_with_rc(tmp_path, 42, include_shaping=True)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "reward_shaping" in run_entry
+        sd = run_entry["reward_shaping"]["shanten_delta"]
+        assert sd["enabled"] is True
+        assert sd["scale"] == 0.01
+        assert sd["mode"] == "both"
+        assert sd["schedule_type"] == "constant"
+
+    def test_reward_shaping_mixed_no_crash(self, tmp_path: Path):
+        """reward_shaping あり/なし混在でもクラッシュしない (CQ-0143)"""
+        results = [self._make_result_with_rc(tmp_path, 42, include_shaping=True)]
+        # seed 43: reward_shaping なし
+        run_dir_43 = tmp_path / "fake_run_43"
+        run_dir_43.mkdir(parents=True, exist_ok=True)
+        with open(run_dir_43 / "summary.json", "w") as f:
+            json.dump({"phase_stats": {"selfplay": {"total_steps": 100}}}, f)
+        results.append({
+            "seed": 43,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir_43),
+                "global_seed": 43,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        })
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert "reward_shaping" in summary["runs"][0]
+        assert "reward_shaping" not in summary["runs"][1]
+
+
+class TestJointImitationBatch:
+    """joint imitation の batch レポート統合テスト (CQ-0150, CQ-0152)"""
+
+    def _make_result_with_joint_imi(self, tmp_path: Path, seed: int,
+                                      value_loss: float = 0.05,
+                                      enabled: bool = True):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        summary_data = {
+            "phase_stats": {
+                "imitation": {
+                    "teacher_top1_match_rate": 0.5,
+                    "teacher_best_set_hit_rate": 0.7,
+                    "imitation_loss_mode": "strict_top1",
+                    "value_loss": value_loss,
+                    "imitation_value_warmstart": {
+                        "enabled": enabled,
+                        "coef": 0.5,
+                    },
+                },
+            },
+            "model_features": {
+                "value_features": {
+                    "current_shanten": {"enabled": True},
+                },
+            },
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_imitation_value_loss_in_runs(self, tmp_path: Path):
+        """runs[*].imitation_metrics に value_loss と imitation_value_warmstart が含まれる"""
+        results = [self._make_result_with_joint_imi(tmp_path, 42, value_loss=0.05)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "imitation_metrics" in run_entry
+        im = run_entry["imitation_metrics"]
+        assert im["value_loss"] == 0.05
+        assert im["imitation_value_warmstart"]["enabled"] is True
+        assert im["imitation_value_warmstart"]["coef"] == 0.5
+        # model_features も転記される
+        assert "model_features" in run_entry
+        assert run_entry["model_features"]["value_features"]["current_shanten"]["enabled"] is True
+        # aggregate にも value_loss が集約される
+        agg = summary["aggregate"]
+        assert "imitation" in agg
+        assert "value_loss" in agg["imitation"]
+        assert agg["imitation"]["value_loss"]["count"] == 1
+
+    def test_imitation_mixed_no_crash(self, tmp_path: Path):
+        """joint imitation on/off 混在でも集約が落ちない"""
+        results = [
+            self._make_result_with_joint_imi(tmp_path, 42, value_loss=0.05, enabled=True),
+        ]
+        # seed 43: joint imitation off (value_loss なし)
+        run_dir_43 = tmp_path / "fake_run_43"
+        run_dir_43.mkdir(parents=True, exist_ok=True)
+        summary_data = {
+            "phase_stats": {
+                "imitation": {
+                    "teacher_top1_match_rate": 0.4,
+                    "teacher_best_set_hit_rate": 0.6,
+                    "imitation_loss_mode": "strict_top1",
+                },
+            },
+        }
+        with open(run_dir_43 / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        results.append({
+            "seed": 43,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir_43),
+                "global_seed": 43,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        })
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        # クラッシュしない
+        assert summary["success_count"] == 2
+        # imitation 集約は 2 件
+        agg = summary["aggregate"]
+        assert "imitation" in agg
+        assert agg["imitation"]["teacher_top1_match_rate"]["count"] == 2
+        # value_loss は 1 件のみ（seed 43 にはなし）
+        assert agg["imitation"]["value_loss"]["count"] == 1
+
+
+class TestCurrentShantenBatch:
+    """current_shanten model_features の batch レポート統合テスト (CQ-0154)"""
+
+    def _make_result_with_model_features(self, tmp_path: Path, seed: int,
+                                          cs_enabled: bool = True):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        summary_data = {
+            "phase_stats": {
+                "imitation": {
+                    "teacher_top1_match_rate": 0.5,
+                    "teacher_best_set_hit_rate": 0.7,
+                    "imitation_loss_mode": "strict_top1",
+                    "value_loss": 0.05,
+                    "imitation_value_warmstart": {"enabled": True, "coef": 0.5},
+                },
+            },
+            "model_features": {
+                "value_features": {
+                    "current_shanten": {"enabled": cs_enabled},
+                },
+            },
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_model_features_in_runs(self, tmp_path: Path):
+        """runs[*].model_features に current_shanten.enabled が含まれる"""
+        results = [self._make_result_with_model_features(tmp_path, 42, cs_enabled=True)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "model_features" in run_entry
+        vf = run_entry["model_features"]["value_features"]
+        assert vf["current_shanten"]["enabled"] is True
+
+    def test_model_features_mixed_no_crash(self, tmp_path: Path):
+        """current_shanten on/off 混在でも batch 集約が落ちない"""
+        results = [
+            self._make_result_with_model_features(tmp_path, 42, cs_enabled=True),
+        ]
+        # seed 43: model_features なし
+        run_dir_43 = tmp_path / "fake_run_43"
+        run_dir_43.mkdir(parents=True, exist_ok=True)
+        summary_data = {
+            "phase_stats": {
+                "imitation": {
+                    "teacher_top1_match_rate": 0.4,
+                    "teacher_best_set_hit_rate": 0.6,
+                    "imitation_loss_mode": "strict_top1",
+                },
+            },
+        }
+        with open(run_dir_43 / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        results.append({
+            "seed": 43,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir_43),
+                "global_seed": 43,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        })
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        # クラッシュしない
+        assert summary["success_count"] == 2
+        # seed 42 には model_features あり、seed 43 にはなし
+        assert "model_features" in summary["runs"][0]
+        assert "model_features" not in summary["runs"][1]

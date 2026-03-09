@@ -2465,6 +2465,50 @@ class TestPPODiagIntegration:
             assert diag_result[key] == diag_json[key], f"{key} mismatch result vs json"
             assert diag_json[key] == diag_summary[key], f"{key} mismatch json vs summary"
 
+    def test_shanten_diag_three_path_consistency(self, tmp_path: Path):
+        """CQ-0147: shanten_diag が result / train_metrics.json / summary.json で整合"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.reward["shaping"] = {
+            "shanten_delta": {
+                "enabled": True,
+                "scale": 0.01,
+                "mode": "both",
+                "schedule": {"type": "constant"},
+            },
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+
+        # 1) result["train_metrics"]["ppo_diag"]["shanten_diag"]
+        tm = result["train_metrics"]
+        assert "ppo_diag" in tm
+        assert "shanten_diag" in tm["ppo_diag"]
+        diag_result = tm["ppo_diag"]["shanten_diag"]
+        assert diag_result["status"] in ("complete", "partial", "unavailable")
+
+        run_dir = Path(result["run_dir"])
+
+        # 2) train_metrics.json
+        with open(run_dir / "metrics" / "train_metrics.json") as f:
+            saved_tm = json.load(f)
+        assert "shanten_diag" in saved_tm["ppo_diag"]
+        diag_json = saved_tm["ppo_diag"]["shanten_diag"]
+
+        # 3) summary.json
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        learner_stats = summary.get("phase_stats", {}).get("learner", {})
+        assert "shanten_diag" in learner_stats["ppo_diag"]
+        diag_summary = learner_stats["ppo_diag"]["shanten_diag"]
+
+        # status / available_samples の一致確認
+        assert diag_result["status"] == diag_json["status"]
+        assert diag_json["status"] == diag_summary["status"]
+        assert diag_result["available_samples"] == diag_json["available_samples"]
+
     def test_imitation_only_no_ppo_diag(self, tmp_path: Path):
         """imitation-only 経路では ppo_diag が必須化されていない"""
         config = _make_minimal_config()
@@ -2486,3 +2530,74 @@ class TestPPODiagIntegration:
             summary = json.load(f)
         learner_stats = summary.get("phase_stats", {}).get("learner", {})
         assert "ppo_diag" not in learner_stats
+
+
+class TestJointImitationIntegration:
+    """joint imitation の統合テスト (CQ-0150, CQ-0152)"""
+
+    def test_joint_imitation_in_summary(self, tmp_path: Path):
+        """joint imitation on で summary.json に value_loss と imitation_value_warmstart が記録される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 1
+        config.training["imitation_epochs"] = 2
+        config.training["imitation_value_warmstart"] = {
+            "enabled": True,
+            "coef": 0.5,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        imi_stats = summary.get("phase_stats", {}).get("imitation", {})
+        assert "value_loss" in imi_stats
+        assert isinstance(imi_stats["value_loss"], float)
+        assert imi_stats["value_loss"] >= 0.0
+
+        assert "imitation_value_warmstart" in imi_stats
+        ivw = imi_stats["imitation_value_warmstart"]
+        assert ivw["enabled"] is True
+        assert ivw["coef"] == 0.5
+
+
+class TestCurrentShantenE2E:
+    """current_shanten.enabled=true の end-to-end テスト (CQ-0153, CQ-0154)"""
+
+    def test_current_shanten_enabled_e2e(self, tmp_path: Path):
+        """current_shanten on + joint imitation on で最小 run が完走する"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.selfplay["imitation_matches"] = 1
+        config.training["imitation_epochs"] = 2
+        config.training["imitation_value_warmstart"] = {
+            "enabled": True,
+            "coef": 0.5,
+        }
+        config.model["value_features"] = {
+            "current_shanten": {"enabled": True},
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        # model_features が記録される
+        mf = summary.get("model_features", {})
+        assert mf.get("value_features", {}).get("current_shanten", {}).get("enabled") is True
+
+        # imitation 統計が記録される
+        imi_stats = summary.get("phase_stats", {}).get("imitation", {})
+        assert "value_loss" in imi_stats
+        assert isinstance(imi_stats["value_loss"], float)
+        assert imi_stats["value_loss"] >= 0.0
+        assert "imitation_value_warmstart" in imi_stats
+        assert imi_stats["imitation_value_warmstart"]["enabled"] is True

@@ -23,11 +23,13 @@ class DiscardPolicyModel(ABC, nn.Module):
     """
 
     @abstractmethod
-    def forward(self, features: Tensor, legal_mask: Tensor) -> PolicyValueOutput:
+    def forward(self, features: Tensor, legal_mask: Tensor,
+                value_aux_features: Tensor | None = None) -> PolicyValueOutput:
         """
         Args:
             features: (batch, *input_shape) 特徴量テンソル
             legal_mask: (batch, 34) 合法手マスク (1=合法, 0=非合法)
+            value_aux_features: (batch, aux_dim) value head 専用補助特徴 (CQ-0151)
 
         Returns:
             PolicyValueOutput: logits (batch, 34), values dict

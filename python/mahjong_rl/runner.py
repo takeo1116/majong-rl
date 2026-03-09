@@ -175,17 +175,25 @@ def _eval_worker_fn(
         import math
         meta = encoder.metadata()
         input_dim = math.prod(meta.output_shape)
+        # CQ-0151: value_aux_dim
+        _vf = model_config.get("value_features", {})
+        _cs = _vf.get("current_shanten", {})
+        _vaux_dim = 1 if _cs.get("enabled", False) else 0
         model = MLPPolicyValueModel(
             input_dim=input_dim,
             hidden_dims=model_config.get("hidden_dims", [256, 128]),
             value_heads=model_config.get("value_heads", ["round_delta"]),
+            value_aux_dim=_vaux_dim,
         )
         state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict)
         model.eval()
 
+        # CQ-0153: value current_shanten 有効時は evaluator にも渡す
+        _cs_enabled = _cs.get("enabled", False)
         eval_runner = EvaluationRunner(
-            model=model, encoder=encoder, observation_mode=obs_mode)
+            model=model, encoder=encoder, observation_mode=obs_mode,
+            value_shanten_enabled=_cs_enabled)
 
         partial = eval_runner.evaluate_partial(
             num_matches=num_matches,
@@ -251,10 +259,15 @@ def _selfplay_worker_fn(
         import math
         meta = encoder.metadata()
         input_dim = math.prod(meta.output_shape)
+        # CQ-0151: value_aux_dim
+        _vf2 = model_config.get("value_features", {})
+        _cs2 = _vf2.get("current_shanten", {})
+        _vaux_dim2 = 1 if _cs2.get("enabled", False) else 0
         model = MLPPolicyValueModel(
             input_dim=input_dim,
             hidden_dims=model_config.get("hidden_dims", [256, 128]),
             value_heads=model_config.get("value_heads", ["round_delta"]),
+            value_aux_dim=_vaux_dim2,
         )
         state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict)
@@ -283,6 +296,17 @@ def _selfplay_worker_fn(
             sp_stats["match_index_end"] = len(match_seeds) - 1
             sp_stats["first_match_seed"] = match_seeds[0]
             sp_stats["last_match_seed"] = match_seeds[-1]
+        # CQ-0142: raw values は別ファイルに保存（stats.json の肥大化防止）
+        raw_values = sp_stats.pop("_reward_raw_values", None)
+        if raw_values is not None:
+            import numpy as _np
+            raw_path = Path(output_dir) / "reward_raw_values.npz"
+            _np.savez_compressed(
+                raw_path,
+                **{f"{comp}": _np.array(vals, dtype=_np.float64)
+                   for comp, vals in raw_values.items()},
+            )
+
         stats_path = Path(output_dir) / "stats.json"
         import json as _json
         with open(stats_path, "w") as f:
@@ -963,6 +987,8 @@ class Stage1Runner:
             num_matches=sp_cfg.get("num_matches", 10),
             seed_start=sp_cfg.get("seed_start", 0),
         )
+        # CQ-0142: 内部キーを除去（single worker は quantile 計算済み）
+        sp_stats.pop("_reward_raw_values", None)
         logger.info(f"  total_steps: {sp_stats['total_steps']}")
         return sp_stats
 
@@ -1064,6 +1090,58 @@ class Stage1Runner:
                 round_totals[k] += ws.get(k, 0)
             worker_stats_list.append(ws)
 
+        # CQ-0139, CQ-0142: reward_composition 集約（raw values からの正確な quantile 計算）
+        reward_composition = None
+        rc_list = [ws.get("reward_composition") for ws in worker_stats_list
+                   if ws.get("reward_composition") is not None]
+        if rc_list:
+            reward_composition = {"shanten_delta_enabled": rc_list[0].get("shanten_delta_enabled", False)}
+            # raw values を読み込んで結合
+            merged_raw: dict[str, list] = {"point_delta": [], "shanten_delta": [], "total": []}
+            for i in range(num_workers):
+                raw_path = selfplay_dir / f"worker_{i}" / "reward_raw_values.npz"
+                if raw_path.exists():
+                    data = np.load(raw_path)
+                    for comp in merged_raw:
+                        if comp in data:
+                            merged_raw[comp].append(data[comp])
+                    data.close()
+
+            for comp in ("point_delta", "shanten_delta", "total"):
+                arrays = merged_raw.get(comp, [])
+                if arrays:
+                    arr = np.concatenate(arrays)
+                    n = len(arr)
+                    s = float(arr.sum())
+                    mean = float(arr.mean())
+                    std = float(arr.std())
+                    nz = int(np.count_nonzero(arr))
+                    p50 = float(np.percentile(arr, 50))
+                    p90 = float(np.percentile(arr, 90))
+                    p99 = float(np.percentile(arr, 99))
+                else:
+                    # raw values なし → per-worker stats からのフォールバック
+                    n = sum(rc[comp]["count"] for rc in rc_list if comp in rc)
+                    s = sum(rc[comp]["sum"] for rc in rc_list if comp in rc)
+                    mean = s / n if n > 0 else 0.0
+                    std = 0.0
+                    nz = sum(rc[comp].get("nonzero_count", 0) for rc in rc_list if comp in rc)
+                    p50 = 0.0
+                    p90 = 0.0
+                    p99 = 0.0
+                reward_composition[comp] = {
+                    "count": n,
+                    "sum": s,
+                    "mean": mean,
+                    "std": std,
+                    "nonzero_count": nz,
+                    "p50": p50,
+                    "p90": p90,
+                    "p99": p99,
+                }
+            # CQ-0143: reward_shaping 設定（最初の worker から取得）
+            reward_shaping = worker_stats_list[0].get("reward_shaping") if worker_stats_list else None
+
         result = {
             "num_matches": total_matches,
             "total_steps": total_steps,
@@ -1072,6 +1150,10 @@ class Stage1Runner:
             "worker_stats": worker_stats_list,
         }
         result.update(round_totals)
+        if reward_composition is not None:
+            result["reward_composition"] = reward_composition
+        if reward_composition is not None and reward_shaping is not None:
+            result["reward_shaping"] = reward_shaping
         return result
 
     def _run_learner(self, run_dir: Path, shard_dir: Path, model,
@@ -1114,11 +1196,15 @@ class Stage1Runner:
         # 単一プロセス評価 (既存経路)
         eval_device = resolve_device(
             eval_cfg.get("inference_device", "auto"))
+        # CQ-0153: value current_shanten 有効時は evaluator にも渡す
+        vf_cfg = self._config.model.get("value_features", {})
+        cs_enabled = vf_cfg.get("current_shanten", {}).get("enabled", False)
         eval_runner = EvaluationRunner(
             model=model,
             encoder=encoder,
             observation_mode=obs_mode,
             inference_device=eval_device,
+            value_shanten_enabled=cs_enabled,
         )
 
         if eval_mode == "rotation":
@@ -1417,6 +1503,11 @@ class Stage1Runner:
         hidden_dims = model_cfg.get("hidden_dims", [256, 128])
         value_heads = model_cfg.get("value_heads", ["round_delta"])
 
+        # CQ-0151: value head 専用補助特徴の次元
+        vf_cfg = model_cfg.get("value_features", {})
+        cs_cfg = vf_cfg.get("current_shanten", {})
+        value_aux_dim = 1 if cs_cfg.get("enabled", False) else 0
+
         # エンコーダの出力次元を取得
         meta = encoder.metadata()
         import math
@@ -1426,6 +1517,7 @@ class Stage1Runner:
             input_dim=input_dim,
             hidden_dims=hidden_dims,
             value_heads=value_heads,
+            value_aux_dim=value_aux_dim,
         )
 
     def _setup_file_logging(self, run_dir: Path) -> logging.FileHandler:
@@ -1488,6 +1580,14 @@ class Stage1Runner:
                 "policy_win_by_tsumo": sp.get("policy_win_by_tsumo", 0),
                 "policy_win_by_ron": sp.get("policy_win_by_ron", 0),
             }
+            # CQ-0139: reward composition
+            rc = sp.get("reward_composition")
+            if rc is not None:
+                phase_stats["selfplay"]["reward_composition"] = rc
+            # CQ-0143: reward shaping 設定
+            rs = sp.get("reward_shaping")
+            if rs is not None:
+                phase_stats["selfplay"]["reward_shaping"] = rs
         if "imitation_metrics" in result:
             imi = result["imitation_metrics"]
             # imitation shard 数 (平坦 + worker サブディレクトリ)
@@ -1513,6 +1613,9 @@ class Stage1Runner:
                 "teacher_best_mask_shard_info": imi.get("teacher_best_mask_shard_info"),
                 # CQ-0132: loss mode 追跡
                 "imitation_loss_mode": imi.get("imitation_loss_mode"),
+                # CQ-0150, CQ-0152: joint value warm start 追跡
+                "value_loss": imi.get("value_loss"),
+                "imitation_value_warmstart": imi.get("imitation_value_warmstart"),
             }
         if "train_metrics" in result:
             tm = result["train_metrics"]
@@ -1591,6 +1694,18 @@ class Stage1Runner:
             "observation_mode": enc_cfg.get("observation_mode", "?"),
             "shanten_hint": shanten_on,
             "input_dim": result.get("input_dim"),
+        }
+
+        # CQ-0151, CQ-0152: model_features を記録
+        model_cfg = self._config.model
+        vf_cfg = model_cfg.get("value_features", {})
+        cs_cfg = vf_cfg.get("current_shanten", {})
+        summary["model_features"] = {
+            "value_features": {
+                "current_shanten": {
+                    "enabled": cs_cfg.get("enabled", False),
+                },
+            },
         }
 
         # プロファイル情報 (CQ-0098)
@@ -2026,6 +2141,15 @@ class Stage1Runner:
         imi_loss_mode = imi.get("imitation_loss_mode")
         if imi_loss_mode is not None:
             lines.append(f"- imitation loss_mode: {imi_loss_mode}")
+
+        # CQ-0139: reward shaping 情報
+        sp_stats = result.get("selfplay_stats", {})
+        rc = sp_stats.get("reward_composition")
+        if rc and rc.get("shanten_delta_enabled"):
+            sd = rc.get("shanten_delta", {})
+            lines.append(f"- reward_shaping: shanten_delta enabled, "
+                         f"mean={sd.get('mean', 0):.6f}, "
+                         f"nonzero={sd.get('nonzero_count', 0)}/{sd.get('count', 0)}")
 
         # CQ-0135: PPO 診断統計サマリ
         tm = result.get("train_metrics", {})

@@ -95,12 +95,28 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
                             "teacher_top1_match_rate": imi_top1,
                             "teacher_best_set_hit_rate": imi_best_set,
                             "imitation_loss_mode": imi_stats.get("imitation_loss_mode"),
+                            # CQ-0150, CQ-0152: joint imitation 追跡
+                            "value_loss": imi_stats.get("value_loss"),
+                            "imitation_value_warmstart": imi_stats.get("imitation_value_warmstart"),
                         }
+                    # CQ-0151, CQ-0152: model_features
+                    mf = run_summary.get("model_features")
+                    if mf is not None:
+                        entry["model_features"] = mf
                     # CQ-0137: learner PPO 診断統計
                     learner_stats = run_summary.get("phase_stats", {}).get("learner", {})
                     ppo_diag = learner_stats.get("ppo_diag")
                     if ppo_diag is not None:
                         entry["learner_diag"] = ppo_diag
+                    # CQ-0139: reward composition
+                    sp_stats = run_summary.get("phase_stats", {}).get("selfplay", {})
+                    rc = sp_stats.get("reward_composition")
+                    if rc is not None:
+                        entry["reward_composition"] = rc
+                    # CQ-0143: reward shaping 設定
+                    rs = sp_stats.get("reward_shaping")
+                    if rs is not None:
+                        entry["reward_shaping"] = rs
         else:
             entry["error"] = r.get("error", "unknown")
         runs_info.append(entry)
@@ -114,7 +130,7 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
     if imi_metrics_list:
         aggregate["imitation"] = _compute_aggregate_generic(
             imi_metrics_list,
-            ["teacher_top1_match_rate", "teacher_best_set_hit_rate"],
+            ["teacher_top1_match_rate", "teacher_best_set_hit_rate", "value_loss"],
         )
         # CQ-0133, CQ-0134: mode 別集約（None/空文字は "unknown" に正規化）
         by_mode: dict[str, list[dict]] = {}
@@ -148,6 +164,25 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
         aggregate["learner_diag"] = _compute_aggregate_generic(
             learner_diag_list, _LEARNER_DIAG_AGG_KEYS,
         )
+
+    # CQ-0139, CQ-0142: reward composition 集約（quantile 含む）
+    rc_list = [
+        entry["reward_composition"]
+        for entry in runs_info
+        if entry.get("reward_composition")
+    ]
+    if rc_list:
+        _RC_AGG_KEYS = ["mean", "std", "p50", "p90", "p99"]
+        rc_agg: dict = {}
+        for comp in ("point_delta", "shanten_delta", "total"):
+            comp_dicts = [rc[comp] for rc in rc_list if comp in rc]
+            if comp_dicts:
+                rc_agg[comp] = _compute_aggregate_generic(
+                    comp_dicts, _RC_AGG_KEYS)
+        if any(rc.get("shanten_delta_enabled") for rc in rc_list):
+            rc_agg["shanten_delta_enabled"] = True
+        if rc_agg:
+            aggregate["reward_composition"] = rc_agg
 
     summary = {
         "num_seeds": len(seeds),

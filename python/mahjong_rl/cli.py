@@ -759,19 +759,39 @@ def _load_sweep_config(path: Path) -> dict | None:
 
 
 def _apply_override(config: ExperimentConfig, key: str, value: str) -> None:
-    """ドット区切りのキーで config を上書きする"""
+    """ドット区切りのキーで config を上書きする (CQ-0144: deep-merge 対応)"""
     parts = key.split(".")
-    if len(parts) != 2:
-        raise ValueError(f"override キーは section.key 形式で指定してください: {key}")
+    if len(parts) < 2:
+        raise ValueError(f"override キーは section.key[.subkey...] 形式で指定してください: {key}")
 
-    section_name, field_name = parts
+    section_name = parts[0]
     section = getattr(config, section_name, None)
     if section is None or not isinstance(section, dict):
         raise ValueError(f"不正な config セクション: {section_name}")
 
     # 型推定
     parsed = _parse_value(value)
-    section[field_name] = parsed
+    _deep_set(section, parts[1:], parsed)
+
+
+def _deep_set(d: dict, keys: list[str], value) -> None:
+    """dict に対してキーリストで再帰的に値を設定する (CQ-0144)
+
+    - keys 長1: d[keys[0]] = value（leaf 設定）
+    - keys 長2以上: 中間が dict なら辿る、存在しなければ dict 作成
+    - 既存値が scalar のところに深いキーで辿ろうとする → ValueError (fail fast)
+    """
+    for i, k in enumerate(keys[:-1]):
+        if k not in d:
+            d[k] = {}
+        elif not isinstance(d[k], dict):
+            path = ".".join(keys[: i + 1])
+            raise ValueError(
+                f"override: '{path}' は既に非 dict 値です。"
+                f"深いキーで辿ることはできません"
+            )
+        d = d[k]
+    d[keys[-1]] = value
 
 
 def _parse_value(value: str):

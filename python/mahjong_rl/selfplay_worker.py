@@ -15,6 +15,8 @@ from mahjong_rl.models import MLPPolicyValueModel
 from mahjong_rl.action_selector import ActionSelector, SelectionMode
 from mahjong_rl.baseline import RuleBasedBaseline
 from mahjong_rl.profiler import Profiler
+from mahjong_rl.baseline.shanten import compute_shanten
+from mahjong_rl.reward_shaping import ShantenDeltaTracker, RewardSchedule
 from mahjong_rl.shard import LearningSample, ShardWriter
 
 
@@ -61,6 +63,30 @@ class SelfPlayWorker:
         obs_mode = config.get("experiment", {}).get("observation_mode", "full")
         self._observation_mode = obs_mode
 
+        # reward shaping (CQ-0139, CQ-0140)
+        reward_cfg = config.get("reward", {})
+        shaping_cfg = reward_cfg.get("shaping", {})
+        sd_cfg = shaping_cfg.get("shanten_delta", {})
+        self._shanten_delta_enabled = sd_cfg.get("enabled", False)
+        if self._shanten_delta_enabled:
+            self._shanten_tracker = ShantenDeltaTracker(
+                scale=sd_cfg.get("scale", 0.01),
+                mode=sd_cfg.get("mode", "both"),
+            )
+            self._shanten_schedule = RewardSchedule(sd_cfg.get("schedule"))
+        else:
+            self._shanten_tracker = None
+            self._shanten_schedule = None
+
+        # CQ-0151: value head 用 current shanten 特徴
+        model_cfg = config.get("model", {})
+        vf_cfg = model_cfg.get("value_features", {})
+        cs_cfg = vf_cfg.get("current_shanten", {})
+        self._value_shanten_enabled = cs_cfg.get("enabled", False)
+
+        # reward composition 統計 (CQ-0142: quantile 対応で raw values 保持)
+        self._reward_component_values: dict[str, list[float]] = {}
+
         # メタデータ
         self._experiment_id = config.get("experiment", {}).get("name", "")
         self._model_version = 0
@@ -89,15 +115,21 @@ class SelfPlayWorker:
         profiler = self._profiler or Profiler(enabled=False)
         self._round_results: list[dict] = []
 
+        # reward composition 統計リセット (CQ-0139, CQ-0142)
+        for comp in ("point_delta", "shanten_delta", "total"):
+            self._reward_component_values[comp] = []
+
         profiler.start("selfplay_match_loop")
         for match_idx in range(num_matches):
             seed = match_seeds[match_idx] if match_seeds is not None else seed_start + match_idx
             episode_id = f"ep_{seed}"
+            progress = match_idx / num_matches if num_matches > 0 else 0.0
 
             stats = self._play_one_match(
                 seed=seed,
                 episode_id=episode_id,
                 run_id=run_id,
+                progress=progress,
             )
             total_steps += stats["steps"]
             total_rounds += stats["rounds"]
@@ -121,13 +153,27 @@ class SelfPlayWorker:
             "inference_device": str(self._device),
         }
         result.update(round_stats)
+        # CQ-0139, CQ-0142: reward composition 統計
+        result["reward_composition"] = self._compute_reward_composition_stats()
+        # CQ-0142: multi-worker 集約用に raw values を保持
+        result["_reward_raw_values"] = {
+            comp: self._reward_component_values.get(comp, [])
+            for comp in ("point_delta", "shanten_delta", "total")
+        }
+        # CQ-0143: shaping 設定を構造化出力
+        result["reward_shaping"] = self._get_shaping_config()
         return result
 
-    def _play_one_match(self, seed: int, episode_id: str, run_id: str) -> dict:
+    def _play_one_match(self, seed: int, episode_id: str, run_id: str,
+                        progress: float = 0.0) -> dict:
         """1 半荘を実行しサンプルを収集する"""
         env = Stage1Env(observation_mode=self._observation_mode)
         torch.manual_seed(seed)
         obs, info = env.reset(seed=seed)
+
+        # CQ-0139: shanten tracker リセット (match 単位)
+        if self._shanten_tracker is not None:
+            self._shanten_tracker.reset()
 
         # 4 席を policy/baseline に割り当て
         seat_is_policy = self._assign_seats(seed)
@@ -142,12 +188,24 @@ class SelfPlayWorker:
             current = env.current_player
             mask = env.get_legal_mask()
 
+            # CQ-0151: current_shanten 計算（shanten_delta とは独立に計算可能）
+            current_shanten_val = None
+            hand = None
+            if self._value_shanten_enabled or self._shanten_tracker is not None:
+                hand = list(env.env_state.round_state.players[current].hand)
+                if self._value_shanten_enabled:
+                    counts = [0] * 34
+                    for tid in hand:
+                        counts[tid // 4] += 1
+                    current_shanten_val = compute_shanten(counts)
+
             teacher_best_mask = None  # CQ-0125: baseline 席のみ非 None
             if seat_is_policy[current]:
                 # ポリシー席: action 選択前の観測を保存用にエンコード
                 pre_features = self._encoder.encode(obs)
                 pre_features_flat = pre_features.flatten() if pre_features.ndim > 1 else pre_features
-                tile_type, log_prob, value = self._policy_step(obs, mask)
+                tile_type, log_prob, value = self._policy_step(
+                    obs, mask, current_shanten=current_shanten_val)
             else:
                 # ベースライン席: ルールベースで選択
                 tile_type, teacher_best_mask = self._baseline_step(env, mask)
@@ -160,7 +218,20 @@ class SelfPlayWorker:
                 else:
                     pre_features_flat = None
 
+            # CQ-0139, CQ-0140: shanten delta reward 計算 (env.step の前)
+            shanten_delta_reward = 0.0
+            shanten_delta_raw = None  # CQ-0145, CQ-0148: mode/scale/schedule 非依存の raw delta
+            if self._shanten_tracker is not None:
+                # hand は上で既に取得済み（_shanten_tracker is not None なら必ず取得されている）
+                shaping_reward, shanten_delta_raw = self._shanten_tracker.compute_reward(
+                    current, hand, tile_type)
+                shanten_delta_reward = shaping_reward * self._shanten_schedule.get_scale_factor(progress)
+
             obs, rewards, terminated, truncated, info = env.step(tile_type)
+
+            # CQ-0139: reward composition
+            point_delta_reward = float(rewards[current])
+            total_reward = point_delta_reward + shanten_delta_reward
 
             # 局境界判定
             round_number = info["round_number"]
@@ -192,12 +263,16 @@ class SelfPlayWorker:
             should_save = seat_is_policy[current] or (
                 self._save_baseline_actions and not seat_is_policy[current])
             if should_save:
+                # CQ-0139: reward composition 統計を累積
+                self._accumulate_reward_stats(
+                    point_delta_reward, shanten_delta_reward, total_reward)
+
                 actor_type = "policy" if seat_is_policy[current] else "baseline"
                 sample = LearningSample(
                     observation=pre_features_flat,
                     legal_mask=mask.astype(np.float32),
                     action=tile_type,
-                    reward=float(rewards[current]),
+                    reward=total_reward,
                     log_prob=float(log_prob),
                     value=float(value),
                     terminated=terminated,
@@ -215,6 +290,8 @@ class SelfPlayWorker:
                     player_id=current,
                     actor_type=actor_type,
                     teacher_best_mask=teacher_best_mask if actor_type == "baseline" else None,
+                    shanten_delta=shanten_delta_raw,  # CQ-0145: schedule 適用前の raw delta
+                    current_shanten=current_shanten_val,  # CQ-0151: value head 用
                 )
                 self._writer.add(sample)
                 sample_step += 1
@@ -230,15 +307,22 @@ class SelfPlayWorker:
         rng = np.random.RandomState(seed)
         return [rng.random() < self._policy_ratio for _ in range(4)]
 
-    def _policy_step(self, obs, mask: np.ndarray) -> tuple[int, float, float]:
+    def _policy_step(self, obs, mask: np.ndarray,
+                     current_shanten: int | None = None) -> tuple[int, float, float]:
         """ポリシーモデルで打牌を選択する"""
         features = self._encoder.encode(obs)
         features_flat = features.flatten() if features.ndim > 1 else features
         features_t = torch.from_numpy(features_flat).unsqueeze(0).to(self._device)
         mask_t = torch.from_numpy(mask).unsqueeze(0).to(self._device)
 
+        # CQ-0151: value head 専用補助特徴
+        value_aux = None
+        if self._value_shanten_enabled and current_shanten is not None:
+            value_aux = torch.tensor(
+                [[current_shanten / 8.0]], dtype=torch.float32, device=self._device)
+
         with torch.no_grad():
-            output = self._model(features_t, mask_t)
+            output = self._model(features_t, mask_t, value_aux_features=value_aux)
 
         tile_type, log_prob = self._selector.select(output.logits[0], mask_t[0])
 
@@ -327,6 +411,63 @@ class SelfPlayWorker:
             "policy_draws": policy_draws,
             "policy_win_by_tsumo": policy_win_by_tsumo,
             "policy_win_by_ron": policy_win_by_ron,
+        }
+
+    def _accumulate_reward_stats(
+        self, point_delta: float, shanten_delta: float, total: float,
+    ) -> None:
+        """reward composition の累積統計を更新する (CQ-0139, CQ-0142)"""
+        self._reward_component_values["point_delta"].append(point_delta)
+        self._reward_component_values["shanten_delta"].append(shanten_delta)
+        self._reward_component_values["total"].append(total)
+
+    def _compute_reward_composition_stats(self) -> dict:
+        """reward composition の集約統計を計算する (CQ-0139, CQ-0142)"""
+        stats: dict = {"shanten_delta_enabled": self._shanten_delta_enabled}
+        for comp in ("point_delta", "shanten_delta", "total"):
+            vals = self._reward_component_values.get(comp, [])
+            n = len(vals)
+            if n > 0:
+                arr = np.array(vals, dtype=np.float64)
+                s = float(arr.sum())
+                mean = float(arr.mean())
+                std = float(arr.std())
+                nz = int(np.count_nonzero(arr))
+                p50 = float(np.percentile(arr, 50))
+                p90 = float(np.percentile(arr, 90))
+                p99 = float(np.percentile(arr, 99))
+            else:
+                s = 0.0
+                mean = 0.0
+                std = 0.0
+                nz = 0
+                p50 = 0.0
+                p90 = 0.0
+                p99 = 0.0
+            stats[comp] = {
+                "count": n,
+                "sum": s,
+                "mean": mean,
+                "std": std,
+                "nonzero_count": nz,
+                "p50": p50,
+                "p90": p90,
+                "p99": p99,
+            }
+        return stats
+
+    def _get_shaping_config(self) -> dict:
+        """shaping 設定を構造化して返す (CQ-0143)"""
+        reward_cfg = self._config.get("reward", {})
+        shaping_cfg = reward_cfg.get("shaping", {})
+        sd_cfg = shaping_cfg.get("shanten_delta", {})
+        return {
+            "shanten_delta": {
+                "enabled": self._shanten_delta_enabled,
+                "scale": sd_cfg.get("scale", 0.01) if self._shanten_delta_enabled else None,
+                "mode": sd_cfg.get("mode", "both") if self._shanten_delta_enabled else None,
+                "schedule_type": sd_cfg.get("schedule", {}).get("type", "constant") if self._shanten_delta_enabled else None,
+            },
         }
 
     @staticmethod

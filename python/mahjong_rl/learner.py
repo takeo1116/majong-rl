@@ -47,6 +47,11 @@ class Learner:
                 f"Unknown imitation_loss_mode: {self._imitation_loss_mode!r}. "
                 f"有効値: {_VALID_LOSS_MODES}")
 
+        # CQ-0150: imitation value warm start
+        ivw = tc.get("imitation_value_warmstart", {})
+        self._imi_value_enabled = ivw.get("enabled", False)
+        self._imi_value_coef = ivw.get("coef", 0.5)
+
         self._optimizer = torch.optim.Adam(model.parameters(), lr=self._lr)
 
     @property
@@ -96,6 +101,12 @@ class Learner:
 
         n_before_filter = len(observations)
 
+        # CQ-0145: shanten_deltas
+        raw_shanten_deltas = data.get("shanten_deltas")
+
+        # CQ-0151: current_shantens (value head 補助特徴)
+        raw_current_shantens = data.get("current_shantens")
+
         # teacher_best_masks (CQ-0125, CQ-0128)
         raw_teacher_best_masks = data.get("teacher_best_masks")
         tbm_shard_info = data.get("teacher_best_mask_shard_info", {})
@@ -129,6 +140,16 @@ class Learner:
                 result["filter_stats"] = filter_stats
             return result
 
+        # CQ-0151: current_shantens を value_aux_features 用テンソルに変換
+        current_shantens_t = None
+        if raw_current_shantens is not None:
+            cs_arr = raw_current_shantens
+            if keep is not None:
+                cs_arr = cs_arr[keep]
+            # 正規化: shanten 0-8 → /8.0 で [0,1] 範囲
+            current_shantens_t = torch.from_numpy(
+                cs_arr.astype(np.float32) / 8.0).unsqueeze(-1).to(self._device)
+
         profiler.start("model_forward")
         if self._mode == "imitation":
             # teacher_best_masks 準備 (CQ-0125, CQ-0128, CQ-0130)
@@ -148,17 +169,23 @@ class Learner:
 
             metrics = self._train_imitation(
                 observations, legal_masks, actions, n, epochs,
-                teacher_best_masks=teacher_best_masks_t)
+                teacher_best_masks=teacher_best_masks_t,
+                rewards=rewards, old_values=old_values,
+                terminateds=terminateds,
+                value_aux_features=current_shantens_t)
             metrics["teacher_best_set_status"] = teacher_best_set_status
             if tbm_shard_info:
                 metrics["teacher_best_mask_shard_info"] = tbm_shard_info
             repro = self._compute_imitation_metrics(
-                observations, legal_masks, actions, teacher_best_masks_t)
+                observations, legal_masks, actions, teacher_best_masks_t,
+                value_aux_features=current_shantens_t)
             metrics.update(repro)
         else:
             metrics = self._train_ppo(
                 observations, legal_masks, actions, rewards,
-                old_log_probs, old_values, terminateds, n, epochs)
+                old_log_probs, old_values, terminateds, n, epochs,
+                shanten_deltas=raw_shanten_deltas,
+                value_aux_features=current_shantens_t)
         profiler.stop("model_forward")
 
         metrics["mode"] = self._mode
@@ -211,6 +238,8 @@ class Learner:
         terminateds: torch.Tensor,
         n: int,
         epochs: int,
+        shanten_deltas: np.ndarray | None = None,
+        value_aux_features: torch.Tensor | None = None,
     ) -> dict:
         """PPO 学習"""
         advantages, returns = self._compute_gae(rewards, old_values, terminateds)
@@ -236,8 +265,9 @@ class Learner:
                 batch_old_log_probs = old_log_probs[idx]
                 batch_advantages = advantages[idx]
                 batch_returns = returns[idx]
+                batch_vaux = value_aux_features[idx] if value_aux_features is not None else None
 
-                output = self._model(batch_obs, batch_masks)
+                output = self._model(batch_obs, batch_masks, value_aux_features=batch_vaux)
 
                 # ポリシーロス (PPO clipped)
                 log_probs = torch.log_softmax(output.logits, dim=-1)
@@ -286,6 +316,11 @@ class Learner:
                 all_ratios, all_new_values,
                 clip_epsilon=self._clip_epsilon,
             )
+            # CQ-0145: shanten 変化別 advantage 診断
+            if shanten_deltas is not None:
+                metrics["ppo_diag"]["shanten_diag"] = (
+                    self._compute_shanten_conditioned_diag(
+                        advantages, returns, old_values, shanten_deltas))
 
         return metrics
 
@@ -297,8 +332,12 @@ class Learner:
         n: int,
         epochs: int,
         teacher_best_masks: torch.Tensor | None = None,
+        rewards: torch.Tensor | None = None,
+        old_values: torch.Tensor | None = None,
+        terminateds: torch.Tensor | None = None,
+        value_aux_features: torch.Tensor | None = None,
     ) -> dict:
-        """模倣学習 (CQ-0130: loss mode 切替対応)
+        """模倣学習 (CQ-0130: loss mode 切替, CQ-0150: joint value warm start)
 
         imitation_loss_mode:
             strict_top1: 教師 action への cross-entropy loss
@@ -309,7 +348,13 @@ class Learner:
                 "imitation_loss_mode='tie_aware_best_set' requires teacher_best_masks, "
                 "but none were found in shard data")
 
+        # CQ-0150: joint value warm start — returns 計算
+        returns = None
+        if self._imi_value_enabled and rewards is not None and old_values is not None and terminateds is not None:
+            _, returns = self._compute_gae(rewards, old_values, terminateds)
+
         all_policy_losses = []
+        all_value_losses = []
         all_entropies = []
         num_updates = 0
 
@@ -322,8 +367,9 @@ class Learner:
                 batch_obs = observations[idx]
                 batch_masks = legal_masks[idx]
                 batch_actions = actions[idx]
+                batch_vaux = value_aux_features[idx] if value_aux_features is not None else None
 
-                output = self._model(batch_obs, batch_masks)
+                output = self._model(batch_obs, batch_masks, value_aux_features=batch_vaux)
 
                 # loss 計算 (CQ-0130)
                 if self._imitation_loss_mode == "strict_top1":
@@ -339,7 +385,14 @@ class Learner:
                 probs_for_ent = torch.softmax(output.logits, dim=-1)
                 entropy = -(probs_for_ent * log_probs).sum(dim=-1).mean()
 
-                loss = policy_loss - self._entropy_coef * entropy
+                # CQ-0150: value loss
+                value_loss_t = torch.tensor(0.0, device=self._device)
+                if returns is not None:
+                    batch_returns = returns[idx]
+                    value = list(output.values.values())[0].squeeze(-1)
+                    value_loss_t = nn.functional.mse_loss(value, batch_returns)
+
+                loss = policy_loss + self._imi_value_coef * value_loss_t - self._entropy_coef * entropy
 
                 self._optimizer.zero_grad()
                 loss.backward()
@@ -348,14 +401,19 @@ class Learner:
                 num_updates += 1
 
                 all_policy_losses.append(policy_loss.item())
+                all_value_losses.append(value_loss_t.item())
                 all_entropies.append(entropy.item())
 
         return {
             "policy_loss": float(np.mean(all_policy_losses)) if all_policy_losses else 0.0,
-            "value_loss": 0.0,
+            "value_loss": float(np.mean(all_value_losses)) if all_value_losses else 0.0,
             "entropy": float(np.mean(all_entropies)) if all_entropies else 0.0,
             "num_updates": num_updates,
             "imitation_loss_mode": self._imitation_loss_mode,
+            "imitation_value_warmstart": {
+                "enabled": self._imi_value_enabled,
+                "coef": self._imi_value_coef,
+            },
         }
 
     @torch.no_grad()
@@ -365,6 +423,7 @@ class Learner:
         legal_masks: torch.Tensor,
         actions: torch.Tensor,
         teacher_best_masks: torch.Tensor | None,
+        value_aux_features: torch.Tensor | None = None,
     ) -> dict:
         """学習後モデルの教師再現メトリクスを計算する (CQ-0125)
 
@@ -373,6 +432,7 @@ class Learner:
             legal_masks: (N, 34)
             actions: (N,) 教師 action
             teacher_best_masks: (N, 34) or None
+            value_aux_features: (N, aux_dim) or None (CQ-0153)
 
         Returns:
             teacher_top1_match_rate と（mask 存在時）teacher_best_set_hit_rate
@@ -386,7 +446,10 @@ class Learner:
         all_preds = []
         for start in range(0, n, self._batch_size):
             end = min(start + self._batch_size, n)
-            output = self._model(observations[start:end], legal_masks[start:end])
+            batch_vaux = value_aux_features[start:end] if value_aux_features is not None else None
+            output = self._model(
+                observations[start:end], legal_masks[start:end],
+                value_aux_features=batch_vaux)
             all_preds.append(output.logits.argmax(dim=-1))
         pred_actions = torch.cat(all_preds)
 
@@ -466,6 +529,80 @@ class Learner:
         diag["clip_fraction"] = float(np.mean(clipped))
 
         return diag
+
+    @staticmethod
+    def _compute_shanten_conditioned_diag(
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+        old_values: torch.Tensor,
+        shanten_deltas: np.ndarray,
+    ) -> dict:
+        """shanten 変化別の advantage/return/value_error 診断統計 (CQ-0145, CQ-0146)
+
+        3群 (improve/same/worsen) に分割して統計量を計算する。
+        NaN の shanten_delta は unavailable として除外し、same 群に混入させない。
+        """
+        adv_np = advantages.cpu().numpy().astype(np.float64)
+        ret_np = returns.cpu().numpy().astype(np.float64)
+        val_err_np = (old_values.cpu().numpy().astype(np.float64)) - ret_np
+        sd = shanten_deltas.astype(np.float64)
+
+        # CQ-0146: NaN は unavailable として除外
+        available_mask = ~np.isnan(sd)
+        n_total = len(sd)
+        n_available = int(np.sum(available_mask))
+        n_unavailable = n_total - n_available
+
+        # 状態判定
+        if n_available == n_total:
+            status = "complete"
+        elif n_available == 0:
+            status = "unavailable"
+        else:
+            status = "partial"
+
+        groups = {
+            "improve": available_mask & (sd > 0),
+            "same": available_mask & (sd == 0),
+            "worsen": available_mask & (sd < 0),
+        }
+
+        def _group_stats(arr: np.ndarray) -> dict:
+            """基本統計量を計算"""
+            return {
+                "mean": float(np.mean(arr)),
+                "std": float(np.std(arr, ddof=0)),
+                "p50": float(np.percentile(arr, 50)),
+                "p90": float(np.percentile(arr, 90)),
+                "p99": float(np.percentile(arr, 99)),
+            }
+
+        result: dict = {
+            "status": status,
+            "total_samples": n_total,
+            "available_samples": n_available,
+            "unavailable_samples": n_unavailable,
+        }
+        for name, mask in groups.items():
+            count = int(np.sum(mask))
+            if count == 0:
+                result[name] = {"count": 0}
+                continue
+            entry: dict = {"count": count}
+            # advantage
+            adv_g = adv_np[mask]
+            adv_stats = _group_stats(adv_g)
+            n_pos = int(np.sum(adv_g > 0))
+            n_neg = int(np.sum(adv_g < 0))
+            adv_stats["positive_ratio"] = n_pos / count
+            adv_stats["negative_ratio"] = n_neg / count
+            entry["advantage"] = adv_stats
+            # return
+            entry["return"] = _group_stats(ret_np[mask])
+            # value_error
+            entry["value_error"] = _group_stats(val_err_np[mask])
+            result[name] = entry
+        return result
 
     def _compute_gae(
         self,

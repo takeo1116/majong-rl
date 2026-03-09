@@ -468,3 +468,148 @@ class TestSelfPlayDevice:
         stats = worker.run(num_matches=1, seed_start=42)
         assert stats["total_steps"] > 0
         assert stats["inference_device"] == "cpu"
+
+
+@pytest.mark.slow
+class TestRewardComposition:
+    """reward composition 統計テスト (CQ-0141)"""
+
+    def test_disabled_backward_compat(self, tmp_path: Path):
+        """shaping 無効時: reward_composition 存在、shanten_delta はゼロ"""
+        config = _make_config(policy_ratio=1.0)
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=2, seed_start=42)
+
+        rc = stats["reward_composition"]
+        assert rc["shanten_delta_enabled"] is False
+        assert rc["shanten_delta"]["nonzero_count"] == 0
+        assert rc["point_delta"]["count"] > 0
+        # total == point_delta (shaping なし)
+        assert rc["total"]["sum"] == pytest.approx(rc["point_delta"]["sum"])
+        # CQ-0142: quantile キーが存在する
+        for comp in ("point_delta", "shanten_delta", "total"):
+            for qk in ("p50", "p90", "p99"):
+                assert qk in rc[comp], f"{comp}.{qk} missing"
+        # shanten_delta は全 0 → quantile も 0
+        assert rc["shanten_delta"]["p50"] == 0.0
+        assert rc["shanten_delta"]["p90"] == 0.0
+        assert rc["shanten_delta"]["p99"] == 0.0
+
+    def test_enabled_nonzero_shaping(self, tmp_path: Path):
+        """shaping 有効時: shanten_delta に非ゼロ reward が発生する"""
+        config = _make_config(policy_ratio=1.0)
+        config["reward"] = {
+            "shaping": {
+                "shanten_delta": {
+                    "enabled": True,
+                    "scale": 0.1,
+                    "mode": "both",
+                    "schedule": {"type": "constant"},
+                },
+            },
+        }
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=3, seed_start=0)
+
+        rc = stats["reward_composition"]
+        assert rc["shanten_delta_enabled"] is True
+        # 3半荘あれば非ゼロの shanten delta が少なくとも1つ出る
+        assert rc["shanten_delta"]["count"] > 0
+
+    def test_total_equals_sum(self, tmp_path: Path):
+        """total.sum == point_delta.sum + shanten_delta.sum"""
+        config = _make_config(policy_ratio=1.0)
+        config["reward"] = {
+            "shaping": {
+                "shanten_delta": {
+                    "enabled": True,
+                    "scale": 0.01,
+                    "mode": "both",
+                },
+            },
+        }
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=2, seed_start=10)
+
+        rc = stats["reward_composition"]
+        expected_sum = rc["point_delta"]["sum"] + rc["shanten_delta"]["sum"]
+        assert rc["total"]["sum"] == pytest.approx(expected_sum, abs=1e-10)
+
+    def test_quantile_ordering(self, tmp_path: Path):
+        """p50 <= p90 <= p99 の順序が保たれる (CQ-0142)"""
+        config = _make_config(policy_ratio=1.0)
+        config["reward"] = {
+            "shaping": {
+                "shanten_delta": {
+                    "enabled": True,
+                    "scale": 0.1,
+                    "mode": "both",
+                },
+            },
+        }
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=3, seed_start=0)
+        rc = stats["reward_composition"]
+        for comp in ("point_delta", "total"):
+            assert rc[comp]["p50"] <= rc[comp]["p90"] <= rc[comp]["p99"]
+
+    def test_reward_shaping_config_output(self, tmp_path: Path):
+        """reward_shaping 設定が構造化出力される (CQ-0143)"""
+        config = _make_config(policy_ratio=1.0)
+        config["reward"] = {
+            "shaping": {
+                "shanten_delta": {
+                    "enabled": True,
+                    "scale": 0.05,
+                    "mode": "improve_only",
+                    "schedule": {"type": "linear_decay"},
+                },
+            },
+        }
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=1, seed_start=42)
+        rs = stats["reward_shaping"]
+        sd = rs["shanten_delta"]
+        assert sd["enabled"] is True
+        assert sd["scale"] == 0.05
+        assert sd["mode"] == "improve_only"
+        assert sd["schedule_type"] == "linear_decay"
+
+    def test_reward_shaping_config_disabled(self, tmp_path: Path):
+        """shaping 無効時の reward_shaping 出力 (CQ-0143)"""
+        config = _make_config(policy_ratio=1.0)
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=1, seed_start=42)
+        rs = stats["reward_shaping"]
+        assert rs["shanten_delta"]["enabled"] is False
+        assert rs["shanten_delta"]["scale"] is None

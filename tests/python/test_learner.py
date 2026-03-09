@@ -906,3 +906,281 @@ class TestPPODiagnosticStats:
             saved = json.load(f)
         assert "ppo_diag" in saved
         assert saved["ppo_diag"]["clip_fraction"] == metrics["ppo_diag"]["clip_fraction"]
+
+
+def _write_shards_with_shanten_delta(
+    shard_dir: Path, n: int = 100, obs_dim: int = 100,
+) -> None:
+    """shanten_delta 付きダミー shard を書き出す"""
+    writer = ShardWriter(shard_dir, max_samples=10000)
+    for i in range(n):
+        # 3群に分散: improve(+), same(0), worsen(-)
+        if i % 3 == 0:
+            sd = float(np.random.randint(1, 4))   # improve
+        elif i % 3 == 1:
+            sd = 0.0                                # same
+        else:
+            sd = float(-np.random.randint(1, 3))   # worsen
+        writer.add(LearningSample(
+            observation=np.random.randn(obs_dim).astype(np.float32),
+            legal_mask=(np.random.rand(34) > 0.5).astype(np.float32),
+            action=np.random.randint(0, 34),
+            reward=np.random.randn() * 0.01,
+            log_prob=-np.random.rand(),
+            value=np.random.randn() * 0.1,
+            terminated=(i == n - 1),
+            round_over=(i % 20 == 19),
+            experiment_id="dummy_exp",
+            run_id="dummy_run",
+            worker_id="dummy_worker",
+            episode_id="dummy_ep",
+            step_id=i,
+            shanten_delta=sd,
+        ))
+    writer.close()
+
+
+class TestShantenConditionedDiag:
+    """CQ-0145: shanten 変化別 advantage 診断統計テスト"""
+
+    def _run_ppo_with_shanten(self, tmp_path: Path, n: int = 90) -> dict:
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_shanten_delta(shard_dir, n=n, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["epochs"] = 1
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        return learner.train(shard_dir)
+
+    def test_shanten_diag_present(self, tmp_path: Path):
+        """shanten_delta 付き shard で shanten_diag が出力される"""
+        metrics = self._run_ppo_with_shanten(tmp_path)
+        assert "ppo_diag" in metrics
+        diag = metrics["ppo_diag"]
+        assert "shanten_diag" in diag
+        sd = diag["shanten_diag"]
+        # CQ-0146: status / 件数情報
+        assert sd["status"] == "complete"
+        assert sd["unavailable_samples"] == 0
+        for group in ("improve", "same", "worsen"):
+            assert group in sd
+            assert sd[group]["count"] > 0
+
+    def test_shanten_diag_advantage_keys(self, tmp_path: Path):
+        """各群の advantage に必要なキーが揃っている"""
+        metrics = self._run_ppo_with_shanten(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        expected_adv_keys = {"mean", "std", "p50", "p90", "p99",
+                             "positive_ratio", "negative_ratio"}
+        expected_ret_keys = {"mean", "std", "p50", "p90", "p99"}
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            if entry["count"] == 0:
+                continue
+            assert expected_adv_keys <= set(entry["advantage"].keys())
+            assert expected_ret_keys <= set(entry["return"].keys())
+            assert expected_ret_keys <= set(entry["value_error"].keys())
+
+    def test_shanten_diag_ratios_bounded(self, tmp_path: Path):
+        """positive_ratio / negative_ratio が [0,1] 範囲"""
+        metrics = self._run_ppo_with_shanten(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            if entry["count"] == 0:
+                continue
+            pr = entry["advantage"]["positive_ratio"]
+            nr = entry["advantage"]["negative_ratio"]
+            assert 0.0 <= pr <= 1.0
+            assert 0.0 <= nr <= 1.0
+
+    def test_shanten_diag_no_nan(self, tmp_path: Path):
+        """全値が有限"""
+        metrics = self._run_ppo_with_shanten(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            if entry["count"] == 0:
+                continue
+            for series in ("advantage", "return", "value_error"):
+                for v in entry[series].values():
+                    assert np.isfinite(v), f"{group}.{series} に非有限値: {v}"
+
+    def test_shanten_diag_absent_without_shanten(self, tmp_path: Path):
+        """shanten_delta なし shard では shanten_diag が出ない"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["epochs"] = 1
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        assert "ppo_diag" in metrics
+        assert "shanten_diag" not in metrics["ppo_diag"]
+
+    def test_mixed_old_new_shard_excludes_unavailable(self, tmp_path: Path):
+        """CQ-0146: 旧/新 mixed shard で unavailable が same 群に入らない"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+
+        # 新 shard: shanten_delta あり (30 サンプル: 10 improve, 10 same, 10 worsen)
+        new_dir = shard_dir / "worker_0"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        writer1 = ShardWriter(new_dir, max_samples=10000)
+        for i in range(30):
+            if i < 10:
+                sd = 1.0   # improve
+            elif i < 20:
+                sd = 0.0   # same
+            else:
+                sd = -1.0  # worsen
+            writer1.add(LearningSample(
+                observation=np.random.randn(obs_dim).astype(np.float32),
+                legal_mask=(np.random.rand(34) > 0.5).astype(np.float32),
+                action=np.random.randint(0, 34),
+                reward=np.random.randn() * 0.01,
+                log_prob=-np.random.rand(),
+                value=np.random.randn() * 0.1,
+                terminated=(i == 29),
+                round_over=(i % 10 == 9),
+                experiment_id="dummy_exp",
+                run_id="dummy_run",
+                worker_id="dummy_worker",
+                episode_id="dummy_ep",
+                step_id=i,
+                shanten_delta=sd,
+            ))
+        writer1.close()
+
+        # 旧 shard: shanten_delta なし (20 サンプル)
+        old_dir = shard_dir / "worker_1"
+        old_dir.mkdir(parents=True, exist_ok=True)
+        writer2 = ShardWriter(old_dir, max_samples=10000)
+        for i in range(20):
+            writer2.add(LearningSample(
+                observation=np.random.randn(obs_dim).astype(np.float32),
+                legal_mask=(np.random.rand(34) > 0.5).astype(np.float32),
+                action=np.random.randint(0, 34),
+                reward=np.random.randn() * 0.01,
+                log_prob=-np.random.rand(),
+                value=np.random.randn() * 0.1,
+                terminated=(i == 19),
+                round_over=(i % 10 == 9),
+                experiment_id="dummy_exp",
+                run_id="dummy_run",
+                worker_id="dummy_worker",
+                episode_id="dummy_ep",
+                step_id=30 + i,
+            ))
+        writer2.close()
+
+        config = _make_config()
+        config["training"]["epochs"] = 1
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+
+        assert "ppo_diag" in metrics
+        sd = metrics["ppo_diag"]["shanten_diag"]
+
+        # status は partial（mixed）
+        assert sd["status"] == "partial"
+        assert sd["available_samples"] == 30
+        assert sd["unavailable_samples"] == 20
+
+        # same 群は真に delta==0 の 10 サンプルのみ（旧 shard の 20 が混入しない）
+        assert sd["same"]["count"] == 10
+        assert sd["improve"]["count"] == 10
+        assert sd["worsen"]["count"] == 10
+
+
+class TestJointImitation:
+    """CQ-0150: imitation value warm start テスト"""
+
+    def test_joint_imitation_off_value_loss_zero(self, tmp_path: Path):
+        """off のとき value_loss=0.0"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=50, obs_dim=obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        # imitation_value_warmstart 未設定（デフォルト off）
+
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=1)
+
+        assert metrics["value_loss"] == 0.0
+        assert metrics["imitation_value_warmstart"]["enabled"] is False
+
+    def test_joint_imitation_on_value_loss_nonzero(self, tmp_path: Path):
+        """on のとき value_loss > 0"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=50, obs_dim=obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["imitation_value_warmstart"] = {
+            "enabled": True,
+            "coef": 0.5,
+        }
+
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=2)
+
+        assert metrics["value_loss"] > 0.0
+        assert metrics["imitation_value_warmstart"]["enabled"] is True
+        assert metrics["imitation_value_warmstart"]["coef"] == 0.5
+
+    def test_joint_imitation_metrics_keys(self, tmp_path: Path):
+        """metrics に imitation_value_warmstart が含まれる"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=30, obs_dim=obs_dim)
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["imitation_value_warmstart"] = {
+            "enabled": True,
+            "coef": 0.25,
+        }
+
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=1)
+
+        assert "imitation_value_warmstart" in metrics
+        ivw = metrics["imitation_value_warmstart"]
+        assert ivw["enabled"] is True
+        assert ivw["coef"] == 0.25
+        # policy_loss も出る
+        assert "policy_loss" in metrics
+        assert metrics["policy_loss"] > 0
+
+    def test_joint_imitation_with_tie_aware(self, tmp_path: Path):
+        """tie_aware_best_set mode でも joint imitation が動作する"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_best_mask(
+            shard_dir, n=30, obs_dim=obs_dim, action=0, tie_actions=[1, 2])
+
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["imitation_loss_mode"] = "tie_aware_best_set"
+        config["training"]["imitation_value_warmstart"] = {
+            "enabled": True,
+            "coef": 0.5,
+        }
+
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir, num_epochs=1, filter_actor_type="baseline")
+
+        assert metrics["imitation_loss_mode"] == "tie_aware_best_set"
+        assert metrics["value_loss"] > 0.0
+        assert metrics["policy_loss"] > 0.0

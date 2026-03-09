@@ -185,3 +185,61 @@ class TestIsDiscardPolicyModel:
     def test_isinstance(self, model):
         assert isinstance(model, DiscardPolicyModel)
         assert isinstance(model, torch.nn.Module)
+
+
+class TestValueAuxFeatures:
+    """CQ-0151: value head 専用補助特徴テスト"""
+
+    def test_value_aux_off_shape_unchanged(self):
+        """value_aux_dim=0 で従来通りの出力 shape"""
+        model = MLPPolicyValueModel(input_dim=353, hidden_dims=[64, 32], value_aux_dim=0)
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        output = model(features, legal_mask)
+        assert output.logits.shape == (4, 34)
+        assert output.values["round_delta"].shape == (4, 1)
+
+    def test_value_aux_on_value_shape(self):
+        """value_aux_dim=1 で value output shape は (batch, 1) のまま"""
+        model = MLPPolicyValueModel(input_dim=353, hidden_dims=[64, 32], value_aux_dim=1)
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        value_aux = torch.randn(4, 1)
+        output = model(features, legal_mask, value_aux_features=value_aux)
+        assert output.values["round_delta"].shape == (4, 1)
+
+    def test_value_aux_policy_unchanged(self):
+        """value_aux_dim=1 でも policy logits shape は (batch, 34) のまま"""
+        model = MLPPolicyValueModel(input_dim=353, hidden_dims=[64, 32], value_aux_dim=1)
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        value_aux = torch.randn(4, 1)
+        output = model(features, legal_mask, value_aux_features=value_aux)
+        assert output.logits.shape == (4, 34)
+
+
+class TestValueAuxZeroPad:
+    """CQ-0153: value_aux_dim>0 / value_aux_features=None の zero pad テスト"""
+
+    def test_zero_pad_when_aux_none(self):
+        """value_aux_dim=1, value_aux_features=None で forward が通り shape が正しい"""
+        model = MLPPolicyValueModel(input_dim=353, hidden_dims=[64, 32], value_aux_dim=1)
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        # value_aux_features=None でも crash しない
+        output = model(features, legal_mask)
+        assert output.logits.shape == (4, 34)
+        assert output.values["round_delta"].shape == (4, 1)
+
+    def test_zero_pad_vs_actual_policy_same(self):
+        """zero pad と actual features で logits が同一（policy 不変の確認）"""
+        model = MLPPolicyValueModel(input_dim=353, hidden_dims=[64, 32], value_aux_dim=1)
+        model.eval()
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        value_aux = torch.randn(4, 1)
+        with torch.no_grad():
+            out_none = model(features, legal_mask)
+            out_aux = model(features, legal_mask, value_aux_features=value_aux)
+        # policy logits は value_aux_features に依存しない
+        assert torch.allclose(out_none.logits, out_aux.logits)

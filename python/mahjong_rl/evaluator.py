@@ -11,6 +11,7 @@ import torch
 from mahjong_rl.env import Stage1Env
 from mahjong_rl.action_selector import ActionSelector, SelectionMode
 from mahjong_rl.baseline import RuleBasedBaseline
+from mahjong_rl.baseline.shanten import compute_shanten
 from mahjong_rl import RoundEndReason
 
 
@@ -285,13 +286,15 @@ class EvaluationRunner:
     """
 
     def __init__(self, model: torch.nn.Module, encoder, observation_mode: str = "full",
-                 inference_device: torch.device | None = None):
+                 inference_device: torch.device | None = None,
+                 value_shanten_enabled: bool = False):
         self._device = inference_device or torch.device("cpu")
         self._model = model.to(self._device)
         self._encoder = encoder
         self._observation_mode = observation_mode
         self._baseline = RuleBasedBaseline()
         self._selector = ActionSelector(mode=SelectionMode.ARGMAX)
+        self._value_shanten_enabled = value_shanten_enabled
 
     def evaluate_partial(
         self,
@@ -420,7 +423,15 @@ class EvaluationRunner:
             mask = env.get_legal_mask()
 
             if current == policy_player:
-                tile_type = self._policy_step(obs, mask)
+                # CQ-0153: value head 用 current shanten 計算
+                current_shanten = None
+                if self._value_shanten_enabled:
+                    hand = list(env.env_state.round_state.players[current].hand)
+                    counts = [0] * 34
+                    for tid in hand:
+                        counts[tid // 4] += 1
+                    current_shanten = compute_shanten(counts)
+                tile_type = self._policy_step(obs, mask, current_shanten=current_shanten)
             else:
                 tile_type = self._baseline_step(env, mask)
 
@@ -464,15 +475,22 @@ class EvaluationRunner:
             "rounds": round_count,
         }
 
-    def _policy_step(self, obs, mask: np.ndarray) -> int:
+    def _policy_step(self, obs, mask: np.ndarray,
+                     current_shanten: int | None = None) -> int:
         """ポリシーモデルで打牌を選択する（argmax）"""
         features = self._encoder.encode(obs)
         features_flat = features.flatten() if features.ndim > 1 else features
         features_t = torch.from_numpy(features_flat).unsqueeze(0).to(self._device)
         mask_t = torch.from_numpy(mask).unsqueeze(0).to(self._device)
 
+        # CQ-0153: value head 用補助特徴
+        value_aux = None
+        if self._value_shanten_enabled and current_shanten is not None:
+            value_aux = torch.tensor(
+                [[current_shanten / 8.0]], dtype=torch.float32, device=self._device)
+
         with torch.no_grad():
-            output = self._model(features_t, mask_t)
+            output = self._model(features_t, mask_t, value_aux_features=value_aux)
 
         tile_type, _ = self._selector.select(output.logits[0], mask_t[0])
         return tile_type

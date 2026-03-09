@@ -44,6 +44,8 @@ class LearningSample:
     player_id: int = 0
     actor_type: str = "policy"  # "policy" or "baseline"
     teacher_best_mask: np.ndarray | None = None  # (34,) float32, 教師最良候補集合 (CQ-0125)
+    shanten_delta: float | None = None  # shanten 変化量 (CQ-0145)
+    current_shanten: int | None = None  # 現在シャンテン数 (CQ-0151)
 
 
 def validate_metadata(sample: LearningSample) -> None:
@@ -175,6 +177,20 @@ class ShardWriter:
                 for s in self._buffer
             ]
 
+        # shanten_delta: 1つでも非 None があればカラム書き出し (CQ-0145)
+        if any(s.shanten_delta is not None for s in self._buffer):
+            data["shanten_delta"] = [
+                float(s.shanten_delta) if s.shanten_delta is not None else 0.0
+                for s in self._buffer
+            ]
+
+        # current_shanten: 1つでも非 None があればカラム書き出し (CQ-0151)
+        if any(s.current_shanten is not None for s in self._buffer):
+            data["current_shanten"] = [
+                int(s.current_shanten) if s.current_shanten is not None else -1
+                for s in self._buffer
+            ]
+
         self._backend.write(data, path)
         self._buffer.clear()
         self._shard_counter += 1
@@ -264,6 +280,14 @@ class ShardReader:
         # CQ-0128: shard ごとの teacher_best_mask 有無カウント
         tbm_shard_count = 0
         tbm_shard_total = 0
+        # CQ-0145, CQ-0146: shanten_delta（欠落は NaN で表現）
+        all_shanten_deltas: list[float] = []
+        has_shanten_delta = False
+        shanten_delta_shard_count = 0
+        shanten_delta_shard_total = 0
+        # CQ-0151: current_shanten
+        all_current_shantens: list[int] = []
+        has_current_shanten = False
 
         for path in self._find_shards():
             table = self._backend.read(path)
@@ -299,6 +323,22 @@ class ShardReader:
             else:
                 all_teacher_best_masks.extend([None] * n)
 
+            # shanten_delta (CQ-0145, CQ-0146): カラム存在時のみ読み込み、欠落は NaN
+            shanten_delta_shard_total += 1
+            if "shanten_delta" in table.column_names:
+                has_shanten_delta = True
+                shanten_delta_shard_count += 1
+                all_shanten_deltas.extend(table.column("shanten_delta").to_pylist())
+            else:
+                all_shanten_deltas.extend([float("nan")] * n)
+
+            # current_shanten (CQ-0151): カラム存在時のみ読み込み
+            if "current_shanten" in table.column_names:
+                has_current_shanten = True
+                all_current_shantens.extend(table.column("current_shanten").to_pylist())
+            else:
+                all_current_shantens.extend([-1] * n)
+
         if not all_obs:
             return {
                 "observations": np.zeros((0, 0), dtype=np.float32),
@@ -311,6 +351,9 @@ class ShardReader:
                 "actor_types": np.array([], dtype=object),
                 "teacher_best_masks": None,
                 "teacher_best_mask_shard_info": {"available": 0, "total": 0},
+                "shanten_deltas": None,
+                "shanten_delta_shard_info": {"available": 0, "total": 0},
+                "current_shantens": None,
             }
 
         result = {
@@ -335,12 +378,34 @@ class ShardReader:
             "total": tbm_shard_total,
         }
 
+        # shanten_deltas (CQ-0145, CQ-0146): カラムがある shard があれば配列化（欠落は NaN）
+        if has_shanten_delta:
+            result["shanten_deltas"] = np.array(all_shanten_deltas, dtype=np.float32)
+        else:
+            result["shanten_deltas"] = None
+        result["shanten_delta_shard_info"] = {
+            "available": shanten_delta_shard_count,
+            "total": shanten_delta_shard_total,
+        }
+
+        # current_shantens (CQ-0151): 全 shard にカラムがある場合のみ配列化
+        if has_current_shanten and all(v >= 0 for v in all_current_shantens):
+            result["current_shantens"] = np.array(all_current_shantens, dtype=np.int32)
+        else:
+            result["current_shantens"] = None
+
         if filter_actor_type is not None:
             actor_mask = result["actor_types"] == filter_actor_type
             tbm = result.pop("teacher_best_masks")
             shard_info = result.pop("teacher_best_mask_shard_info")
+            sd = result.pop("shanten_deltas")
+            sd_shard_info = result.pop("shanten_delta_shard_info")
+            cs = result.pop("current_shantens")
             result = {k: v[actor_mask] for k, v in result.items()}
             result["teacher_best_masks"] = tbm[actor_mask] if tbm is not None else None
             result["teacher_best_mask_shard_info"] = shard_info
+            result["shanten_deltas"] = sd[actor_mask] if sd is not None else None
+            result["shanten_delta_shard_info"] = sd_shard_info
+            result["current_shantens"] = cs[actor_mask] if cs is not None else None
 
         return result

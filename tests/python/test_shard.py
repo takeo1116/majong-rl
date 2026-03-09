@@ -446,3 +446,165 @@ class TestTeacherBestMask:
         assert info["total"] == 2
         # 混在時は teacher_best_masks は None（全 shard 揃わないため）
         assert data["teacher_best_masks"] is None
+
+
+class TestShantenDeltaShard:
+    """CQ-0145: shanten_delta の shard 読み書きテスト"""
+
+    def test_shanten_delta_roundtrip(self, tmp_path: Path):
+        """shanten_delta 付きサンプルの書き出し・読み込み"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.shanten_delta = 1.0
+        s2 = _make_sample(step_id=1)
+        s2.shanten_delta = -0.5
+        s3 = _make_sample(step_id=2)
+        s3.shanten_delta = 0.0
+        writer.add(s1)
+        writer.add(s2)
+        writer.add(s3)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["shanten_deltas"] is not None
+        np.testing.assert_allclose(
+            data["shanten_deltas"], [1.0, -0.5, 0.0], atol=1e-6)
+
+    def test_shanten_delta_none_returns_none(self, tmp_path: Path):
+        """shanten_delta が全て None なら shanten_deltas は None"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s2 = _make_sample(step_id=1)
+        writer.add(s1)
+        writer.add(s2)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["shanten_deltas"] is None
+
+    def test_shanten_delta_mixed_fills_zero(self, tmp_path: Path):
+        """shanten_delta が一部 None の場合、None は 0.0 で埋められる"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.shanten_delta = 2.0
+        s2 = _make_sample(step_id=1)
+        # s2.shanten_delta = None (default)
+        writer.add(s1)
+        writer.add(s2)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["shanten_deltas"] is not None
+        np.testing.assert_allclose(
+            data["shanten_deltas"], [2.0, 0.0], atol=1e-6)
+
+    def test_shanten_delta_filter_actor_type(self, tmp_path: Path):
+        """filter_actor_type 時に shanten_deltas が正しくフィルタされる"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.shanten_delta = 1.0
+        s1.actor_type = "policy"
+        s2 = _make_sample(step_id=1)
+        s2.shanten_delta = -1.0
+        s2.actor_type = "baseline"
+        writer.add(s1)
+        writer.add(s2)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors(filter_actor_type="policy")
+        assert data["shanten_deltas"] is not None
+        assert len(data["shanten_deltas"]) == 1
+        np.testing.assert_allclose(data["shanten_deltas"], [1.0], atol=1e-6)
+
+    def test_mixed_old_new_shard_nan_for_missing(self, tmp_path: Path):
+        """CQ-0146: 旧 shard (shanten_delta なし) と新 shard の混在で欠落は NaN"""
+        # shard 1: shanten_delta あり
+        new_dir = tmp_path / "worker_0"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        writer1 = ShardWriter(new_dir, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.shanten_delta = 1.5
+        writer1.add(s1)
+        writer1.close()
+
+        # shard 2: shanten_delta なし（旧 shard 模擬）
+        old_dir = tmp_path / "worker_1"
+        old_dir.mkdir(parents=True, exist_ok=True)
+        writer2 = ShardWriter(old_dir, max_samples=100)
+        s2 = _make_sample(step_id=1)
+        # shanten_delta = None → カラムなし
+        writer2.add(s2)
+        writer2.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["shanten_deltas"] is not None
+        assert len(data["shanten_deltas"]) == 2
+        # 新 shard のサンプルは値が保持される
+        assert not np.isnan(data["shanten_deltas"][0])
+        np.testing.assert_allclose(data["shanten_deltas"][0], 1.5, atol=1e-6)
+        # 旧 shard のサンプルは NaN
+        assert np.isnan(data["shanten_deltas"][1])
+
+    def test_shanten_delta_shard_info(self, tmp_path: Path):
+        """CQ-0146: shanten_delta_shard_info が正しく報告される"""
+        # shard 1: shanten_delta あり
+        new_dir = tmp_path / "worker_0"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        writer1 = ShardWriter(new_dir, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.shanten_delta = 1.0
+        writer1.add(s1)
+        writer1.close()
+
+        # shard 2: shanten_delta なし
+        old_dir = tmp_path / "worker_1"
+        old_dir.mkdir(parents=True, exist_ok=True)
+        writer2 = ShardWriter(old_dir, max_samples=100)
+        s2 = _make_sample(step_id=1)
+        writer2.add(s2)
+        writer2.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        info = data["shanten_delta_shard_info"]
+        assert info["available"] == 1
+        assert info["total"] == 2
+
+
+class TestCurrentShantenShard:
+    """CQ-0151: current_shanten の shard 読み書きテスト"""
+
+    def test_current_shanten_roundtrip(self, tmp_path: Path):
+        """current_shanten の書き込み→読み取りが一致する"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.current_shanten = 3
+        s2 = _make_sample(step_id=1)
+        s2.current_shanten = 0
+        writer.add(s1)
+        writer.add(s2)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["current_shantens"] is not None
+        assert len(data["current_shantens"]) == 2
+        assert data["current_shantens"][0] == 3
+        assert data["current_shantens"][1] == 0
+
+    def test_current_shanten_none_returns_none(self, tmp_path: Path):
+        """全サンプルが None のとき None が返る"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s = _make_sample(step_id=0)
+        assert s.current_shanten is None
+        writer.add(s)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["current_shantens"] is None

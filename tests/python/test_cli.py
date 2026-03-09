@@ -7,7 +7,7 @@ from unittest.mock import patch
 pytestmark = pytest.mark.smoke
 
 from mahjong_rl.cli import (
-    main, _apply_override, _parse_value, run_batch, _resolve_seeds,
+    main, _apply_override, _deep_set, _parse_value, run_batch, _resolve_seeds,
     run_batch_resume, _detect_completed_seeds, run_sweep,
     run_sweep_resume, _find_batch_dir,
 )
@@ -119,6 +119,75 @@ class TestApplyOverride:
         config = ExperimentConfig()
         with pytest.raises(ValueError, match="section.key"):
             _apply_override(config, "only_one_part", "value")
+
+
+class TestDeepOverride:
+    """CQ-0144: deep-merge override のテスト"""
+
+    def test_deep_3level(self):
+        """深い leaf 設定が通る"""
+        config = ExperimentConfig(
+            reward={"type": "point_delta", "shaping": {"shanten_delta": {"enabled": False}}},
+        )
+        _apply_override(config, "reward.shaping.shanten_delta.enabled", "true")
+        assert config.reward["shaping"]["shanten_delta"]["enabled"] is True
+
+    def test_deep_creates_intermediate(self):
+        """存在しない中間 dict を自動生成"""
+        config = ExperimentConfig(reward={"type": "point_delta"})
+        _apply_override(config, "reward.shaping.shanten_delta.scale", "0.01")
+        assert config.reward["shaping"]["shanten_delta"]["scale"] == 0.01
+
+    def test_deep_sibling_preserved(self):
+        """兄弟キーが消えない"""
+        config = ExperimentConfig(
+            reward={"type": "point_delta", "shaping": {
+                "shanten_delta": {"enabled": False, "scale": 0.01, "mode": "both"},
+            }},
+        )
+        _apply_override(config, "reward.shaping.shanten_delta.enabled", "true")
+        assert config.reward["shaping"]["shanten_delta"]["enabled"] is True
+        assert config.reward["shaping"]["shanten_delta"]["scale"] == 0.01
+        assert config.reward["shaping"]["shanten_delta"]["mode"] == "both"
+        assert config.reward["type"] == "point_delta"
+
+    def test_json_override_compat(self):
+        """JSON 1塊 override が従来通り動作"""
+        config = ExperimentConfig(reward={"type": "point_delta"})
+        _apply_override(
+            config, "reward.shaping",
+            '{"shanten_delta": {"enabled": true, "scale": 0.01}}',
+        )
+        assert config.reward["shaping"]["shanten_delta"]["enabled"] is True
+        assert config.reward["shaping"]["shanten_delta"]["scale"] == 0.01
+
+    def test_scalar_to_dict_conflict(self):
+        """scalar に深いキーで辿ると ValueError"""
+        config = ExperimentConfig(reward={"type": "point_delta"})
+        with pytest.raises(ValueError, match="非 dict"):
+            _apply_override(config, "reward.type.sub.key", "value")
+
+    def test_dict_to_scalar_override(self):
+        """dict を scalar で上書きは許可"""
+        config = ExperimentConfig(
+            reward={"shaping": {"shanten_delta": {"enabled": True}}},
+        )
+        _apply_override(config, "reward.shaping", "null")
+        assert config.reward["shaping"] is None
+
+    def test_2level_backward_compat(self):
+        """既存2階層互換"""
+        config = ExperimentConfig(experiment={"name": "test", "global_seed": 0})
+        _apply_override(config, "experiment.global_seed", "42")
+        assert config.experiment["global_seed"] == 42
+
+    def test_list_full_replace(self):
+        """list は deep merge せず全置換"""
+        config = ExperimentConfig(
+            model={"hidden_dims": [64, 64]},
+        )
+        _apply_override(config, "model.hidden_dims", "[128, 128, 128]")
+        assert config.model["hidden_dims"] == [128, 128, 128]
 
 
 class TestValidateOnly:
