@@ -213,6 +213,35 @@ model:
       enabled: true
 ```
 
+#### 7.4.2 task-specific tower (CQ-0157)
+
+shared trunk の後に task-specific tower (1 hidden layer) を追加できる。
+
+- `policy_tower`: enabled 時、trunk 出力に `Linear(trunk_out, hidden_dim) + ReLU` を挟んでから policy head に渡す
+- `value_tower`: enabled 時、trunk+aux 出力に `Linear(trunk_out + value_aux_dim, hidden_dim) + ReLU` を挟んでから value heads に渡す
+- 両方 off で現行構造を完全維持（後方互換）
+- `current_shanten` は value tower の入力に含まれる（policy tower には入らない）
+
+config 例:
+```yaml
+model:
+  policy_tower:
+    enabled: false
+    hidden_dim: 128
+  value_tower:
+    enabled: false
+    hidden_dim: 128
+```
+
+成果物追跡:
+- `summary.json.model_features.policy_tower.{enabled, hidden_dim}`
+- `summary.json.model_features.value_tower.{enabled, hidden_dim}`
+- `batch_summary.json.runs[*].model_features` に同上
+
+実験方針注記:
+- tower 比較実験では `current_shanten=true` を全条件で固定し、差分を tower 構造だけにする
+- `exp_024 D` は旧診断世代（CQ-0155/0156 以前）のため今回の baseline に使わず、small model + `current_shanten=true` を新規取得する
+
 ---
 
 ## 8. 現仕様: Action / legal mask
@@ -351,7 +380,12 @@ raw `shanten_delta` の符号で 3 群に分割した診断統計を `ppo_diag.s
 - `count`
 - `advantage`: mean, std, p50, p90, p99, positive_ratio, negative_ratio
 - `return`: mean, std, p50, p90, p99
+- `old_value`: mean, std, p50, p90, p99 (CQ-0155)
 - `value_error`: mean, std, p50, p90, p99
+- `new_value`: mean, std, p50, p90, p99 (CQ-0155, PPO 学習完了後の value 予測)
+- `value_update_delta`: mean, std, p50, p90, p99 (CQ-0155, = new_value - old_value)
+
+`new_value` / `value_update_delta` は PPO 学習ループ完了後に全データに対して 1 回推論して取得する per-sample 値。
 
 count == 0 の群は `{"count": 0}` のみ。
 
@@ -369,12 +403,43 @@ count == 0 の群は `{"count": 0}` のみ。
 - `summary.json.phase_stats.learner.ppo_diag.shanten_diag`（既存 ppo_diag 転送パス経由）
 - `batch_summary.json.runs[].learner_diag.shanten_diag`（同上）
 
+#### 成果物キー: turn_diag (CQ-0156)
+PPO learner が turn_number 付き shard を受け取った場合、巡目バケット別の診断統計を
+`ppo_diag.turn_diag` に格納する。
+
+バケット定義（固定）:
+- `early`: turn 0-5
+- `mid`: turn 6-11
+- `late`: turn 12+
+
+各バケット:
+- `count`
+- `advantage`: mean, std, p50, p90, p99, positive_ratio, negative_ratio
+- `return`: mean, std, p50, p90, p99
+- `old_value`: mean, std, p50, p90, p99
+- `value_error`: mean, std, p50, p90, p99
+- `new_value`: mean, std, p50, p90, p99 (PPO 学習完了後)
+- `value_update_delta`: mean, std, p50, p90, p99 (= new_value - old_value)
+
+count == 0 のバケットは `{"count": 0}` のみ。
+
+データフロー:
+- `turn_number` は `LearningSample` のオプショナルフィールド（shard 条件付きカラム）
+- selfplay_worker が `env.env_state.round_state.turn_number` から取得
+- learner が shard 読み込み時に `turn_numbers` として受け取り、`_train_ppo` に転送
+
+出力先:
+- `metrics/train_metrics.json.ppo_diag.turn_diag`
+- `summary.json.phase_stats.learner.ppo_diag.turn_diag`（既存 ppo_diag 転送パス経由）
+- `batch_summary.json.runs[].learner_diag.turn_diag`（同上）
+
 #### 後方互換
 - `reward.shaping` 未指定 or `shanten_delta.enabled: false` → shaping 無効、`total = point_delta` のまま
 - 既存 config で動作が変わらないことをテストで保証
 - 新規キーは追加のみ、既存キーの削除・改名なし
 - shanten_delta カラムがない shard → `shanten_deltas = None`、shanten_diag 省略
 - mixed shard（旧/新混在）→ 欠落サンプルは NaN、same 群に混入しない
+- turn_number カラムがない shard → `turn_numbers = None`、turn_diag 省略
 
 ### 9.5 将来案
 

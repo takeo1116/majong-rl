@@ -1,6 +1,6 @@
 # PROJECT.md
 
-最終更新: 2026-03-10  
+最終更新: 2026-03-11  
 この文書の役割: プロジェクトの大目標・現在地・次アクションを短時間で復元する意思決定ハブ。
 
 ---
@@ -12,9 +12,9 @@
 
 ---
 
-## 2. 現在地（2026-03-08）
+## 2. 現在地（2026-03-10）
 
-フェーズ: **Stage1後半（reward shaping 固定後の value/target 診断フェーズ）**
+フェーズ: **Stage1後半（value 診断改善と policy 更新安定性のトレードオフ切り分けフェーズ）**
 
 - できている
   - runbook/report/driver 運用、phase 再利用、resume
@@ -23,9 +23,11 @@
   - `shanten_hint` と `tie_aware_best_set` の導入・比較
   - learner 診断統計（`ppo_diag`）の成果物化
 - 未解決
-  - warm start + PPO での平均悪化（`eval_before -> eval`）
-  - 固定した shaping 条件の下でも、`improve/worsen` 群で advantage の符号が整合しない理由
-  - value/target 側でどこまで説明できるかの確定
+  - 固定した shaping 条件と joint imitation 条件の下でも、`improve/worsen` 群で advantage の符号が整合しない理由
+  - value 診断改善と通常評価改善がなぜ乖離するのか
+  - hidden size 拡大で `clip_fraction` / `ratio_std` が悪化する理由
+  - 単純な `lr` / `epochs` 弱化で上記トレードオフを解けない理由
+  - value/target 改善と policy 更新安定性の両立条件
 
 ---
 
@@ -33,7 +35,7 @@
 
 現在の主目的は次の1点。
 
-> reward shaping 条件を固定し、その後に残る PPO 悪化を value/target 側へ切り分ける。特に、改善打牌/悪化打牌ごとの advantage 整合を回復できるかを見る。
+> reward shaping 条件と joint imitation 条件を固定した上で、`shanten_diag` / `turn_diag` と PPO 更新安定性指標を併せて見て、value 診断改善と通常評価悪化の乖離、そしてそのトレードオフが単純な PPO 弱化で解けるかを説明する。
 
 現行固定軸（診断基準点）:
 
@@ -95,6 +97,28 @@
   - `improve` 群の advantage mean は依然として負、`worsen` 群の advantage mean は依然として正
   - baseline reward と標準 shaping reward で `shanten_diag` はほぼ変わらず、reward sparse 性だけでは残差を説明できない
   - 次段は reward 探索より value/target 仮説を優先する
+- `exp_024`（joint imitation + value current_shanten）
+  - `imitation_value_warmstart.coef=0.1` は通常評価（`eval_before -> eval` / after 指標）を改善
+  - ただし `shanten_diag` の符号整合は回復せず、`improve` はなお負、`worsen` はなお正
+  - value current_shanten の追加価値は見えず、当面は不採用
+  - 暫定標準候補は「reward shaping 標準 + joint imitation coef=0.1 + current_shanten off」
+- `exp_025`（B 条件単条件診断）
+  - `shanten_diag` に `old_value/new_value/value_update_delta` を追加した診断で、`improve` 群の value misfit が最も大きいことを確認
+  - `turn_diag` では `late` bucket の `value_error` が `early/mid` より大きく、終盤で value misfit が強い
+  - 次段は reward 探索ではなく、value/target 改善仮説を比較する
+- `exp_026`（大きいモデル + value current shanten）
+  - `shanten_diag` / `turn_diag` / global `value_error` は改善し、表現力不足仮説は一定程度支持された
+  - ただし通常評価は `exp_025` を更新できず不採用
+  - 診断改善と通常評価改善が一致しないため、次は改善要因の分離が必要
+- `exp_027`（強化版 value 表現のスケーリング）
+  - `[768,384]` / `[1024,512]` でも `shanten_diag` / `turn_diag` / global `value_error` はさらに改善した
+  - 一方で通常評価はさらに悪化し、`clip_fraction` と `ratio_std` も悪化した
+  - value 表現強化そのものは有効だが、現状では policy 更新安定性とのトレードオフが強く、単純なサイズ拡大は採用しない
+- `exp_028`（大きめモデル条件で PPO 更新強度を弱化）
+  - `weak-lr` は `clip_fraction` / `ratio_std` をほぼ `exp_025` 近傍まで戻し、通常評価も `exp_027 A` より回復した
+  - ただし `shanten_diag` / `turn_diag` の value 診断改善はほぼ失われ、`exp_025` 近傍へ戻った
+  - `weak-epochs` は value 診断改善を維持したが通常評価はさらに悪化した
+  - 単純な `lr` / `epochs` 弱化だけでは、value 診断改善と通常評価改善の両立はできない
 
 ---
 
@@ -111,6 +135,10 @@
 - `scale=0.1` の極端 shaping
 - `mode=improve_only`
 - reward shaping の追加比較を続けること（当面は learner/value 仮説を優先）
+- `model.value_features.current_shanten.enabled=true` の追加比較（現時点では価値が見えない）
+- reward shaping の追加探索（value/target の残差説明が先）
+- hidden size 拡大 + current shanten 同時導入を、そのまま採用すること
+- 大きめモデル条件で `lr` / `epochs` を単純に弱めれば解決するとみなすこと
 
 再検討条件:
 
@@ -127,11 +155,18 @@ run 成果物で確認可能:
 - self-play 統計（wins/deal-ins/draws/tsumo/ron/ryukyoku/num_rounds）
 - reward 内訳統計（`point_delta/shanten_delta/total` の `mean/std/p50/p90/p99`）
 - reward shaping 設定（`enabled/scale/mode/schedule_type`）
+- imitation metrics
+  - `value_loss`
+  - `imitation_value_warmstart`
+  - `model_features.value_features.current_shanten.enabled`
 - learner 診断統計 `ppo_diag`
   - `advantage_*`, `return_*`, `old_value_*`, `value_error_*`, `ratio_*`, `clip_fraction`
   - `shanten_diag`
-    - `improve/same/worsen` ごとの `advantage/return/value_error`
+    - `improve/same/worsen` ごとの `advantage/return/old_value/new_value/value_update_delta/value_error`
     - `available_samples/unavailable_samples/status`
+- `turn_diag`
+    - `early/mid/late` ごとの `advantage/return/old_value/new_value/value_update_delta/value_error`
+- 大きいモデル + current shanten 条件での同診断（`exp_026`）との比較
 - batch 側 run 別 learner 診断統計
 
 不足が出たら CQ 化して可観測性を先に上げる（推測で進めない）。
@@ -145,7 +180,7 @@ run 成果物で確認可能:
 必須条件:
 
 1. 主比較条件で `eval_before -> eval` の悪化が消える（少なくとも 5 seeds で一貫して改善または非悪化）
-2. learner 診断統計が安定（ratio tail / clip_fraction / value_error が過大でない）
+2. `shanten_diag` を含む learner 診断統計が、少なくとも改善方向と矛盾しない
 3. 追加1回の再現実験でも同傾向が出る
 
 達成後の次段:
@@ -181,4 +216,4 @@ run 成果物で確認可能:
 
 ## 10. 一文要約
 
-**imitation 改善と reward sparse 緩和までは前進したが、`improve/worsen` 群の advantage はまだ整合していない。次は value/target 問題を本命として切り分ける。**
+**reward shaping と joint imitation で通常評価は前進したが、`improve/worsen` 群の advantage はまだ整合していない。value 表現を強めると診断値は一貫して改善する一方、通常評価はむしろ悪化し、さらに単純な `lr` / `epochs` 弱化でもそのトレードオフは解けなかった。次は policy-value 干渉または target 定義を本丸として切る必要がある。**
