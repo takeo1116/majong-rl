@@ -1111,3 +1111,143 @@ class TestCurrentShantenBatch:
         # seed 42 には model_features あり、seed 43 にはなし
         assert "model_features" in summary["runs"][0]
         assert "model_features" not in summary["runs"][1]
+
+
+class TestTurnDiagBatch:
+    """CQ-0156: turn_diag の batch レポートテスト"""
+
+    def _make_result_with_turn_diag(self, tmp_path: Path, seed: int,
+                                     include_turn_diag: bool = True):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ppo_diag = {
+            "advantage_mean": 0.01,
+            "clip_fraction": 0.05,
+            "ratio_mean": 1.0,
+        }
+        if include_turn_diag:
+            ppo_diag["turn_diag"] = {
+                "total_samples": 90,
+                "early": {"count": 30, "advantage": {"mean": 0.02}},
+                "mid": {"count": 30, "advantage": {"mean": -0.01}},
+                "late": {"count": 30, "advantage": {"mean": 0.0}},
+            }
+        summary_data = {
+            "phase_stats": {"learner": {"ppo_diag": ppo_diag}},
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_turn_diag_in_runs(self, tmp_path: Path):
+        """runs[*].learner_diag.turn_diag が参照可能"""
+        results = [self._make_result_with_turn_diag(tmp_path, 42)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "learner_diag" in run_entry
+        assert "turn_diag" in run_entry["learner_diag"]
+        td = run_entry["learner_diag"]["turn_diag"]
+        assert td["early"]["count"] == 30
+
+    def test_turn_diag_mixed_no_crash(self, tmp_path: Path):
+        """turn_diag あり/なし混在でクラッシュしない"""
+        results = [
+            self._make_result_with_turn_diag(tmp_path, 42, include_turn_diag=True),
+            self._make_result_with_turn_diag(tmp_path, 43, include_turn_diag=False),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert summary["success_count"] == 2
+        # seed 42 has turn_diag, seed 43 doesn't
+        assert "turn_diag" in summary["runs"][0]["learner_diag"]
+        assert "turn_diag" not in summary["runs"][1]["learner_diag"]
+
+
+class TestTowerBatch:
+    """CQ-0158: tower 構造の batch レポートテスト"""
+
+    def _make_result_with_tower(self, tmp_path: Path, seed: int,
+                                 pt_enabled: bool = False, vt_enabled: bool = False):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        summary_data = {
+            "phase_stats": {},
+            "model_features": {
+                "value_features": {"current_shanten": {"enabled": True}},
+                "policy_tower": {"enabled": pt_enabled, "hidden_dim": 16 if pt_enabled else None},
+                "value_tower": {"enabled": vt_enabled, "hidden_dim": 16 if vt_enabled else None},
+            },
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_tower_in_runs(self, tmp_path: Path):
+        """runs[*].model_features から tower 条件が読める"""
+        results = [self._make_result_with_tower(tmp_path, 42, pt_enabled=True, vt_enabled=True)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "model_features" in run_entry
+        mf = run_entry["model_features"]
+        assert mf["policy_tower"]["enabled"] is True
+        assert mf["policy_tower"]["hidden_dim"] == 16
+        assert mf["value_tower"]["enabled"] is True
+        assert mf["value_tower"]["hidden_dim"] == 16
+
+    def test_tower_mixed_no_crash(self, tmp_path: Path):
+        """tower あり/なし混在で batch 集約が落ちない"""
+        results = [
+            self._make_result_with_tower(tmp_path, 42, pt_enabled=True, vt_enabled=True),
+        ]
+        # seed 43: model_features なし (旧形式)
+        run_dir_43 = tmp_path / "fake_run_43"
+        run_dir_43.mkdir(parents=True, exist_ok=True)
+        summary_data = {"phase_stats": {}}
+        with open(run_dir_43 / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        results.append({
+            "seed": 43,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir_43),
+                "global_seed": 43,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        })
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert summary["success_count"] == 2
+        assert "model_features" in summary["runs"][0]
+        assert "model_features" not in summary["runs"][1]

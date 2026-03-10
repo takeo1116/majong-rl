@@ -188,6 +188,9 @@ class SelfPlayWorker:
             current = env.current_player
             mask = env.get_legal_mask()
 
+            # CQ-0156: 巡目診断用
+            turn_number_val = env.env_state.round_state.turn_number
+
             # CQ-0151: current_shanten 計算（shanten_delta とは独立に計算可能）
             current_shanten_val = None
             hand = None
@@ -292,6 +295,7 @@ class SelfPlayWorker:
                     teacher_best_mask=teacher_best_mask if actor_type == "baseline" else None,
                     shanten_delta=shanten_delta_raw,  # CQ-0145: schedule 適用前の raw delta
                     current_shanten=current_shanten_val,  # CQ-0151: value head 用
+                    turn_number=turn_number_val,  # CQ-0156: 巡目診断用
                 )
                 self._writer.add(sample)
                 sample_step += 1

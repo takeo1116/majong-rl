@@ -1184,3 +1184,137 @@ class TestJointImitation:
         assert metrics["imitation_loss_mode"] == "tie_aware_best_set"
         assert metrics["value_loss"] > 0.0
         assert metrics["policy_loss"] > 0.0
+
+
+def _write_shards_with_turn_number(
+    shard_dir: Path, n: int = 90, obs_dim: int = 100,
+) -> None:
+    """turn_number + shanten_delta 付きダミー shard を書き出す"""
+    writer = ShardWriter(shard_dir, max_samples=10000)
+    for i in range(n):
+        # turn_number: 0-17 に分散
+        tn = i % 18
+        # shanten_delta: 3群に分散
+        if i % 3 == 0:
+            sd = float(np.random.randint(1, 4))
+        elif i % 3 == 1:
+            sd = 0.0
+        else:
+            sd = float(-np.random.randint(1, 3))
+        writer.add(LearningSample(
+            observation=np.random.randn(obs_dim).astype(np.float32),
+            legal_mask=(np.random.rand(34) > 0.5).astype(np.float32),
+            action=np.random.randint(0, 34),
+            reward=np.random.randn() * 0.01,
+            log_prob=-np.random.rand(),
+            value=np.random.randn() * 0.1,
+            terminated=(i == n - 1),
+            round_over=(i % 20 == 19),
+            experiment_id="dummy_exp",
+            run_id="dummy_run",
+            worker_id="dummy_worker",
+            episode_id="dummy_ep",
+            step_id=i,
+            shanten_delta=sd,
+            turn_number=tn,
+        ))
+    writer.close()
+
+
+class TestShantenDiagValueBreakdown:
+    """CQ-0155: shanten_diag に old_value/new_value/value_update_delta を追加"""
+
+    def _run(self, tmp_path: Path) -> dict:
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_turn_number(shard_dir, n=90, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["epochs"] = 2
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        return learner.train(shard_dir)
+
+    def test_old_value_in_groups(self, tmp_path: Path):
+        """各群に old_value が存在し mean/std/p50/p90/p99 がある"""
+        metrics = self._run(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        expected_keys = {"mean", "std", "p50", "p90", "p99"}
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            assert entry["count"] > 0
+            assert "old_value" in entry
+            assert expected_keys <= set(entry["old_value"].keys())
+
+    def test_new_value_in_groups(self, tmp_path: Path):
+        """各群に new_value が存在"""
+        metrics = self._run(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        expected_keys = {"mean", "std", "p50", "p90", "p99"}
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            assert entry["count"] > 0
+            assert "new_value" in entry
+            assert expected_keys <= set(entry["new_value"].keys())
+
+    def test_value_update_delta_in_groups(self, tmp_path: Path):
+        """value_update_delta が存在し定義通り (new_value - old_value)"""
+        metrics = self._run(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            assert entry["count"] > 0
+            assert "value_update_delta" in entry
+            # value_update_delta の全統計値が有限
+            for v in entry["value_update_delta"].values():
+                assert np.isfinite(v), f"{group}.value_update_delta に非有限値"
+
+
+class TestTurnDiag:
+    """CQ-0156: 巡目バケット別 learner 診断テスト"""
+
+    def _run(self, tmp_path: Path) -> dict:
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_turn_number(shard_dir, n=90, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["epochs"] = 2
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        return learner.train(shard_dir)
+
+    def test_turn_diag_buckets_exist(self, tmp_path: Path):
+        """early/mid/late バケットが存在し count > 0"""
+        metrics = self._run(tmp_path)
+        assert "turn_diag" in metrics["ppo_diag"]
+        td = metrics["ppo_diag"]["turn_diag"]
+        for bucket in ("early", "mid", "late"):
+            assert bucket in td
+            assert td[bucket]["count"] > 0
+
+    def test_turn_diag_stats_keys(self, tmp_path: Path):
+        """各バケットに return/old_value/advantage 等が存在"""
+        metrics = self._run(tmp_path)
+        td = metrics["ppo_diag"]["turn_diag"]
+        expected_stat_keys = {"mean", "std", "p50", "p90", "p99"}
+        for bucket in ("early", "mid", "late"):
+            entry = td[bucket]
+            assert entry["count"] > 0
+            for series in ("advantage", "return", "old_value", "value_error"):
+                assert series in entry
+                assert expected_stat_keys <= set(entry[series].keys())
+            # new_value / value_update_delta も存在
+            assert "new_value" in entry
+            assert "value_update_delta" in entry
+
+    def test_turn_diag_advantage_ratios(self, tmp_path: Path):
+        """advantage に positive_ratio/negative_ratio がある"""
+        metrics = self._run(tmp_path)
+        td = metrics["ppo_diag"]["turn_diag"]
+        for bucket in ("early", "mid", "late"):
+            entry = td[bucket]
+            assert entry["count"] > 0
+            adv = entry["advantage"]
+            assert "positive_ratio" in adv
+            assert "negative_ratio" in adv
+            assert 0.0 <= adv["positive_ratio"] <= 1.0
+            assert 0.0 <= adv["negative_ratio"] <= 1.0

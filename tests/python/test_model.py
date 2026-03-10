@@ -243,3 +243,82 @@ class TestValueAuxZeroPad:
             out_aux = model(features, legal_mask, value_aux_features=value_aux)
         # policy logits は value_aux_features に依存しない
         assert torch.allclose(out_none.logits, out_aux.logits)
+
+
+class TestTowerStructure:
+    """CQ-0157: task-specific tower 構造テスト"""
+
+    def test_baseline_no_tower(self):
+        """tower off で従来出力 shape と一致"""
+        model = MLPPolicyValueModel(input_dim=353, hidden_dims=[64, 32])
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        output = model(features, legal_mask)
+        assert output.logits.shape == (4, 34)
+        assert output.values["round_delta"].shape == (4, 1)
+        # tower 属性は None
+        assert model.policy_tower is None
+        assert model.value_tower is None
+
+    def test_policy_tower_only(self):
+        """policy tower on, value tower off"""
+        model = MLPPolicyValueModel(
+            input_dim=353, hidden_dims=[64, 32],
+            policy_tower_config={"enabled": True, "hidden_dim": 16},
+        )
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        output = model(features, legal_mask)
+        assert output.logits.shape == (4, 34)
+        assert output.values["round_delta"].shape == (4, 1)
+        assert model.policy_tower is not None
+        assert model.value_tower is None
+
+    def test_value_tower_only(self):
+        """value tower on, policy tower off"""
+        model = MLPPolicyValueModel(
+            input_dim=353, hidden_dims=[64, 32],
+            value_tower_config={"enabled": True, "hidden_dim": 16},
+        )
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        output = model(features, legal_mask)
+        assert output.logits.shape == (4, 34)
+        assert output.values["round_delta"].shape == (4, 1)
+        assert model.policy_tower is None
+        assert model.value_tower is not None
+
+    def test_dual_towers(self):
+        """both towers on"""
+        model = MLPPolicyValueModel(
+            input_dim=353, hidden_dims=[64, 32],
+            policy_tower_config={"enabled": True, "hidden_dim": 16},
+            value_tower_config={"enabled": True, "hidden_dim": 16},
+        )
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        output = model(features, legal_mask)
+        assert output.logits.shape == (4, 34)
+        assert output.values["round_delta"].shape == (4, 1)
+        assert model.policy_tower is not None
+        assert model.value_tower is not None
+
+    def test_tower_with_current_shanten(self):
+        """dual towers + value_aux_dim=1 で shape 正しい"""
+        model = MLPPolicyValueModel(
+            input_dim=353, hidden_dims=[64, 32],
+            value_aux_dim=1,
+            policy_tower_config={"enabled": True, "hidden_dim": 16},
+            value_tower_config={"enabled": True, "hidden_dim": 16},
+        )
+        features = torch.randn(4, 353)
+        legal_mask = torch.ones(4, 34)
+        value_aux = torch.randn(4, 1)
+        # aux あり
+        output = model(features, legal_mask, value_aux_features=value_aux)
+        assert output.logits.shape == (4, 34)
+        assert output.values["round_delta"].shape == (4, 1)
+        # aux なし (zero pad)
+        output_none = model(features, legal_mask)
+        assert output_none.logits.shape == (4, 34)
+        assert output_none.values["round_delta"].shape == (4, 1)

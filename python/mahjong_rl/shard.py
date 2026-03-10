@@ -46,6 +46,7 @@ class LearningSample:
     teacher_best_mask: np.ndarray | None = None  # (34,) float32, 教師最良候補集合 (CQ-0125)
     shanten_delta: float | None = None  # shanten 変化量 (CQ-0145)
     current_shanten: int | None = None  # 現在シャンテン数 (CQ-0151)
+    turn_number: int | None = None  # 巡目 (CQ-0156)
 
 
 def validate_metadata(sample: LearningSample) -> None:
@@ -191,6 +192,13 @@ class ShardWriter:
                 for s in self._buffer
             ]
 
+        # turn_number: 1つでも非 None があればカラム書き出し (CQ-0156)
+        if any(s.turn_number is not None for s in self._buffer):
+            data["turn_number"] = [
+                int(s.turn_number) if s.turn_number is not None else -1
+                for s in self._buffer
+            ]
+
         self._backend.write(data, path)
         self._buffer.clear()
         self._shard_counter += 1
@@ -288,6 +296,9 @@ class ShardReader:
         # CQ-0151: current_shanten
         all_current_shantens: list[int] = []
         has_current_shanten = False
+        # CQ-0156: turn_number
+        all_turn_numbers: list[int] = []
+        has_turn_number = False
 
         for path in self._find_shards():
             table = self._backend.read(path)
@@ -339,6 +350,13 @@ class ShardReader:
             else:
                 all_current_shantens.extend([-1] * n)
 
+            # turn_number (CQ-0156): カラム存在時のみ読み込み
+            if "turn_number" in table.column_names:
+                has_turn_number = True
+                all_turn_numbers.extend(table.column("turn_number").to_pylist())
+            else:
+                all_turn_numbers.extend([-1] * n)
+
         if not all_obs:
             return {
                 "observations": np.zeros((0, 0), dtype=np.float32),
@@ -354,6 +372,7 @@ class ShardReader:
                 "shanten_deltas": None,
                 "shanten_delta_shard_info": {"available": 0, "total": 0},
                 "current_shantens": None,
+                "turn_numbers": None,
             }
 
         result = {
@@ -394,6 +413,12 @@ class ShardReader:
         else:
             result["current_shantens"] = None
 
+        # turn_numbers (CQ-0156): 全 shard にカラムがある場合のみ配列化
+        if has_turn_number and all(v >= 0 for v in all_turn_numbers):
+            result["turn_numbers"] = np.array(all_turn_numbers, dtype=np.int32)
+        else:
+            result["turn_numbers"] = None
+
         if filter_actor_type is not None:
             actor_mask = result["actor_types"] == filter_actor_type
             tbm = result.pop("teacher_best_masks")
@@ -401,11 +426,13 @@ class ShardReader:
             sd = result.pop("shanten_deltas")
             sd_shard_info = result.pop("shanten_delta_shard_info")
             cs = result.pop("current_shantens")
+            tn = result.pop("turn_numbers")
             result = {k: v[actor_mask] for k, v in result.items()}
             result["teacher_best_masks"] = tbm[actor_mask] if tbm is not None else None
             result["teacher_best_mask_shard_info"] = shard_info
             result["shanten_deltas"] = sd[actor_mask] if sd is not None else None
             result["shanten_delta_shard_info"] = sd_shard_info
             result["current_shantens"] = cs[actor_mask] if cs is not None else None
+            result["turn_numbers"] = tn[actor_mask] if tn is not None else None
 
         return result

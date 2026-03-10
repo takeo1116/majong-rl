@@ -107,6 +107,9 @@ class Learner:
         # CQ-0151: current_shantens (value head 補助特徴)
         raw_current_shantens = data.get("current_shantens")
 
+        # CQ-0156: turn_numbers (巡目診断用)
+        raw_turn_numbers = data.get("turn_numbers")
+
         # teacher_best_masks (CQ-0125, CQ-0128)
         raw_teacher_best_masks = data.get("teacher_best_masks")
         tbm_shard_info = data.get("teacher_best_mask_shard_info", {})
@@ -185,7 +188,8 @@ class Learner:
                 observations, legal_masks, actions, rewards,
                 old_log_probs, old_values, terminateds, n, epochs,
                 shanten_deltas=raw_shanten_deltas,
-                value_aux_features=current_shantens_t)
+                value_aux_features=current_shantens_t,
+                turn_numbers=raw_turn_numbers)
         profiler.stop("model_forward")
 
         metrics["mode"] = self._mode
@@ -240,6 +244,7 @@ class Learner:
         epochs: int,
         shanten_deltas: np.ndarray | None = None,
         value_aux_features: torch.Tensor | None = None,
+        turn_numbers: np.ndarray | None = None,
     ) -> dict:
         """PPO 学習"""
         advantages, returns = self._compute_gae(rewards, old_values, terminateds)
@@ -316,11 +321,32 @@ class Learner:
                 all_ratios, all_new_values,
                 clip_epsilon=self._clip_epsilon,
             )
-            # CQ-0145: shanten 変化別 advantage 診断
+
+            # CQ-0155: per-sample final new_values (学習完了後の value 予測)
+            final_new_values_parts: list[torch.Tensor] = []
+            self._model.eval()
+            with torch.no_grad():
+                for s in range(0, n, self._batch_size):
+                    e = min(s + self._batch_size, n)
+                    bvaux = value_aux_features[s:e] if value_aux_features is not None else None
+                    out = self._model(observations[s:e], legal_masks[s:e], value_aux_features=bvaux)
+                    final_new_values_parts.append(list(out.values.values())[0].squeeze(-1).cpu())
+            self._model.train()
+            final_new_values_t = torch.cat(final_new_values_parts)
+
+            # CQ-0145/CQ-0155: shanten 変化別 advantage 診断
             if shanten_deltas is not None:
                 metrics["ppo_diag"]["shanten_diag"] = (
                     self._compute_shanten_conditioned_diag(
-                        advantages, returns, old_values, shanten_deltas))
+                        advantages, returns, old_values, shanten_deltas,
+                        new_values=final_new_values_t))
+
+            # CQ-0156: 巡目バケット別診断
+            if turn_numbers is not None:
+                metrics["ppo_diag"]["turn_diag"] = (
+                    self._compute_turn_conditioned_diag(
+                        advantages, returns, old_values, turn_numbers,
+                        new_values=final_new_values_t))
 
         return metrics
 
@@ -536,6 +562,7 @@ class Learner:
         returns: torch.Tensor,
         old_values: torch.Tensor,
         shanten_deltas: np.ndarray,
+        new_values: torch.Tensor | None = None,
     ) -> dict:
         """shanten 変化別の advantage/return/value_error 診断統計 (CQ-0145, CQ-0146)
 
@@ -544,7 +571,9 @@ class Learner:
         """
         adv_np = advantages.cpu().numpy().astype(np.float64)
         ret_np = returns.cpu().numpy().astype(np.float64)
-        val_err_np = (old_values.cpu().numpy().astype(np.float64)) - ret_np
+        old_val_np = old_values.cpu().numpy().astype(np.float64)
+        val_err_np = old_val_np - ret_np
+        new_val_np = new_values.cpu().numpy().astype(np.float64) if new_values is not None else None
         sd = shanten_deltas.astype(np.float64)
 
         # CQ-0146: NaN は unavailable として除外
@@ -599,8 +628,82 @@ class Learner:
             entry["advantage"] = adv_stats
             # return
             entry["return"] = _group_stats(ret_np[mask])
+            # CQ-0155: old_value
+            entry["old_value"] = _group_stats(old_val_np[mask])
             # value_error
             entry["value_error"] = _group_stats(val_err_np[mask])
+            # CQ-0155: new_value / value_update_delta
+            if new_val_np is not None:
+                entry["new_value"] = _group_stats(new_val_np[mask])
+                delta = new_val_np[mask] - old_val_np[mask]
+                entry["value_update_delta"] = _group_stats(delta)
+            result[name] = entry
+        return result
+
+    @staticmethod
+    def _compute_turn_conditioned_diag(
+        advantages: torch.Tensor,
+        returns: torch.Tensor,
+        old_values: torch.Tensor,
+        turn_numbers: np.ndarray,
+        new_values: torch.Tensor | None = None,
+    ) -> dict:
+        """巡目バケット別の診断統計 (CQ-0156)
+
+        バケット: early (0-5), mid (6-11), late (12+)
+        """
+        adv_np = advantages.cpu().numpy().astype(np.float64)
+        ret_np = returns.cpu().numpy().astype(np.float64)
+        old_val_np = old_values.cpu().numpy().astype(np.float64)
+        new_val_np = new_values.cpu().numpy().astype(np.float64) if new_values is not None else None
+        tn = turn_numbers.astype(np.int32)
+
+        buckets = {
+            "early": (0, 5),
+            "mid": (6, 11),
+            "late": (12, None),
+        }
+
+        def _group_stats(arr: np.ndarray) -> dict:
+            return {
+                "mean": float(np.mean(arr)),
+                "std": float(np.std(arr, ddof=0)),
+                "p50": float(np.percentile(arr, 50)),
+                "p90": float(np.percentile(arr, 90)),
+                "p99": float(np.percentile(arr, 99)),
+            }
+
+        result: dict = {"total_samples": len(tn)}
+        for name, (lo, hi) in buckets.items():
+            if hi is not None:
+                mask = (tn >= lo) & (tn <= hi)
+            else:
+                mask = tn >= lo
+            count = int(np.sum(mask))
+            if count == 0:
+                result[name] = {"count": 0}
+                continue
+            entry: dict = {"count": count}
+            # advantage
+            adv_g = adv_np[mask]
+            adv_stats = _group_stats(adv_g)
+            n_pos = int(np.sum(adv_g > 0))
+            n_neg = int(np.sum(adv_g < 0))
+            adv_stats["positive_ratio"] = n_pos / count
+            adv_stats["negative_ratio"] = n_neg / count
+            entry["advantage"] = adv_stats
+            # return
+            entry["return"] = _group_stats(ret_np[mask])
+            # old_value
+            entry["old_value"] = _group_stats(old_val_np[mask])
+            # value_error
+            val_err = old_val_np[mask] - ret_np[mask]
+            entry["value_error"] = _group_stats(val_err)
+            # new_value / value_update_delta
+            if new_val_np is not None:
+                entry["new_value"] = _group_stats(new_val_np[mask])
+                delta = new_val_np[mask] - old_val_np[mask]
+                entry["value_update_delta"] = _group_stats(delta)
             result[name] = entry
         return result
 

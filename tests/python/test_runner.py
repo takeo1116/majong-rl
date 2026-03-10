@@ -2601,3 +2601,94 @@ class TestCurrentShantenE2E:
         assert imi_stats["value_loss"] >= 0.0
         assert "imitation_value_warmstart" in imi_stats
         assert imi_stats["imitation_value_warmstart"]["enabled"] is True
+
+
+class TestTurnDiagIntegration:
+    """CQ-0156: turn_diag の統合テスト"""
+
+    def test_turn_diag_in_summary(self, tmp_path: Path):
+        """PPO run の summary.json に ppo_diag.turn_diag が存在する"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.selfplay["num_matches"] = 3
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        learner_stats = summary.get("phase_stats", {}).get("learner", {})
+        ppo_diag = learner_stats.get("ppo_diag", {})
+        # turn_diag が存在する
+        assert "turn_diag" in ppo_diag, f"ppo_diag keys: {list(ppo_diag.keys())}"
+        td = ppo_diag["turn_diag"]
+        # 少なくとも 1 バケットに count > 0
+        found = any(td.get(b, {}).get("count", 0) > 0 for b in ("early", "mid", "late"))
+        assert found, f"turn_diag: {td}"
+
+
+class TestTowerE2E:
+    """CQ-0157/CQ-0158: tower 構造の end-to-end テスト"""
+
+    def _run_with_tower(self, tmp_path: Path, pt_enabled: bool, vt_enabled: bool,
+                        suffix: str = "") -> dict:
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.model["value_features"] = {
+            "current_shanten": {"enabled": True},
+        }
+        if pt_enabled:
+            config.model["policy_tower"] = {"enabled": True, "hidden_dim": 16}
+        if vt_enabled:
+            config.model["value_tower"] = {"enabled": True, "hidden_dim": 16}
+        runner = Stage1Runner(config=config, base_dir=tmp_path / f"run_{suffix}")
+        return runner.run()
+
+    def test_baseline_no_tower(self, tmp_path: Path):
+        """tower なし + current_shanten on で完走し summary に tower 条件記録"""
+        result = self._run_with_tower(tmp_path, False, False, "base")
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        mf = summary["model_features"]
+        assert mf["policy_tower"]["enabled"] is False
+        assert mf["value_tower"]["enabled"] is False
+        assert mf["value_features"]["current_shanten"]["enabled"] is True
+
+    def test_policy_tower_only(self, tmp_path: Path):
+        """policy tower on のみで完走"""
+        result = self._run_with_tower(tmp_path, True, False, "pt")
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        mf = summary["model_features"]
+        assert mf["policy_tower"]["enabled"] is True
+        assert mf["policy_tower"]["hidden_dim"] == 16
+        assert mf["value_tower"]["enabled"] is False
+
+    def test_value_tower_only(self, tmp_path: Path):
+        """value tower on のみで完走"""
+        result = self._run_with_tower(tmp_path, False, True, "vt")
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        mf = summary["model_features"]
+        assert mf["policy_tower"]["enabled"] is False
+        assert mf["value_tower"]["enabled"] is True
+        assert mf["value_tower"]["hidden_dim"] == 16
+
+    def test_dual_towers(self, tmp_path: Path):
+        """dual towers で完走"""
+        result = self._run_with_tower(tmp_path, True, True, "dual")
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        mf = summary["model_features"]
+        assert mf["policy_tower"]["enabled"] is True
+        assert mf["value_tower"]["enabled"] is True

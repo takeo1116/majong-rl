@@ -179,11 +179,16 @@ def _eval_worker_fn(
         _vf = model_config.get("value_features", {})
         _cs = _vf.get("current_shanten", {})
         _vaux_dim = 1 if _cs.get("enabled", False) else 0
+        # CQ-0157: tower config
+        _pt = model_config.get("policy_tower", {})
+        _vt = model_config.get("value_tower", {})
         model = MLPPolicyValueModel(
             input_dim=input_dim,
             hidden_dims=model_config.get("hidden_dims", [256, 128]),
             value_heads=model_config.get("value_heads", ["round_delta"]),
             value_aux_dim=_vaux_dim,
+            policy_tower_config=_pt if _pt.get("enabled", False) else None,
+            value_tower_config=_vt if _vt.get("enabled", False) else None,
         )
         state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict)
@@ -263,11 +268,16 @@ def _selfplay_worker_fn(
         _vf2 = model_config.get("value_features", {})
         _cs2 = _vf2.get("current_shanten", {})
         _vaux_dim2 = 1 if _cs2.get("enabled", False) else 0
+        # CQ-0157: tower config
+        _pt2 = model_config.get("policy_tower", {})
+        _vt2 = model_config.get("value_tower", {})
         model = MLPPolicyValueModel(
             input_dim=input_dim,
             hidden_dims=model_config.get("hidden_dims", [256, 128]),
             value_heads=model_config.get("value_heads", ["round_delta"]),
             value_aux_dim=_vaux_dim2,
+            policy_tower_config=_pt2 if _pt2.get("enabled", False) else None,
+            value_tower_config=_vt2 if _vt2.get("enabled", False) else None,
         )
         state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict)
@@ -1513,11 +1523,17 @@ class Stage1Runner:
         import math
         input_dim = math.prod(meta.output_shape)
 
+        # CQ-0157: tower config
+        pt_cfg = model_cfg.get("policy_tower", {})
+        vt_cfg = model_cfg.get("value_tower", {})
+
         return MLPPolicyValueModel(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
             value_heads=value_heads,
             value_aux_dim=value_aux_dim,
+            policy_tower_config=pt_cfg if pt_cfg.get("enabled", False) else None,
+            value_tower_config=vt_cfg if vt_cfg.get("enabled", False) else None,
         )
 
     def _setup_file_logging(self, run_dir: Path) -> logging.FileHandler:
@@ -1696,15 +1712,25 @@ class Stage1Runner:
             "input_dim": result.get("input_dim"),
         }
 
-        # CQ-0151, CQ-0152: model_features を記録
+        # CQ-0151, CQ-0152, CQ-0157: model_features を記録
         model_cfg = self._config.model
         vf_cfg = model_cfg.get("value_features", {})
         cs_cfg = vf_cfg.get("current_shanten", {})
+        pt_cfg = model_cfg.get("policy_tower", {})
+        vt_cfg = model_cfg.get("value_tower", {})
         summary["model_features"] = {
             "value_features": {
                 "current_shanten": {
                     "enabled": cs_cfg.get("enabled", False),
                 },
+            },
+            "policy_tower": {
+                "enabled": pt_cfg.get("enabled", False),
+                "hidden_dim": pt_cfg.get("hidden_dim"),
+            },
+            "value_tower": {
+                "enabled": vt_cfg.get("enabled", False),
+                "hidden_dim": vt_cfg.get("hidden_dim"),
             },
         }
 

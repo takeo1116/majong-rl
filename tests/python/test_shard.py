@@ -608,3 +608,37 @@ class TestCurrentShantenShard:
         reader = ShardReader(tmp_path)
         data = reader.read_as_tensors()
         assert data["current_shantens"] is None
+
+
+class TestTurnNumberShard:
+    """CQ-0156: turn_number の shard 読み書きテスト"""
+
+    def test_turn_number_roundtrip(self, tmp_path: Path):
+        """turn_number の書き込み→読み取りが一致する"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.turn_number = 3
+        s2 = _make_sample(step_id=1)
+        s2.turn_number = 10
+        writer.add(s1)
+        writer.add(s2)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["turn_numbers"] is not None
+        assert len(data["turn_numbers"]) == 2
+        assert data["turn_numbers"][0] == 3
+        assert data["turn_numbers"][1] == 10
+
+    def test_turn_number_none_returns_none(self, tmp_path: Path):
+        """全サンプルが None のとき None が返る"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s = _make_sample(step_id=0)
+        assert s.turn_number is None
+        writer.add(s)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["turn_numbers"] is None
