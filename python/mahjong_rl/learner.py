@@ -52,6 +52,10 @@ class Learner:
         self._imi_value_enabled = ivw.get("enabled", False)
         self._imi_value_coef = ivw.get("coef", 0.5)
 
+        # CQ-0164: 立直後打牌除外
+        eprd = tc.get("exclude_post_riichi_discards", {})
+        self._exclude_post_riichi = eprd.get("enabled", False)
+
         self._optimizer = torch.optim.Adam(model.parameters(), lr=self._lr)
 
     @property
@@ -110,6 +114,13 @@ class Learner:
         # CQ-0156: turn_numbers (巡目診断用)
         raw_turn_numbers = data.get("turn_numbers")
 
+        # CQ-0160: reward components (診断用)
+        raw_point_delta_rewards = data.get("point_delta_rewards")
+        raw_shanten_delta_rewards = data.get("shanten_delta_rewards")
+
+        # CQ-0163: is_post_riichi_discards
+        raw_is_post_riichi_discards = data.get("is_post_riichi_discards")
+
         # teacher_best_masks (CQ-0125, CQ-0128)
         raw_teacher_best_masks = data.get("teacher_best_masks")
         tbm_shard_info = data.get("teacher_best_mask_shard_info", {})
@@ -134,6 +145,43 @@ class Learner:
                 old_values = old_values[keep]
                 terminateds = terminateds[keep]
 
+        # CQ-0164: 立直後打牌除外
+        post_riichi_exclusion_stats = None
+        if self._exclude_post_riichi and raw_is_post_riichi_discards is not None:
+            pr_mask = raw_is_post_riichi_discards
+            if keep is not None:
+                pr_mask = pr_mask[keep.cpu().numpy() if isinstance(keep, torch.Tensor) else keep]
+            exclude_mask = torch.from_numpy(~pr_mask).to(observations.device)
+            n_excluded = int(pr_mask.sum())
+            post_riichi_exclusion_stats = {
+                "total_before_exclusion": len(observations),
+                "excluded_post_riichi_discards": n_excluded,
+                "used_samples": len(observations) - n_excluded,
+            }
+            observations = observations[exclude_mask]
+            legal_masks = legal_masks[exclude_mask]
+            actions = actions[exclude_mask]
+            rewards = rewards[exclude_mask]
+            old_log_probs = old_log_probs[exclude_mask]
+            old_values = old_values[exclude_mask]
+            terminateds = terminateds[exclude_mask]
+            # numpy optional arrays も除外
+            exclude_np = exclude_mask.cpu().numpy()
+            if raw_shanten_deltas is not None:
+                raw_shanten_deltas = raw_shanten_deltas[exclude_np]
+            if raw_current_shantens is not None:
+                raw_current_shantens = raw_current_shantens[exclude_np]
+            if raw_turn_numbers is not None:
+                raw_turn_numbers = raw_turn_numbers[exclude_np]
+            if raw_point_delta_rewards is not None:
+                raw_point_delta_rewards = raw_point_delta_rewards[exclude_np]
+            if raw_shanten_delta_rewards is not None:
+                raw_shanten_delta_rewards = raw_shanten_delta_rewards[exclude_np]
+            if raw_is_post_riichi_discards is not None:
+                raw_is_post_riichi_discards = raw_is_post_riichi_discards[exclude_np]
+            if raw_teacher_best_masks is not None:
+                raw_teacher_best_masks = raw_teacher_best_masks[exclude_np]
+
         n = len(observations)
         if n == 0:
             result = {"mode": self._mode, "policy_loss": 0.0, "value_loss": 0.0,
@@ -141,6 +189,8 @@ class Learner:
                       "device": str(self._device)}
             if filter_stats is not None:
                 result["filter_stats"] = filter_stats
+            if post_riichi_exclusion_stats is not None:
+                result["post_riichi_exclusion"] = post_riichi_exclusion_stats
             return result
 
         # CQ-0151: current_shantens を value_aux_features 用テンソルに変換
@@ -189,7 +239,10 @@ class Learner:
                 old_log_probs, old_values, terminateds, n, epochs,
                 shanten_deltas=raw_shanten_deltas,
                 value_aux_features=current_shantens_t,
-                turn_numbers=raw_turn_numbers)
+                turn_numbers=raw_turn_numbers,
+                point_delta_rewards=raw_point_delta_rewards,
+                shanten_delta_rewards=raw_shanten_delta_rewards,
+                is_post_riichi_discards=raw_is_post_riichi_discards)
         profiler.stop("model_forward")
 
         metrics["mode"] = self._mode
@@ -197,6 +250,8 @@ class Learner:
         metrics["device"] = str(self._device)
         if filter_stats is not None:
             metrics["filter_stats"] = filter_stats
+        if post_riichi_exclusion_stats is not None:
+            metrics["post_riichi_exclusion"] = post_riichi_exclusion_stats
 
         # metrics 保存
         metrics_dir = self._run_dir / "metrics"
@@ -245,6 +300,9 @@ class Learner:
         shanten_deltas: np.ndarray | None = None,
         value_aux_features: torch.Tensor | None = None,
         turn_numbers: np.ndarray | None = None,
+        point_delta_rewards: np.ndarray | None = None,
+        shanten_delta_rewards: np.ndarray | None = None,
+        is_post_riichi_discards: np.ndarray | None = None,
     ) -> dict:
         """PPO 学習"""
         advantages, returns = self._compute_gae(rewards, old_values, terminateds)
@@ -334,12 +392,17 @@ class Learner:
             self._model.train()
             final_new_values_t = torch.cat(final_new_values_parts)
 
-            # CQ-0145/CQ-0155: shanten 変化別 advantage 診断
+            # CQ-0145/CQ-0155/CQ-0160/CQ-0163: shanten 変化別 advantage 診断
             if shanten_deltas is not None:
                 metrics["ppo_diag"]["shanten_diag"] = (
                     self._compute_shanten_conditioned_diag(
                         advantages, returns, old_values, shanten_deltas,
-                        new_values=final_new_values_t))
+                        new_values=final_new_values_t,
+                        rewards=rewards, terminateds=terminateds,
+                        gamma=self._gamma,
+                        point_delta_rewards=point_delta_rewards,
+                        shanten_delta_rewards=shanten_delta_rewards,
+                        is_post_riichi_discards=is_post_riichi_discards))
 
             # CQ-0156: 巡目バケット別診断
             if turn_numbers is not None:
@@ -563,11 +626,19 @@ class Learner:
         old_values: torch.Tensor,
         shanten_deltas: np.ndarray,
         new_values: torch.Tensor | None = None,
+        rewards: torch.Tensor | None = None,
+        terminateds: torch.Tensor | None = None,
+        gamma: float = 0.99,
+        point_delta_rewards: np.ndarray | None = None,
+        shanten_delta_rewards: np.ndarray | None = None,
+        is_post_riichi_discards: np.ndarray | None = None,
     ) -> dict:
-        """shanten 変化別の advantage/return/value_error 診断統計 (CQ-0145, CQ-0146)
+        """shanten 変化別の advantage/return/value_error 診断統計 (CQ-0145, CQ-0146, CQ-0160, CQ-0163)
 
         3群 (improve/same/worsen) に分割して統計量を計算する。
         NaN の shanten_delta は unavailable として除外し、same 群に混入させない。
+        CQ-0160: reward/point_delta_reward/shanten_delta_reward/delta_t を追加。
+        CQ-0163: is_post_riichi_discards による立直後打牌統計を追加。
         """
         adv_np = advantages.cpu().numpy().astype(np.float64)
         ret_np = returns.cpu().numpy().astype(np.float64)
@@ -575,6 +646,24 @@ class Learner:
         val_err_np = old_val_np - ret_np
         new_val_np = new_values.cpu().numpy().astype(np.float64) if new_values is not None else None
         sd = shanten_deltas.astype(np.float64)
+
+        # CQ-0160: reward components
+        reward_np = rewards.cpu().numpy().astype(np.float64) if rewards is not None else None
+        pdr_np = point_delta_rewards.astype(np.float64) if point_delta_rewards is not None else None
+        sdr_np = shanten_delta_rewards.astype(np.float64) if shanten_delta_rewards is not None else None
+
+        # CQ-0160: delta_t = reward_t + gamma * next_value_t - old_value_t
+        delta_t_np = None
+        if reward_np is not None and terminateds is not None:
+            t_cpu = terminateds.cpu().numpy()
+            n = len(reward_np)
+            delta_t_np = np.zeros(n, dtype=np.float64)
+            for t in range(n):
+                if t == n - 1 or t_cpu[t]:
+                    next_val = 0.0
+                else:
+                    next_val = old_val_np[t + 1]
+                delta_t_np[t] = reward_np[t] + gamma * next_val - old_val_np[t]
 
         # CQ-0146: NaN は unavailable として除外
         available_mask = ~np.isnan(sd)
@@ -606,18 +695,37 @@ class Learner:
                 "p99": float(np.percentile(arr, 99)),
             }
 
+        # CQ-0163: 立直後打牌フラグ
+        pr_np = is_post_riichi_discards if is_post_riichi_discards is not None else None
+
         result: dict = {
             "status": status,
             "total_samples": n_total,
             "available_samples": n_available,
             "unavailable_samples": n_unavailable,
         }
+
+        # CQ-0163: top-level post_riichi stats
+        if pr_np is not None:
+            total_pr = int(np.sum(pr_np))
+            result["total_post_riichi_discards"] = total_pr
+            avail_pr = int(np.sum(pr_np[available_mask])) if n_available > 0 else 0
+            result["available_post_riichi_discards"] = avail_pr
+        else:
+            result["total_post_riichi_discards"] = None
+            result["available_post_riichi_discards"] = None
+
         for name, mask in groups.items():
             count = int(np.sum(mask))
             if count == 0:
                 result[name] = {"count": 0}
                 continue
             entry: dict = {"count": count}
+            # CQ-0163: 立直後打牌統計（群ごと）
+            if pr_np is not None:
+                pr_count = int(np.sum(pr_np[mask]))
+                entry["post_riichi_discard_count"] = pr_count
+                entry["post_riichi_discard_ratio"] = pr_count / count
             # advantage
             adv_g = adv_np[mask]
             adv_stats = _group_stats(adv_g)
@@ -637,6 +745,15 @@ class Learner:
                 entry["new_value"] = _group_stats(new_val_np[mask])
                 delta = new_val_np[mask] - old_val_np[mask]
                 entry["value_update_delta"] = _group_stats(delta)
+            # CQ-0160: reward / point_delta_reward / shanten_delta_reward / delta_t
+            if reward_np is not None:
+                entry["reward"] = _group_stats(reward_np[mask])
+            if pdr_np is not None:
+                entry["point_delta_reward"] = _group_stats(pdr_np[mask])
+            if sdr_np is not None:
+                entry["shanten_delta_reward"] = _group_stats(sdr_np[mask])
+            if delta_t_np is not None:
+                entry["delta_t"] = _group_stats(delta_t_np[mask])
             result[name] = entry
         return result
 

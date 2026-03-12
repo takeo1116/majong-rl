@@ -47,6 +47,9 @@ class LearningSample:
     shanten_delta: float | None = None  # shanten 変化量 (CQ-0145)
     current_shanten: int | None = None  # 現在シャンテン数 (CQ-0151)
     turn_number: int | None = None  # 巡目 (CQ-0156)
+    point_delta_reward: float | None = None  # 点数差分報酬成分 (CQ-0160)
+    shanten_delta_reward: float | None = None  # シャンテン差分報酬成分 (CQ-0160)
+    is_post_riichi_discard: bool | None = None  # 立直後打牌フラグ (CQ-0163)
 
 
 def validate_metadata(sample: LearningSample) -> None:
@@ -199,6 +202,27 @@ class ShardWriter:
                 for s in self._buffer
             ]
 
+        # point_delta_reward: 1つでも非 None があればカラム書き出し (CQ-0160)
+        if any(s.point_delta_reward is not None for s in self._buffer):
+            data["point_delta_reward"] = [
+                float(s.point_delta_reward) if s.point_delta_reward is not None else 0.0
+                for s in self._buffer
+            ]
+
+        # shanten_delta_reward: 1つでも非 None があればカラム書き出し (CQ-0160)
+        if any(s.shanten_delta_reward is not None for s in self._buffer):
+            data["shanten_delta_reward"] = [
+                float(s.shanten_delta_reward) if s.shanten_delta_reward is not None else 0.0
+                for s in self._buffer
+            ]
+
+        # is_post_riichi_discard: 1つでも非 None があればカラム書き出し (CQ-0163)
+        if any(s.is_post_riichi_discard is not None for s in self._buffer):
+            data["is_post_riichi_discard"] = [
+                int(s.is_post_riichi_discard) if s.is_post_riichi_discard is not None else -1
+                for s in self._buffer
+            ]
+
         self._backend.write(data, path)
         self._buffer.clear()
         self._shard_counter += 1
@@ -299,6 +323,14 @@ class ShardReader:
         # CQ-0156: turn_number
         all_turn_numbers: list[int] = []
         has_turn_number = False
+        # CQ-0160: reward components
+        all_point_delta_rewards: list[float] = []
+        has_point_delta_reward = False
+        all_shanten_delta_rewards: list[float] = []
+        has_shanten_delta_reward = False
+        # CQ-0163: is_post_riichi_discard
+        all_is_post_riichi_discards: list[int] = []
+        has_is_post_riichi_discard = False
 
         for path in self._find_shards():
             table = self._backend.read(path)
@@ -357,6 +389,27 @@ class ShardReader:
             else:
                 all_turn_numbers.extend([-1] * n)
 
+            # point_delta_reward (CQ-0160): カラム存在時のみ読み込み
+            if "point_delta_reward" in table.column_names:
+                has_point_delta_reward = True
+                all_point_delta_rewards.extend(table.column("point_delta_reward").to_pylist())
+            else:
+                all_point_delta_rewards.extend([float("nan")] * n)
+
+            # shanten_delta_reward (CQ-0160): カラム存在時のみ読み込み
+            if "shanten_delta_reward" in table.column_names:
+                has_shanten_delta_reward = True
+                all_shanten_delta_rewards.extend(table.column("shanten_delta_reward").to_pylist())
+            else:
+                all_shanten_delta_rewards.extend([float("nan")] * n)
+
+            # is_post_riichi_discard (CQ-0163): カラム存在時のみ読み込み
+            if "is_post_riichi_discard" in table.column_names:
+                has_is_post_riichi_discard = True
+                all_is_post_riichi_discards.extend(table.column("is_post_riichi_discard").to_pylist())
+            else:
+                all_is_post_riichi_discards.extend([-1] * n)
+
         if not all_obs:
             return {
                 "observations": np.zeros((0, 0), dtype=np.float32),
@@ -373,6 +426,9 @@ class ShardReader:
                 "shanten_delta_shard_info": {"available": 0, "total": 0},
                 "current_shantens": None,
                 "turn_numbers": None,
+                "point_delta_rewards": None,
+                "shanten_delta_rewards": None,
+                "is_post_riichi_discards": None,
             }
 
         result = {
@@ -419,6 +475,24 @@ class ShardReader:
         else:
             result["turn_numbers"] = None
 
+        # point_delta_rewards (CQ-0160): カラムがある shard があれば配列化（欠落は NaN）
+        if has_point_delta_reward:
+            result["point_delta_rewards"] = np.array(all_point_delta_rewards, dtype=np.float32)
+        else:
+            result["point_delta_rewards"] = None
+
+        # shanten_delta_rewards (CQ-0160): カラムがある shard があれば配列化（欠落は NaN）
+        if has_shanten_delta_reward:
+            result["shanten_delta_rewards"] = np.array(all_shanten_delta_rewards, dtype=np.float32)
+        else:
+            result["shanten_delta_rewards"] = None
+
+        # is_post_riichi_discards (CQ-0163): 全 shard にカラムがある場合のみ配列化
+        if has_is_post_riichi_discard and all(v >= 0 for v in all_is_post_riichi_discards):
+            result["is_post_riichi_discards"] = np.array(all_is_post_riichi_discards, dtype=np.bool_)
+        else:
+            result["is_post_riichi_discards"] = None
+
         if filter_actor_type is not None:
             actor_mask = result["actor_types"] == filter_actor_type
             tbm = result.pop("teacher_best_masks")
@@ -427,6 +501,9 @@ class ShardReader:
             sd_shard_info = result.pop("shanten_delta_shard_info")
             cs = result.pop("current_shantens")
             tn = result.pop("turn_numbers")
+            pdr = result.pop("point_delta_rewards")
+            sdr = result.pop("shanten_delta_rewards")
+            iprd = result.pop("is_post_riichi_discards")
             result = {k: v[actor_mask] for k, v in result.items()}
             result["teacher_best_masks"] = tbm[actor_mask] if tbm is not None else None
             result["teacher_best_mask_shard_info"] = shard_info
@@ -434,5 +511,8 @@ class ShardReader:
             result["shanten_delta_shard_info"] = sd_shard_info
             result["current_shantens"] = cs[actor_mask] if cs is not None else None
             result["turn_numbers"] = tn[actor_mask] if tn is not None else None
+            result["point_delta_rewards"] = pdr[actor_mask] if pdr is not None else None
+            result["shanten_delta_rewards"] = sdr[actor_mask] if sdr is not None else None
+            result["is_post_riichi_discards"] = iprd[actor_mask] if iprd is not None else None
 
         return result

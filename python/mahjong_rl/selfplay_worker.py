@@ -18,6 +18,7 @@ from mahjong_rl.profiler import Profiler
 from mahjong_rl.baseline.shanten import compute_shanten
 from mahjong_rl.reward_shaping import ShantenDeltaTracker, RewardSchedule
 from mahjong_rl.shard import LearningSample, ShardWriter
+from mahjong_rl import RewardPolicyConfig
 
 
 class SelfPlayWorker:
@@ -63,8 +64,13 @@ class SelfPlayWorker:
         obs_mode = config.get("experiment", {}).get("observation_mode", "full")
         self._observation_mode = obs_mode
 
-        # reward shaping (CQ-0139, CQ-0140)
+        # CQ-0162: reward policy config を env に渡すため構築
         reward_cfg = config.get("reward", {})
+        self._reward_policy_config = RewardPolicyConfig()
+        self._reward_policy_config.point_delta_scale = reward_cfg.get(
+            "point_delta_scale", 1.0)
+
+        # reward shaping (CQ-0139, CQ-0140)
         shaping_cfg = reward_cfg.get("shaping", {})
         sd_cfg = shaping_cfg.get("shanten_delta", {})
         self._shanten_delta_enabled = sd_cfg.get("enabled", False)
@@ -167,7 +173,8 @@ class SelfPlayWorker:
     def _play_one_match(self, seed: int, episode_id: str, run_id: str,
                         progress: float = 0.0) -> dict:
         """1 半荘を実行しサンプルを収集する"""
-        env = Stage1Env(observation_mode=self._observation_mode)
+        env = Stage1Env(observation_mode=self._observation_mode,
+                       reward_config=self._reward_policy_config)
         torch.manual_seed(seed)
         obs, info = env.reset(seed=seed)
 
@@ -190,6 +197,9 @@ class SelfPlayWorker:
 
             # CQ-0156: 巡目診断用
             turn_number_val = env.env_state.round_state.turn_number
+
+            # CQ-0163: 立直後打牌フラグ（打牌前の状態で判定）
+            is_post_riichi = env.env_state.round_state.players[current].is_riichi
 
             # CQ-0151: current_shanten 計算（shanten_delta とは独立に計算可能）
             current_shanten_val = None
@@ -296,6 +306,9 @@ class SelfPlayWorker:
                     shanten_delta=shanten_delta_raw,  # CQ-0145: schedule 適用前の raw delta
                     current_shanten=current_shanten_val,  # CQ-0151: value head 用
                     turn_number=turn_number_val,  # CQ-0156: 巡目診断用
+                    point_delta_reward=point_delta_reward,  # CQ-0160: 点数差分報酬成分
+                    shanten_delta_reward=shanten_delta_reward,  # CQ-0160: シャンテン差分報酬成分
+                    is_post_riichi_discard=is_post_riichi,  # CQ-0163: 立直後打牌フラグ
                 )
                 self._writer.add(sample)
                 sample_step += 1

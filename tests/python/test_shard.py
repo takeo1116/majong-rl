@@ -642,3 +642,131 @@ class TestTurnNumberShard:
         reader = ShardReader(tmp_path)
         data = reader.read_as_tensors()
         assert data["turn_numbers"] is None
+
+
+class TestRewardComponentShard:
+    """CQ-0160: reward components の shard 読み書きテスト"""
+
+    def test_reward_components_roundtrip(self, tmp_path: Path):
+        """point_delta_reward / shanten_delta_reward の書き込み→読み取りが一致"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.point_delta_reward = 0.5
+        s1.shanten_delta_reward = -0.1
+        s2 = _make_sample(step_id=1)
+        s2.point_delta_reward = 0.0
+        s2.shanten_delta_reward = 0.3
+        writer.add(s1)
+        writer.add(s2)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["point_delta_rewards"] is not None
+        assert data["shanten_delta_rewards"] is not None
+        np.testing.assert_allclose(
+            data["point_delta_rewards"], [0.5, 0.0], atol=1e-6)
+        np.testing.assert_allclose(
+            data["shanten_delta_rewards"], [-0.1, 0.3], atol=1e-6)
+
+    def test_reward_components_none_returns_none(self, tmp_path: Path):
+        """全サンプルが None のとき None が返る"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s = _make_sample(step_id=0)
+        assert s.point_delta_reward is None
+        assert s.shanten_delta_reward is None
+        writer.add(s)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["point_delta_rewards"] is None
+        assert data["shanten_delta_rewards"] is None
+
+    def test_reward_components_mixed_old_new_shard(self, tmp_path: Path):
+        """新旧 shard 混在で欠落は NaN"""
+        # shard 1: reward components あり
+        new_dir = tmp_path / "worker_0"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        writer1 = ShardWriter(new_dir, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.point_delta_reward = 1.0
+        s1.shanten_delta_reward = 0.5
+        writer1.add(s1)
+        writer1.close()
+
+        # shard 2: reward components なし
+        old_dir = tmp_path / "worker_1"
+        old_dir.mkdir(parents=True, exist_ok=True)
+        writer2 = ShardWriter(old_dir, max_samples=100)
+        s2 = _make_sample(step_id=1)
+        writer2.add(s2)
+        writer2.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["point_delta_rewards"] is not None
+        assert len(data["point_delta_rewards"]) == 2
+        np.testing.assert_allclose(data["point_delta_rewards"][0], 1.0, atol=1e-6)
+        assert np.isnan(data["point_delta_rewards"][1])
+        assert data["shanten_delta_rewards"] is not None
+        np.testing.assert_allclose(data["shanten_delta_rewards"][0], 0.5, atol=1e-6)
+        assert np.isnan(data["shanten_delta_rewards"][1])
+
+
+class TestPostRiichiDiscardShard:
+    """CQ-0163: is_post_riichi_discard の shard 読み書きテスト"""
+
+    def test_post_riichi_discard_roundtrip(self, tmp_path: Path):
+        """is_post_riichi_discard の書き込み→読み取りが一致"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.is_post_riichi_discard = True
+        s2 = _make_sample(step_id=1)
+        s2.is_post_riichi_discard = False
+        writer.add(s1)
+        writer.add(s2)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["is_post_riichi_discards"] is not None
+        assert data["is_post_riichi_discards"].dtype == np.bool_
+        np.testing.assert_array_equal(
+            data["is_post_riichi_discards"], [True, False])
+
+    def test_post_riichi_discard_none_returns_none(self, tmp_path: Path):
+        """全サンプルが None のとき None が返る"""
+        writer = ShardWriter(tmp_path, max_samples=100)
+        s = _make_sample(step_id=0)
+        assert s.is_post_riichi_discard is None
+        writer.add(s)
+        writer.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["is_post_riichi_discards"] is None
+
+    def test_post_riichi_discard_mixed_old_new_shard(self, tmp_path: Path):
+        """新旧 shard 混在でカラム欠落時は None（安全フォールバック）"""
+        # shard 1: is_post_riichi_discard あり
+        new_dir = tmp_path / "worker_0"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        writer1 = ShardWriter(new_dir, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.is_post_riichi_discard = True
+        writer1.add(s1)
+        writer1.close()
+
+        # shard 2: is_post_riichi_discard なし（旧 shard）
+        old_dir = tmp_path / "worker_1"
+        old_dir.mkdir(parents=True, exist_ok=True)
+        writer2 = ShardWriter(old_dir, max_samples=100)
+        s2 = _make_sample(step_id=1)
+        writer2.add(s2)
+        writer2.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        # 旧 shard に -1 sentinel が混入するため、全 shard 揃い条件を満たさず None
+        assert data["is_post_riichi_discards"] is None

@@ -287,7 +287,8 @@ class EvaluationRunner:
 
     def __init__(self, model: torch.nn.Module, encoder, observation_mode: str = "full",
                  inference_device: torch.device | None = None,
-                 value_shanten_enabled: bool = False):
+                 value_shanten_enabled: bool = False,
+                 reward_config=None):
         self._device = inference_device or torch.device("cpu")
         self._model = model.to(self._device)
         self._encoder = encoder
@@ -295,6 +296,7 @@ class EvaluationRunner:
         self._baseline = RuleBasedBaseline()
         self._selector = ActionSelector(mode=SelectionMode.ARGMAX)
         self._value_shanten_enabled = value_shanten_enabled
+        self._reward_config = reward_config  # CQ-0162: RewardPolicyConfig or None
 
     def evaluate_partial(
         self,
@@ -407,7 +409,8 @@ class EvaluationRunner:
 
     def _play_one_match(self, seed: int, policy_seat: int = 0) -> dict:
         """1 半荘を実行して結果を返す"""
-        env = Stage1Env(observation_mode=self._observation_mode)
+        env = Stage1Env(observation_mode=self._observation_mode,
+                       reward_config=self._reward_config)
         obs, info = env.reset(seed=seed)
 
         policy_player = policy_seat

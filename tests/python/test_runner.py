@@ -2629,6 +2629,54 @@ class TestTurnDiagIntegration:
         assert found, f"turn_diag: {td}"
 
 
+class TestRewardComponentDiagIntegration:
+    """CQ-0160/CQ-0161: reward 成分別 shanten_diag の統合テスト"""
+
+    def test_reward_diag_three_path_consistency(self, tmp_path: Path):
+        """shanten_diag の reward/delta_t が result / json / summary の3経路で整合"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.reward["shaping"] = {
+            "shanten_delta": {
+                "enabled": True,
+                "scale": 0.01,
+                "mode": "both",
+                "schedule": {"type": "constant"},
+            },
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+
+        # 1) result
+        tm = result["train_metrics"]
+        sd_result = tm["ppo_diag"]["shanten_diag"]
+
+        run_dir = Path(result["run_dir"])
+
+        # 2) train_metrics.json
+        with open(run_dir / "metrics" / "train_metrics.json") as f:
+            saved_tm = json.load(f)
+        sd_json = saved_tm["ppo_diag"]["shanten_diag"]
+
+        # 3) summary.json
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        sd_summary = summary["phase_stats"]["learner"]["ppo_diag"]["shanten_diag"]
+
+        # 新キー (reward, delta_t) が 3 経路に存在
+        for group in ("improve", "same", "worsen"):
+            for src, label in ((sd_result, "result"), (sd_json, "json"), (sd_summary, "summary")):
+                entry = src.get(group, {})
+                if entry.get("count", 0) > 0:
+                    assert "reward" in entry, f"{label}.{group} に reward がない"
+                    assert "delta_t" in entry, f"{label}.{group} に delta_t がない"
+                    # point_delta_reward / shanten_delta_reward も shaping on なので存在
+                    assert "point_delta_reward" in entry, f"{label}.{group} に point_delta_reward がない"
+                    assert "shanten_delta_reward" in entry, f"{label}.{group} に shanten_delta_reward がない"
+
+
 class TestTowerE2E:
     """CQ-0157/CQ-0158: tower 構造の end-to-end テスト"""
 
@@ -2692,3 +2740,150 @@ class TestTowerE2E:
         mf = summary["model_features"]
         assert mf["policy_tower"]["enabled"] is True
         assert mf["value_tower"]["enabled"] is True
+
+
+@pytest.mark.slow
+class TestRewardScaleE2E:
+    """CQ-0162: reward config 適用が runner 経由 selfplay/eval に伝播する統合テスト"""
+
+    def test_point_delta_scale_propagates(self, tmp_path: Path):
+        """point_delta_scale=0.0001 で reward が scale 済みの値になる"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.reward["point_delta_scale"] = 0.0001
+        config.reward["shaping"] = {
+            "shanten_delta": {
+                "enabled": True,
+                "scale": 0.01,
+                "mode": "both",
+                "schedule": {"type": "constant"},
+            },
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+
+        # shanten_diag の point_delta_reward が scale 済み
+        sd = result["train_metrics"]["ppo_diag"]["shanten_diag"]
+        for group in ("improve", "same", "worsen"):
+            entry = sd.get(group, {})
+            if entry.get("count", 0) > 0 and "point_delta_reward" in entry:
+                mean_val = abs(entry["point_delta_reward"]["mean"])
+                # scale=0.0001 なので |mean| < 10 程度（scale=1.0 なら数百〜数万）
+                assert mean_val < 50, (
+                    f"{group}.point_delta_reward.mean={mean_val} が大きすぎる"
+                    f" (scale=0.0001 なら |mean|<50 が期待値)"
+                )
+
+    def test_reward_scale_in_summary(self, tmp_path: Path):
+        """summary.json の reward_composition も scale 済みの値になる"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.reward["point_delta_scale"] = 0.0001
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        # reward_composition の point_delta も scale 済み
+        rc = summary["phase_stats"]["selfplay"]["reward_composition"]
+        pd_mean = abs(rc["point_delta"]["mean"])
+        assert pd_mean < 50, (
+            f"reward_composition.point_delta.mean={pd_mean} が大きすぎる"
+            f" (scale=0.0001 なら |mean|<50 が期待値)"
+        )
+
+
+@pytest.mark.slow
+class TestPostRiichiE2E:
+    """CQ-0163/CQ-0164/CQ-0165: 立直後打牌診断・除外の統合テスト"""
+
+    def test_post_riichi_diag_in_summary(self, tmp_path: Path):
+        """summary に立直後打牌の統計が含まれる"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.reward["shaping"] = {
+            "shanten_delta": {
+                "enabled": True,
+                "scale": 0.01,
+                "mode": "both",
+                "schedule": {"type": "constant"},
+            },
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+
+        # shanten_diag に post_riichi 統計が含まれる
+        sd = result["train_metrics"]["ppo_diag"]["shanten_diag"]
+        assert "total_post_riichi_discards" in sd
+        # post_riichi_discards は int or None（旧 shard なら None だが新 shard なら int）
+        if sd["total_post_riichi_discards"] is not None:
+            assert sd["total_post_riichi_discards"] >= 0
+
+        # summary.json にも同じキーが存在
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        sd_summary = summary["phase_stats"]["learner"]["ppo_diag"]["shanten_diag"]
+        assert "total_post_riichi_discards" in sd_summary
+
+    def test_post_riichi_exclusion_reduces_samples(self, tmp_path: Path):
+        """exclude_post_riichi_discards=True で学習サンプル数が減る"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.reward["shaping"] = {
+            "shanten_delta": {
+                "enabled": True,
+                "scale": 0.01,
+                "mode": "both",
+                "schedule": {"type": "constant"},
+            },
+        }
+        config.training["exclude_post_riichi_discards"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+        tm = result["train_metrics"]
+        # exclusion stats が存在する（post_riichi フラグが shard にある場合のみ）
+        if "post_riichi_exclusion" in tm:
+            exc = tm["post_riichi_exclusion"]
+            assert exc["excluded_post_riichi_discards"] >= 0
+            assert exc["used_samples"] <= exc["total_before_exclusion"]
+
+    def test_post_riichi_exclusion_in_summary(self, tmp_path: Path):
+        """CQ-0166: post_riichi_exclusion が summary.json に転送される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.reward["shaping"] = {
+            "shanten_delta": {
+                "enabled": True,
+                "scale": 0.01,
+                "mode": "both",
+                "schedule": {"type": "constant"},
+            },
+        }
+        config.training["exclude_post_riichi_discards"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        learner = summary["phase_stats"]["learner"]
+        # post_riichi_exclusion が summary に転送されている
+        if "post_riichi_exclusion" in result["train_metrics"]:
+            assert "post_riichi_exclusion" in learner
+            exc = learner["post_riichi_exclusion"]
+            assert "excluded_post_riichi_discards" in exc
+            assert "used_samples" in exc

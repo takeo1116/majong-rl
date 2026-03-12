@@ -144,6 +144,7 @@ def _eval_worker_fn(
     num_threads: int,
     base_seed: int,
     error_queue: mp.Queue | None = None,
+    reward_config_dict: dict | None = None,
 ) -> None:
     """evaluation worker プロセスのエントリポイント
 
@@ -194,11 +195,20 @@ def _eval_worker_fn(
         model.load_state_dict(state_dict)
         model.eval()
 
+        # CQ-0162: reward config を env に渡す
+        _reward_config = None
+        if reward_config_dict:
+            from mahjong_rl import RewardPolicyConfig
+            _reward_config = RewardPolicyConfig()
+            _reward_config.point_delta_scale = reward_config_dict.get(
+                "point_delta_scale", 1.0)
+
         # CQ-0153: value current_shanten 有効時は evaluator にも渡す
         _cs_enabled = _cs.get("enabled", False)
         eval_runner = EvaluationRunner(
             model=model, encoder=encoder, observation_mode=obs_mode,
-            value_shanten_enabled=_cs_enabled)
+            value_shanten_enabled=_cs_enabled,
+            reward_config=_reward_config)
 
         partial = eval_runner.evaluate_partial(
             num_matches=num_matches,
@@ -1324,7 +1334,8 @@ class Stage1Runner:
         processes = self._spawn_eval_workers(
             matches_per_worker, model_path, model_config, encoder_config,
             obs_mode, policy_seats, str(partials_dir), num_threads, base_seed,
-            error_queue=error_queue)
+            error_queue=error_queue,
+            reward_config_dict=dict(self._config.reward))
 
         self._wait_and_check_workers(processes, error_queue=error_queue)
 
@@ -1377,7 +1388,8 @@ class Stage1Runner:
                 encoder_config, obs_mode, [seat],
                 str(partials_dir), num_threads, base_seed,
                 worker_id_offset=worker_id_offset,
-                error_queue=error_queue)
+                error_queue=error_queue,
+                reward_config_dict=dict(self._config.reward))
             all_processes.extend(processes)
             worker_id_offset += len(matches_per_worker)
 
@@ -1410,6 +1422,7 @@ class Stage1Runner:
         base_seed: int,
         worker_id_offset: int = 0,
         error_queue: mp.Queue | None = None,
+        reward_config_dict: dict | None = None,
     ) -> list[mp.Process]:
         """eval worker プロセスを生成・起動する
 
@@ -1428,7 +1441,7 @@ class Stage1Runner:
                     wid, model_path, model_config, encoder_config,
                     obs_mode, wm, policy_seats,
                     partials_dir, num_threads, base_seed,
-                    error_queue,
+                    error_queue, reward_config_dict,
                 ),
             )
             p.start()
@@ -1646,6 +1659,13 @@ class Stage1Runner:
             ppo_diag = tm.get("ppo_diag")
             if ppo_diag is not None:
                 phase_stats["learner"]["ppo_diag"] = ppo_diag
+            # CQ-0166: learner 補助統計を summary に転送
+            pre = tm.get("post_riichi_exclusion")
+            if pre is not None:
+                phase_stats["learner"]["post_riichi_exclusion"] = pre
+            fs = tm.get("filter_stats")
+            if fs is not None:
+                phase_stats["learner"]["filter_stats"] = fs
         if "eval_metrics" in result:
             em = result["eval_metrics"]
             phase_stats["eval"] = {

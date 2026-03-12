@@ -108,6 +108,10 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
                     ppo_diag = learner_stats.get("ppo_diag")
                     if ppo_diag is not None:
                         entry["learner_diag"] = ppo_diag
+                    # CQ-0166: learner 補助統計
+                    pre = learner_stats.get("post_riichi_exclusion")
+                    if pre is not None:
+                        entry["post_riichi_exclusion"] = pre
                     # CQ-0139: reward composition
                     sp_stats = run_summary.get("phase_stats", {}).get("selfplay", {})
                     rc = sp_stats.get("reward_composition")

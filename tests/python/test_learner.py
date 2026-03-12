@@ -1188,6 +1188,7 @@ class TestJointImitation:
 
 def _write_shards_with_turn_number(
     shard_dir: Path, n: int = 90, obs_dim: int = 100,
+    include_reward_components: bool = False,
 ) -> None:
     """turn_number + shanten_delta 付きダミー shard を書き出す"""
     writer = ShardWriter(shard_dir, max_samples=10000)
@@ -1201,11 +1202,15 @@ def _write_shards_with_turn_number(
             sd = 0.0
         else:
             sd = float(-np.random.randint(1, 3))
+        # CQ-0160: reward components
+        pdr = float(np.random.randn() * 0.01) if include_reward_components else None
+        sdr_val = float(np.random.randn() * 0.005) if include_reward_components else None
+        reward = (pdr + sdr_val) if include_reward_components else np.random.randn() * 0.01
         writer.add(LearningSample(
             observation=np.random.randn(obs_dim).astype(np.float32),
             legal_mask=(np.random.rand(34) > 0.5).astype(np.float32),
             action=np.random.randint(0, 34),
-            reward=np.random.randn() * 0.01,
+            reward=reward,
             log_prob=-np.random.rand(),
             value=np.random.randn() * 0.1,
             terminated=(i == n - 1),
@@ -1217,6 +1222,8 @@ def _write_shards_with_turn_number(
             step_id=i,
             shanten_delta=sd,
             turn_number=tn,
+            point_delta_reward=pdr,
+            shanten_delta_reward=sdr_val,
         ))
     writer.close()
 
@@ -1318,3 +1325,208 @@ class TestTurnDiag:
             assert "negative_ratio" in adv
             assert 0.0 <= adv["positive_ratio"] <= 1.0
             assert 0.0 <= adv["negative_ratio"] <= 1.0
+
+
+class TestRewardComponentDiag:
+    """CQ-0160: shanten_diag に reward/point_delta_reward/shanten_delta_reward/delta_t を追加"""
+
+    def _run(self, tmp_path: Path) -> dict:
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_turn_number(
+            shard_dir, n=90, obs_dim=obs_dim, include_reward_components=True)
+        config = _make_config()
+        config["training"]["epochs"] = 2
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        return learner.train(shard_dir)
+
+    def test_reward_keys_in_groups(self, tmp_path: Path):
+        """各群に reward/point_delta_reward/shanten_delta_reward/delta_t が存在"""
+        metrics = self._run(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        expected_stat_keys = {"mean", "std", "p50", "p90", "p99"}
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            assert entry["count"] > 0
+            for key in ("reward", "point_delta_reward", "shanten_delta_reward", "delta_t"):
+                assert key in entry, f"{group} に {key} がない"
+                assert expected_stat_keys <= set(entry[key].keys()), f"{group}.{key} の統計キーが不足"
+
+    def test_reward_values_finite(self, tmp_path: Path):
+        """全統計値が有限"""
+        metrics = self._run(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            assert entry["count"] > 0
+            for key in ("reward", "point_delta_reward", "shanten_delta_reward", "delta_t"):
+                for stat_name, v in entry[key].items():
+                    assert np.isfinite(v), f"{group}.{key}.{stat_name} が非有限値: {v}"
+
+    def test_no_reward_components_no_keys(self, tmp_path: Path):
+        """reward components がない場合は reward/delta_t キーが存在しない"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        # include_reward_components=False (デフォルト)
+        _write_shards_with_turn_number(shard_dir, n=90, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["epochs"] = 2
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            assert entry["count"] > 0
+            # reward components がない → 新キーは出ない
+            assert "point_delta_reward" not in entry
+            assert "shanten_delta_reward" not in entry
+            # reward と delta_t は rewards/terminateds から計算可能なので出る
+            assert "reward" in entry
+            assert "delta_t" in entry
+
+
+def _write_shards_with_post_riichi(
+    shard_dir: Path, n: int = 90, obs_dim: int = 100,
+    post_riichi_ratio: float = 0.3,
+) -> None:
+    """is_post_riichi_discard 付きダミー shard を書き出す"""
+    writer = ShardWriter(shard_dir, max_samples=10000)
+    for i in range(n):
+        # shanten_delta: 3群に分散
+        if i % 3 == 0:
+            sd = float(np.random.randint(1, 4))
+        elif i % 3 == 1:
+            sd = 0.0
+        else:
+            sd = float(-np.random.randint(1, 3))
+        pdr = float(np.random.randn() * 0.01)
+        sdr_val = float(np.random.randn() * 0.005)
+        is_pr = (np.random.rand() < post_riichi_ratio)
+        writer.add(LearningSample(
+            observation=np.random.randn(obs_dim).astype(np.float32),
+            legal_mask=(np.random.rand(34) > 0.5).astype(np.float32),
+            action=np.random.randint(0, 34),
+            reward=pdr + sdr_val,
+            log_prob=-np.random.rand(),
+            value=np.random.randn() * 0.1,
+            terminated=(i == n - 1),
+            round_over=(i % 20 == 19),
+            experiment_id="dummy_exp",
+            run_id="dummy_run",
+            worker_id="dummy_worker",
+            episode_id="dummy_ep",
+            step_id=i,
+            shanten_delta=sd,
+            turn_number=i % 18,
+            point_delta_reward=pdr,
+            shanten_delta_reward=sdr_val,
+            is_post_riichi_discard=is_pr,
+        ))
+    writer.close()
+
+
+class TestPostRiichiDiag:
+    """CQ-0163: shanten_diag に立直後打牌統計を追加"""
+
+    def _run(self, tmp_path: Path) -> dict:
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_post_riichi(shard_dir, n=90, obs_dim=obs_dim, post_riichi_ratio=0.3)
+        config = _make_config()
+        config["training"]["epochs"] = 2
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        return learner.train(shard_dir)
+
+    def test_post_riichi_count_in_groups(self, tmp_path: Path):
+        """各群に post_riichi_discard_count / post_riichi_discard_ratio が存在"""
+        metrics = self._run(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            assert entry["count"] > 0
+            assert "post_riichi_discard_count" in entry
+            assert "post_riichi_discard_ratio" in entry
+            assert 0 <= entry["post_riichi_discard_ratio"] <= 1.0
+
+    def test_post_riichi_toplevel_stats(self, tmp_path: Path):
+        """top-level に total/available post_riichi_discards が存在"""
+        metrics = self._run(tmp_path)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        assert "total_post_riichi_discards" in sd
+        assert "available_post_riichi_discards" in sd
+        assert sd["total_post_riichi_discards"] > 0
+        assert sd["available_post_riichi_discards"] > 0
+
+    def test_no_post_riichi_flag_returns_none(self, tmp_path: Path):
+        """is_post_riichi_discards がない場合は None"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_turn_number(shard_dir, n=90, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["epochs"] = 2
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        sd = metrics["ppo_diag"]["shanten_diag"]
+        assert sd["total_post_riichi_discards"] is None
+        assert sd["available_post_riichi_discards"] is None
+        # 群にも post_riichi キーがない
+        for group in ("improve", "same", "worsen"):
+            entry = sd[group]
+            assert "post_riichi_discard_count" not in entry
+
+
+class TestPostRiichiExclusion:
+    """CQ-0164: 立直後打牌の学習除外テスト"""
+
+    def test_exclusion_off_keeps_all_samples(self, tmp_path: Path):
+        """exclusion off では全サンプル使用"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_shards_with_post_riichi(shard_dir, n=90, obs_dim=obs_dim, post_riichi_ratio=0.5)
+        config = _make_config()
+        config["training"]["epochs"] = 1
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        assert metrics["total_steps"] == 90
+        assert "post_riichi_exclusion" not in metrics
+
+    def test_exclusion_on_reduces_samples_ppo(self, tmp_path: Path):
+        """PPO: exclusion on で対象サンプル数が減る"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        np.random.seed(42)
+        _write_shards_with_post_riichi(shard_dir, n=90, obs_dim=obs_dim, post_riichi_ratio=0.5)
+        config = _make_config()
+        config["training"]["epochs"] = 1
+        config["training"]["exclude_post_riichi_discards"] = {"enabled": True}
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        assert metrics["total_steps"] < 90
+        assert "post_riichi_exclusion" in metrics
+        exc = metrics["post_riichi_exclusion"]
+        assert exc["excluded_post_riichi_discards"] > 0
+        assert exc["used_samples"] == metrics["total_steps"]
+
+    def test_exclusion_on_reduces_samples_imitation(self, tmp_path: Path):
+        """imitation: exclusion on で対象サンプル数が減る"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        np.random.seed(42)
+        _write_shards_with_post_riichi(shard_dir, n=90, obs_dim=obs_dim, post_riichi_ratio=0.5)
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["epochs"] = 1
+        config["training"]["exclude_post_riichi_discards"] = {"enabled": True}
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        assert metrics["total_steps"] < 90
+        assert "post_riichi_exclusion" in metrics
+        exc = metrics["post_riichi_exclusion"]
+        assert exc["excluded_post_riichi_discards"] > 0

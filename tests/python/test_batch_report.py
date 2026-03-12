@@ -1251,3 +1251,236 @@ class TestTowerBatch:
         assert summary["success_count"] == 2
         assert "model_features" in summary["runs"][0]
         assert "model_features" not in summary["runs"][1]
+
+
+class TestRewardComponentDiagBatch:
+    """CQ-0160/CQ-0161: reward 成分 shanten_diag の batch レポートテスト"""
+
+    def _make_result_with_reward_diag(self, tmp_path: Path, seed: int,
+                                       include_reward_keys: bool = True):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        improve = {"count": 10, "advantage": {"mean": 0.02}}
+        if include_reward_keys:
+            improve["reward"] = {"mean": 0.01, "std": 0.005, "p50": 0.01, "p90": 0.02, "p99": 0.03}
+            improve["point_delta_reward"] = {"mean": 0.008, "std": 0.003, "p50": 0.008, "p90": 0.015, "p99": 0.02}
+            improve["shanten_delta_reward"] = {"mean": 0.002, "std": 0.001, "p50": 0.002, "p90": 0.003, "p99": 0.005}
+            improve["delta_t"] = {"mean": -0.01, "std": 0.02, "p50": -0.005, "p90": 0.01, "p99": 0.03}
+        ppo_diag = {
+            "advantage_mean": 0.01,
+            "clip_fraction": 0.05,
+            "ratio_mean": 1.0,
+            "shanten_diag": {
+                "status": "complete",
+                "total_samples": 30,
+                "available_samples": 30,
+                "unavailable_samples": 0,
+                "improve": improve,
+                "same": {"count": 10, "advantage": {"mean": 0.0}},
+                "worsen": {"count": 10, "advantage": {"mean": -0.01}},
+            },
+        }
+        summary_data = {
+            "phase_stats": {"learner": {"ppo_diag": ppo_diag}},
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_reward_diag_in_runs(self, tmp_path: Path):
+        """runs[*].learner_diag.shanten_diag から reward/delta_t が参照可能"""
+        results = [self._make_result_with_reward_diag(tmp_path, 42)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        sd = run_entry["learner_diag"]["shanten_diag"]
+        improve = sd["improve"]
+        for key in ("reward", "point_delta_reward", "shanten_delta_reward", "delta_t"):
+            assert key in improve, f"improve に {key} がない"
+
+    def test_reward_diag_mixed_no_crash(self, tmp_path: Path):
+        """reward キーあり/なし混在でクラッシュしない"""
+        results = [
+            self._make_result_with_reward_diag(tmp_path, 42, include_reward_keys=True),
+            self._make_result_with_reward_diag(tmp_path, 43, include_reward_keys=False),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert summary["success_count"] == 2
+        # seed 42 has reward keys
+        sd_42 = summary["runs"][0]["learner_diag"]["shanten_diag"]
+        assert "reward" in sd_42["improve"]
+        # seed 43 doesn't
+        sd_43 = summary["runs"][1]["learner_diag"]["shanten_diag"]
+        assert "reward" not in sd_43["improve"]
+
+
+class TestPostRiichiDiagBatch:
+    """CQ-0163/CQ-0165: 立直後打牌統計の batch レポートテスト"""
+
+    def _make_result_with_post_riichi(self, tmp_path: Path, seed: int,
+                                       include_post_riichi: bool = True):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        improve = {"count": 10, "advantage": {"mean": 0.02}}
+        same = {"count": 15, "advantage": {"mean": 0.01}}
+        if include_post_riichi:
+            improve["post_riichi_discard_count"] = 2
+            improve["post_riichi_discard_ratio"] = 0.2
+            same["post_riichi_discard_count"] = 8
+            same["post_riichi_discard_ratio"] = 0.533
+        ppo_diag = {
+            "advantage_mean": 0.01,
+            "clip_fraction": 0.05,
+            "ratio_mean": 1.0,
+            "shanten_diag": {
+                "status": "complete",
+                "total_samples": 30,
+                "available_samples": 30,
+                "unavailable_samples": 0,
+                "total_post_riichi_discards": 12 if include_post_riichi else None,
+                "available_post_riichi_discards": 12 if include_post_riichi else None,
+                "improve": improve,
+                "same": same,
+                "worsen": {"count": 5, "advantage": {"mean": -0.01}},
+            },
+        }
+        summary_data = {
+            "phase_stats": {"learner": {"ppo_diag": ppo_diag}},
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_post_riichi_in_runs(self, tmp_path: Path):
+        """runs[*].learner_diag.shanten_diag に post_riichi が参照可能"""
+        results = [self._make_result_with_post_riichi(tmp_path, 42)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        sd = run_entry["learner_diag"]["shanten_diag"]
+        assert sd["total_post_riichi_discards"] == 12
+        assert sd["same"]["post_riichi_discard_count"] == 8
+        assert sd["same"]["post_riichi_discard_ratio"] == pytest.approx(0.533, abs=0.01)
+
+    def test_post_riichi_mixed_no_crash(self, tmp_path: Path):
+        """post_riichi あり/なし混在でクラッシュしない"""
+        results = [
+            self._make_result_with_post_riichi(tmp_path, 42, include_post_riichi=True),
+            self._make_result_with_post_riichi(tmp_path, 43, include_post_riichi=False),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert summary["success_count"] == 2
+
+
+class TestLearnerAuxStatsBatch:
+    """CQ-0166/CQ-0167: learner 補助統計の summary / batch 転送テスト"""
+
+    def _make_result_with_exclusion(self, tmp_path: Path, seed: int,
+                                     include_exclusion: bool = True):
+        run_dir = tmp_path / f"fake_run_{seed}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        learner_stats = {
+            "total_steps": 100,
+            "num_updates": 5,
+            "policy_loss": 0.01,
+            "value_loss": 0.02,
+            "mode": "ppo",
+            "ppo_diag": {
+                "advantage_mean": 0.01,
+                "clip_fraction": 0.05,
+                "ratio_mean": 1.0,
+            },
+        }
+        if include_exclusion:
+            learner_stats["post_riichi_exclusion"] = {
+                "total_before_exclusion": 120,
+                "excluded_post_riichi_discards": 20,
+                "used_samples": 100,
+            }
+        summary_data = {
+            "phase_stats": {"learner": learner_stats},
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary_data, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {
+                "run_dir": str(run_dir),
+                "global_seed": seed,
+                "selfplay_stats": {},
+                "eval_metrics": {"avg_rank": 2.5, "avg_score": 100.0,
+                                 "win_rate": 0.3, "deal_in_rate": 0.1},
+            },
+        }
+
+    def test_exclusion_in_batch_runs(self, tmp_path: Path):
+        """runs[*].post_riichi_exclusion が batch_summary に載る"""
+        results = [self._make_result_with_exclusion(tmp_path, 42)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run_entry = summary["runs"][0]
+        assert "post_riichi_exclusion" in run_entry
+        exc = run_entry["post_riichi_exclusion"]
+        assert exc["excluded_post_riichi_discards"] == 20
+        assert exc["used_samples"] == 100
+
+    def test_exclusion_missing_no_crash(self, tmp_path: Path):
+        """exclusion なしの run が混在してもクラッシュしない"""
+        results = [
+            self._make_result_with_exclusion(tmp_path, 42, include_exclusion=True),
+            self._make_result_with_exclusion(tmp_path, 43, include_exclusion=False),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert summary["success_count"] == 2
+        # seed 42 has exclusion
+        assert "post_riichi_exclusion" in summary["runs"][0]
+        # seed 43 doesn't
+        assert "post_riichi_exclusion" not in summary["runs"][1]
+
+    def test_no_exclusion_at_all(self, tmp_path: Path):
+        """全 run で exclusion なしでもクラッシュしない"""
+        results = [
+            self._make_result_with_exclusion(tmp_path, 42, include_exclusion=False),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert summary["success_count"] == 1
+        assert "post_riichi_exclusion" not in summary["runs"][0]

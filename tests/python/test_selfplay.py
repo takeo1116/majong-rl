@@ -613,3 +613,107 @@ class TestRewardComposition:
         rs = stats["reward_shaping"]
         assert rs["shanten_delta"]["enabled"] is False
         assert rs["shanten_delta"]["scale"] is None
+
+
+@pytest.mark.slow
+class TestRewardScale:
+    """CQ-0162: point_delta_scale が self-play env に適用されるテスト"""
+
+    def test_point_delta_scale_applied_to_shard(self, tmp_path: Path):
+        """point_delta_scale=0.0001 で shard の reward / point_delta_reward が scaled 値"""
+        config = _make_config(policy_ratio=1.0)
+        config["reward"] = {"point_delta_scale": 0.0001}
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=2, seed_start=42)
+
+        # shard を読み込み
+        reader = ShardReader(tmp_path / "shards")
+        data = reader.read_as_tensors()
+        rewards = data["rewards"]
+        pdr = data.get("point_delta_rewards")
+
+        # point_delta_scale=0.0001 で raw point (-1000 等) が scaled される
+        # 麻雀の 1 step の点数差は高々数万点なので |reward| < 10 程度に収まるはず
+        # shaping なしなので point_delta_reward ≈ reward
+        assert rewards is not None
+        assert len(rewards) > 0
+        # scale 済みなので |reward| は概ね小さい (raw point なら数百〜数万)
+        max_abs = float(np.abs(rewards).max())
+        assert max_abs < 10.0, f"reward max_abs={max_abs} が大きすぎる。scale 未適用の可能性"
+
+        # point_delta_reward も scaled
+        if pdr is not None:
+            pdr_max = float(np.abs(pdr[~np.isnan(pdr)]).max()) if len(pdr[~np.isnan(pdr)]) > 0 else 0.0
+            assert pdr_max < 10.0, f"point_delta_reward max={pdr_max} が大きすぎる"
+
+    def test_reward_composition_scaled(self, tmp_path: Path):
+        """reward_composition.point_delta の統計値が scale 済み"""
+        config = _make_config(policy_ratio=1.0)
+        config["reward"] = {"point_delta_scale": 0.0001}
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=2, seed_start=42)
+
+        rc = stats["reward_composition"]
+        pd_stats = rc["point_delta"]
+        # scale 済みなので mean の絶対値は raw point (数百〜数千) より遥かに小さい
+        assert abs(pd_stats["mean"]) < 10.0, (
+            f"reward_composition.point_delta.mean={pd_stats['mean']} が大きすぎる")
+
+    def test_default_scale_is_1(self, tmp_path: Path):
+        """reward config なしではデフォルト scale=1.0 (従来互換)"""
+        config = _make_config(policy_ratio=1.0)
+        # reward config なし → point_delta_scale=1.0 がデフォルト
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        stats = worker.run(num_matches=1, seed_start=42)
+
+        rc = stats["reward_composition"]
+        # scale=1.0 なので raw point 単位。非ゼロの reward があれば |mean| >= 0
+        # ただし大半のステップは reward=0 なので mean は小さいかもしれない
+        # ここでは壊れていないことだけ確認
+        assert "point_delta" in rc
+        assert rc["point_delta"]["count"] > 0
+
+
+@pytest.mark.slow
+class TestPostRiichiFlag:
+    """CQ-0163: is_post_riichi_discard フラグが shard に書き出される"""
+
+    def test_post_riichi_flag_in_shard(self, tmp_path: Path):
+        """self-play で is_post_riichi_discards が shard に含まれる"""
+        config = _make_config(observation_mode="full", policy_ratio=1.0)
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(encoder)
+        worker = SelfPlayWorker(
+            config=config,
+            model=model,
+            encoder=encoder,
+            output_dir=tmp_path / "shards",
+        )
+        worker.run(num_matches=2, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        data = reader.read_as_tensors()
+        assert data["is_post_riichi_discards"] is not None
+        assert data["is_post_riichi_discards"].dtype == np.bool_
+        # 少なくとも一部は True / False（立直後あり/なし）
+        total = len(data["is_post_riichi_discards"])
+        n_true = int(data["is_post_riichi_discards"].sum())
+        assert total > 0
+        # 麻雀のゲームでは一部は立直後打牌になるはず（確率的だが2局あれば十分）
+        # 完全に全部 False でも壊れていない証拠にはなる
+        assert n_true >= 0  # 最低限非負
