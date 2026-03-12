@@ -271,7 +271,20 @@ legal mask により、実行可能な打牌へ射影する。
 - 点数変化に比例した reward を返す
 - 学習では scale を掛けた値を用いる
 
-### 9.2 Stage 1 での実際の挙動
+### 9.2 reward config の適用経路 (CQ-0162)
+
+`reward.point_delta_scale` は C++ エンジン (`Stage1Env`) の `RewardPolicyConfig` を通じて
+env 内部で reward 計算時に適用される。すべての `Stage1Env` 生成経路で `reward_config` を渡す必要がある。
+
+適用経路:
+- **self-play**: `selfplay_worker.py` が config["reward"] から `RewardPolicyConfig` を構築し `Stage1Env` に渡す
+- **evaluation**: `runner.py` の `_eval_worker_fn` が `reward_config_dict` から `RewardPolicyConfig` を構築し `EvaluationRunner` に渡す。`EvaluationRunner` が `Stage1Env` に転送する
+- **imitation**: selfplay_worker が self-play と同じ config を使うため同一経路
+
+`reward_config` を渡さない場合、C++ デフォルト `point_delta_scale=1.0` が使われ、
+learner に流れる reward の単位が config 設定と不整合になる。
+
+### 9.3 Stage 1 での実際の挙動
 
 運用上の理解としては次の通り。
 
@@ -283,7 +296,7 @@ legal mask により、実行可能な打牌へ射影する。
 **点数変化ベースの sparse な即時報酬**
 として扱うのが正確である。
 
-### 9.3 現仕様での reward 関連の既知課題
+### 9.4 現仕様での reward 関連の既知課題
 
 - sparse
 - tail が強い
@@ -292,7 +305,7 @@ legal mask により、実行可能な打牌へ射影する。
 これは現在の `PROJECT.md` にある主要診断課題の一つであり、  
 reward 設計変更を伴う CQ ではこの節を起点に議論する。
 
-### 9.4 Reward Shaping (CQ-0139, CQ-0140)
+### 9.5 Reward Shaping (CQ-0139, CQ-0140)
 
 Python `selfplay_worker` 内で shaping reward を計算し、`point_delta` と合成した total を `LearningSample.reward` に格納する。
 shard / learner 側の構造変更はなし（reward は単一 float のまま）。
@@ -384,8 +397,18 @@ raw `shanten_delta` の符号で 3 群に分割した診断統計を `ppo_diag.s
 - `value_error`: mean, std, p50, p90, p99
 - `new_value`: mean, std, p50, p90, p99 (CQ-0155, PPO 学習完了後の value 予測)
 - `value_update_delta`: mean, std, p50, p90, p99 (CQ-0155, = new_value - old_value)
+- `reward`: mean, std, p50, p90, p99 (CQ-0160, total reward = point_delta + shanten_delta)
+- `point_delta_reward`: mean, std, p50, p90, p99 (CQ-0160, 点数差分報酬成分。shard に成分あり時のみ)
+- `shanten_delta_reward`: mean, std, p50, p90, p99 (CQ-0160, shanten shaping 報酬成分。shard に成分あり時のみ)
+- `delta_t`: mean, std, p50, p90, p99 (CQ-0160, 1-step TD 誤差 = reward_t + gamma * next_value_t - old_value_t)
+- `post_riichi_discard_count` (CQ-0163, 群内の立直後打牌数。shard に is_post_riichi_discard あり時のみ)
+- `post_riichi_discard_ratio` (CQ-0163, 群内の立直後打牌比率。同上)
 
 `new_value` / `value_update_delta` は PPO 学習ループ完了後に全データに対して 1 回推論して取得する per-sample 値。
+
+`delta_t` の定義は GAE 計算時の 1-step TD 誤差と一致する。terminated 境界では next_value = 0。
+`point_delta_reward` / `shanten_delta_reward` は shard に reward 成分カラムがある場合のみ出力される。
+`reward` / `delta_t` は rewards / terminateds / old_values から計算可能なため、reward 成分カラムがなくても出力される。
 
 count == 0 の群は `{"count": 0}` のみ。
 
@@ -397,6 +420,10 @@ count == 0 の群は `{"count": 0}` のみ。
   - `partial`: 一部のサンプルのみ shanten_delta あり（mixed shard）
   - `unavailable`: 全サンプルに shanten_delta なし（この場合 shanten_diag 自体は出力される）
 - `total_samples`, `available_samples`, `unavailable_samples` を併記
+
+立直後打牌統計 (CQ-0163):
+- `total_post_riichi_discards`: 全サンプル中の立直後打牌数（shard に `is_post_riichi_discard` あり時のみ。なければ `null`）
+- `available_post_riichi_discards`: available サンプル中の立直後打牌数（同上）
 
 出力先:
 - `metrics/train_metrics.json.ppo_diag.shanten_diag`
@@ -440,6 +467,37 @@ count == 0 のバケットは `{"count": 0}` のみ。
 - shanten_delta カラムがない shard → `shanten_deltas = None`、shanten_diag 省略
 - mixed shard（旧/新混在）→ 欠落サンプルは NaN、same 群に混入しない
 - turn_number カラムがない shard → `turn_numbers = None`、turn_diag 省略
+- point_delta_reward / shanten_delta_reward カラムがない shard → 成分別統計省略、reward/delta_t は出力
+- reward 成分の mixed shard（旧/新混在）→ 欠落サンプルは NaN
+- is_post_riichi_discard カラムがない shard → `is_post_riichi_discards = None`、post_riichi 統計省略
+- is_post_riichi_discard の mixed shard（旧/新混在）→ sentinel -1 が混入するため `None` にフォールバック
+
+#### LearningSample.is_post_riichi_discard (CQ-0163)
+selfplay_worker は打牌前の `env.env_state.round_state.players[current].is_riichi` を取得し、
+`LearningSample.is_post_riichi_discard` に bool として格納する。
+
+定義: **そのサンプルの打牌時点で学習対象プレイヤーが立直済みである場合 `True`**。
+立直宣言打牌そのものは `False`（宣言前の状態で判定）。
+
+shard には条件付きカラムとして書き出す（int: 1/0、sentinel: -1）。
+
+#### 立直後打牌の学習除外 (CQ-0164)
+```yaml
+training:
+  exclude_post_riichi_discards:
+    enabled: false  # デフォルト off
+```
+
+`enabled: true` のとき、learner は shard 読み込み後・学習前に `is_post_riichi_discard=True` のサンプルを除外する。
+- PPO / imitation の両方に適用される
+- shard 保存は変更しない（除外は learner 側で実行）
+- 診断統計（shanten_diag の post_riichi_discard_count 等）は除外後のデータで計算される
+- 除外件数は `train_metrics.post_riichi_exclusion` に記録:
+  - `total_before_exclusion`, `excluded_post_riichi_discards`, `used_samples`
+- 出力先 (CQ-0166):
+  - `metrics/train_metrics.json.post_riichi_exclusion`
+  - `summary.json.phase_stats.learner.post_riichi_exclusion`
+  - `batch_summary.json.runs[*].post_riichi_exclusion`
 
 ### 9.5 将来案
 

@@ -1,6 +1,6 @@
 # PROJECT.md
 
-最終更新: 2026-03-11  
+最終更新: 2026-03-13  
 この文書の役割: プロジェクトの大目標・現在地・次アクションを短時間で復元する意思決定ハブ。
 
 ---
@@ -12,9 +12,9 @@
 
 ---
 
-## 2. 現在地（2026-03-10）
+## 2. 現在地（2026-03-13）
 
-フェーズ: **Stage1後半（value 診断改善と policy 更新安定性のトレードオフ切り分けフェーズ）**
+フェーズ: **Stage1後半（post-fix 基準の再構築を終え、高表現力モデル + target/value 調整の有効域を探るフェーズ）**
 
 - できている
   - runbook/report/driver 運用、phase 再利用、resume
@@ -22,39 +22,53 @@
   - PPO ハイパラ基礎探索
   - `shanten_hint` と `tie_aware_best_set` の導入・比較
   - learner 診断統計（`ppo_diag`）の成果物化
+  - reward scale バグの特定と修正、post-fix baseline の再取得
+  - `exclude_post_riichi_discards` の導入と learner/batch 成果物化
+  - 高表現力モデル（`hidden_dims=[512,256] + dual_towers`）の成立確認
 - 未解決
-  - 固定した shaping 条件と joint imitation 条件の下でも、`improve/worsen` 群で advantage の符号が整合しない理由
-  - value 診断改善と通常評価改善がなぜ乖離するのか
-  - hidden size 拡大で `clip_fraction` / `ratio_std` が悪化する理由
-  - 単純な `lr` / `epochs` 弱化で上記トレードオフを解けない理由
-  - value/target 改善と policy 更新安定性の両立条件
+  - 現行特徴量 + モデルに imitation だけでまだ伸びしろがあるか
+  - shaping の最適条件が post-fix / post-riichi-exclusion 条件でも有効か
+  - 高表現力モデルで、after 指標を改善しつつ PPO 後悪化をさらに縮める条件
+  - `same > 0 / improve < 0` の群平均構造が残っても、実用上どこまで問題か
 
 ---
 
 ## 3. Current Focus（今の実験目的）
 
-現在の主目的は次の1点。
+現在の主目的は次の2点。
 
-> reward shaping 条件と joint imitation 条件を固定した上で、`shanten_diag` / `turn_diag` と PPO 更新安定性指標を併せて見て、value 診断改善と通常評価悪化の乖離、そしてそのトレードオフが単純な PPO 弱化で解けるかを説明する。
+> 1. `exp_037 D` を高表現力 baseline 候補として固定し、データ量増加と shaping 再設定のどちらに伸びしろがあるかを判定する。  
+> 2. 現行特徴量 + モデルが imitation だけでどこまで伸びるかを確認し、PPO 改善余地の有無を切り分ける。
 
 現行固定軸（診断基準点）:
 
 - `feature_encoder.shanten_hint=true`
 - `training.imitation_loss_mode=tie_aware_best_set`
+- `training.imitation_value_warmstart.enabled=true`
+- `training.imitation_value_warmstart.coef=0.3`
 - `training.lr=0.0001`
-- `training.epochs=4`
+- `training.epochs=2`
 - `training.value_loss_coef=0.25`
 - `training.clip_epsilon=0.2`
-- `training.batch_size=256`
+- `training.batch_size=512`
 - `training.gamma=0.99`
-- `training.gae_lambda=0.95`
+- `training.gae_lambda=0.90`
+- `training.exclude_post_riichi_discards.enabled=true`
+- `model.hidden_dims=[512,256]`
+- `model.policy_tower.enabled=true`
+- `model.value_tower.enabled=true`
+- `reward.point_delta_scale=0.0001`
+- `reward.shaping.shanten_delta.enabled=true`
+- `reward.shaping.shanten_delta.scale=0.01`
+- `reward.shaping.shanten_delta.mode=both`
+- `reward.shaping.shanten_delta.schedule.type=linear_decay`
 
 評価の優先順:
 
-1. `eval_before -> eval` の delta（悪化幅）
-2. after 指標（`avg_rank`, `avg_score`, `win_rate`, `deal_in_rate`）
-3. learner 診断統計（`advantage/return/value_error/ratio/clip_fraction`）
-4. self-play / reward 分布
+1. after 指標（`avg_rank`, `avg_score`, `win_rate`, `deal_in_rate`）
+2. `eval_before -> eval` の delta（悪化幅）
+3. learner 診断統計（`value_error/turn_diag/shanten_diag/ratio/clip_fraction`）
+4. imitation 改善量（特に `eval_before`）
 
 ---
 
@@ -119,6 +133,38 @@
   - ただし `shanten_diag` / `turn_diag` の value 診断改善はほぼ失われ、`exp_025` 近傍へ戻った
   - `weak-epochs` は value 診断改善を維持したが通常評価はさらに悪化した
   - 単純な `lr` / `epochs` 弱化だけでは、value 診断改善と通常評価改善の両立はできない
+- `exp_029`（small model + `current_shanten=true` で tower 構造比較）
+  - `value_tower only` は更新安定性は改善したが、通常評価・`shanten_diag`・`turn_diag` を悪化させ不採用
+  - `policy_tower only` は after 指標・更新安定性・value 診断のバランスが最良で、暫定採用候補
+  - `dual towers` は更新安定性は最良だが、通常評価で `policy_tower only` を更新できず保留
+  - shared trunk 干渉仮説は部分的に支持され、少なくとも policy 側 tower は有効候補
+- `exp_030`（baseline 単条件、reward / `delta_t` 分解診断）
+  - `improve` / `worsen` の逆転は `advantage` だけでなく `reward` と `delta_t` の段階ですでに存在
+  - 逆転の主因はまず `point_delta_reward` 群差で、`shanten_delta_reward` の符号自体は正しいが絶対値が小さい
+  - value はその逆転をさらに増幅しているが、value 単独原因ではない
+- `exp_031`（post-fix baseline 再取得）
+  - reward scale バグ修正後の baseline を再取得
+  - PPO 後悪化は残るが、診断値は正常スケールに戻った
+- `exp_032`（post-fix `policy_tower_only`）
+  - pre-fix で良く見えた `policy_tower_only` は post-fix では baseline を更新できず不採用
+- `exp_033`（`exclude_post_riichi_discards=true`）
+  - PPO 後悪化はかなり縮小
+  - ただし `same > 0 / improve < 0` は残存し、主因ではないと確認
+- `exp_034`（高表現力モデル + dual towers）
+  - PPO 後悪化と `shanten_diag` は改善
+  - ただし `clip_fraction` / `ratio_std` / `turn_diag` が悪化し、そのままでは不採用
+- `exp_035`（高表現力モデルの更新強度調整）
+  - `batch_size=512, epochs=2` が有効
+  - `exp_034` より after 指標、更新安定性、turn 歪みが改善
+  - 高表現力側の baseline 候補になった
+- `exp_036`（`batch_size=1024` と lr 比較）
+  - `batch_size=1024` は update は綺麗でも after 指標が大きく悪化
+  - 高表現力条件では過度に保守的で不採用
+- `exp_037`（`gae_lambda` / imitation value warmstart 比較）
+  - `gae_lambda=0.90` 単独は診断改善があるが after では弱い
+  - `coef=0.3` 単独は不採用
+  - `gae_lambda=0.90 + coef=0.3`（D）が総合では最良候補
+  - 現時点の主系列 baseline は `exp_037 D`
 
 ---
 
@@ -134,11 +180,14 @@
 - reward shaping なしの baseline reward 単独運用を「十分」とみなすこと
 - `scale=0.1` の極端 shaping
 - `mode=improve_only`
-- reward shaping の追加比較を続けること（当面は learner/value 仮説を優先）
+- `batch_size=1024` 系の再探索
+- `policy_tower only` を post-fix baseline 候補とみなすこと
+- `coef=0.3` 単独 warmstart
+- `gae_lambda=0.90` 単独を即採用すること
 - `model.value_features.current_shanten.enabled=true` の追加比較（現時点では価値が見えない）
-- reward shaping の追加探索（value/target の残差説明が先）
 - hidden size 拡大 + current shanten 同時導入を、そのまま採用すること
 - 大きめモデル条件で `lr` / `epochs` を単純に弱めれば解決するとみなすこと
+- advantage 逆転を「value だけの問題」とみなすこと
 
 再検討条件:
 
@@ -166,8 +215,16 @@ run 成果物で確認可能:
     - `available_samples/unavailable_samples/status`
 - `turn_diag`
     - `early/mid/late` ごとの `advantage/return/old_value/new_value/value_update_delta/value_error`
+- `shanten_diag` の追加内訳
+    - `reward`
+    - `point_delta_reward`
+    - `shanten_delta_reward`
+    - `delta_t`
 - 大きいモデル + current shanten 条件での同診断（`exp_026`）との比較
 - batch 側 run 別 learner 診断統計
+- `post_riichi_exclusion`
+- `imitation value_loss`
+- `model_features.policy_tower/value_tower`
 
 不足が出たら CQ 化して可観測性を先に上げる（推測で進めない）。
 
@@ -175,12 +232,12 @@ run 成果物で確認可能:
 
 ## 7. Trigger to Move Stage（次段へ進む条件）
 
-「PPO 改善が回る」と判定する目安（暫定）。
+「主系列を次段へ進める」と判定する目安（暫定）。
 
 必須条件:
 
-1. 主比較条件で `eval_before -> eval` の悪化が消える（少なくとも 5 seeds で一貫して改善または非悪化）
-2. `shanten_diag` を含む learner 診断統計が、少なくとも改善方向と矛盾しない
+1. 主比較条件で after 指標が `exp_037 D` を一貫して更新する
+2. `eval_before -> eval` の悪化幅が少なくとも現 baseline より縮む
 3. 追加1回の再現実験でも同傾向が出る
 
 達成後の次段:
@@ -216,4 +273,4 @@ run 成果物で確認可能:
 
 ## 10. 一文要約
 
-**reward shaping と joint imitation で通常評価は前進したが、`improve/worsen` 群の advantage はまだ整合していない。value 表現を強めると診断値は一貫して改善する一方、通常評価はむしろ悪化し、さらに単純な `lr` / `epochs` 弱化でもそのトレードオフは解けなかった。次は policy-value 干渉または target 定義を本丸として切る必要がある。**
+**reward scale バグ修正と立直後打牌除外を経て、主系列 baseline は `exp_037 D`（高表現力モデル + `gae_lambda=0.90` + imitation value warmstart `coef=0.3`）に更新された。現在の論点は、現行特徴量/モデルに imitation だけでまだ伸びしろがあるか、そして post-fix 条件で shaping を再評価すると after 指標をさらに押し上げられるか、の2点である。**
