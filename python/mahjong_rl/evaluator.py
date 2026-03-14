@@ -298,6 +298,14 @@ class EvaluationRunner:
         self._value_shanten_enabled = value_shanten_enabled
         self._reward_config = reward_config  # CQ-0162: RewardPolicyConfig or None
 
+        # 推論用 tensor バッファの事前確保
+        import numpy as np
+        meta = encoder.metadata()
+        input_dim = meta.output_shape[0] if len(meta.output_shape) == 1 else int(np.prod(meta.output_shape))
+        self._features_buf = torch.zeros(1, input_dim, dtype=torch.float32, device=self._device)
+        self._mask_buf = torch.zeros(1, 34, dtype=torch.float32, device=self._device)
+        self._value_aux_buf = torch.zeros(1, 1, dtype=torch.float32, device=self._device)
+
     def evaluate_partial(
         self,
         num_matches: int = 100,
@@ -481,21 +489,22 @@ class EvaluationRunner:
     def _policy_step(self, obs, mask: np.ndarray,
                      current_shanten: int | None = None) -> int:
         """ポリシーモデルで打牌を選択する（argmax）"""
-        features = self._encoder.encode(obs)
+        features = self._encoder.encode(obs, legal_mask=mask)
         features_flat = features.flatten() if features.ndim > 1 else features
-        features_t = torch.from_numpy(features_flat).unsqueeze(0).to(self._device)
-        mask_t = torch.from_numpy(mask).unsqueeze(0).to(self._device)
+        # バッファに書き込み (tensor 再生成を回避)
+        self._features_buf[0].copy_(torch.from_numpy(features_flat))
+        self._mask_buf[0].copy_(torch.from_numpy(mask))
 
         # CQ-0153: value head 用補助特徴
         value_aux = None
         if self._value_shanten_enabled and current_shanten is not None:
-            value_aux = torch.tensor(
-                [[current_shanten / 8.0]], dtype=torch.float32, device=self._device)
+            self._value_aux_buf[0, 0] = current_shanten / 8.0
+            value_aux = self._value_aux_buf
 
         with torch.no_grad():
-            output = self._model(features_t, mask_t, value_aux_features=value_aux)
+            output = self._model(self._features_buf, self._mask_buf, value_aux_features=value_aux)
 
-        tile_type, _ = self._selector.select(output.logits[0], mask_t[0])
+        tile_type, _ = self._selector.select(output.logits[0], self._mask_buf[0])
         return tile_type
 
     def _baseline_step(self, env: Stage1Env, mask: np.ndarray) -> int:

@@ -3,6 +3,9 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 
+#include <algorithm>
+#include <stdexcept>
+
 // Python.h が定義する NAN マクロと tile_type::NAN の名前衝突を回避
 #ifdef NAN
 #undef NAN
@@ -21,6 +24,7 @@
 #include "engine/hand_utils.h"
 #include "rl/observation.h"
 #include "rl/reward_policy.h"
+#include "rl/shanten.h"
 
 namespace py = pybind11;
 using namespace mahjong;
@@ -387,6 +391,98 @@ PYBIND11_MODULE(_mahjong_core, m) {
     m.def("is_agari", &hand_utils::is_agari, "和了形チェック");
     m.def("is_tenpai", &hand_utils::is_tenpai, "テンパイチェック");
     m.def("get_waits", &hand_utils::get_waits, "待ち牌一覧を返す");
+
+    // --- shanten ---
+    m.def("compute_shanten", [](const std::vector<int>& counts_vec) {
+        if (counts_vec.size() != 34) {
+            throw std::invalid_argument("counts must have exactly 34 elements");
+        }
+        std::array<int, 34> counts;
+        std::copy(counts_vec.begin(), counts_vec.end(), counts.begin());
+        return compute_shanten(counts);
+    }, py::arg("counts"),
+       "シャンテン数を計算する (通常形・七対子・国士の最小値)");
+
+    m.def("analyze_discards", [](const std::vector<int>& counts_vec,
+                                  const std::vector<int>& mask_vec) {
+        if (counts_vec.size() != 34 || mask_vec.size() != 34) {
+            throw std::invalid_argument("counts and legal_mask must have exactly 34 elements");
+        }
+        std::array<int, 34> counts, mask;
+        std::copy(counts_vec.begin(), counts_vec.end(), counts.begin());
+        std::copy(mask_vec.begin(), mask_vec.end(), mask.begin());
+        auto result = analyze_discards(counts, mask);
+        py::dict d;
+        d["shanten_after"] = py::cast(std::vector<int>(result.shanten_after.begin(), result.shanten_after.end()));
+        d["acceptance"] = py::cast(std::vector<int>(result.acceptance.begin(), result.acceptance.end()));
+        d["ukeire_norm"] = py::cast(std::vector<float>(result.ukeire_norm.begin(), result.ukeire_norm.end()));
+        d["shanten_sign"] = py::cast(std::vector<float>(result.shanten_sign.begin(), result.shanten_sign.end()));
+        return d;
+    }, py::arg("counts"), py::arg("legal_mask"),
+       "打牌候補の一括分析 (shanten/acceptance/ukeire_norm/shanten_sign)");
+
+    m.def("find_best_discard", [](const std::vector<int>& counts_vec,
+                                   const std::vector<int>& mask_vec) {
+        if (counts_vec.size() != 34 || mask_vec.size() != 34) {
+            throw std::invalid_argument("counts and legal_mask must have exactly 34 elements");
+        }
+        std::array<int, 34> counts, mask;
+        std::copy(counts_vec.begin(), counts_vec.end(), counts.begin());
+        std::copy(mask_vec.begin(), mask_vec.end(), mask.begin());
+        auto result = find_best_discard(counts, mask);
+        py::dict d;
+        d["best_shanten"] = result.best_shanten;
+        d["best_acceptance"] = result.best_acceptance;
+        d["best_tile"] = result.best_tile;
+        d["best_mask"] = py::cast(std::vector<int>(result.best_mask.begin(), result.best_mask.end()));
+        return d;
+    }, py::arg("counts"), py::arg("legal_mask"),
+       "最善打牌を選択する (シャンテン最小 → 受け入れ最大)");
+
+    m.def("make_discard_mask", [](GameEngine& engine, EnvironmentState& env) {
+        auto actions = engine.get_legal_actions(env);
+        std::array<int, 34> mask{};
+        // 立直打牌があるか確認
+        bool has_riichi = false;
+        for (const auto& a : actions) {
+            if (a.type == ActionType::Discard && a.riichi) {
+                has_riichi = true;
+                break;
+            }
+        }
+        if (has_riichi) {
+            for (const auto& a : actions) {
+                if (a.type == ActionType::Discard && a.riichi) {
+                    mask[a.tile / 4] = 1;
+                }
+            }
+        } else {
+            for (const auto& a : actions) {
+                if (a.type == ActionType::Discard) {
+                    mask[a.tile / 4] = 1;
+                }
+            }
+        }
+        return std::vector<int>(mask.begin(), mask.end());
+    }, py::arg("engine"), py::arg("env"),
+       "Stage1 用打牌マスク (34次元) を直接生成する");
+
+    m.def("compute_shape_hint", [](const std::vector<int>& counts_vec) {
+        if (counts_vec.size() != 34) {
+            throw std::invalid_argument("counts must have exactly 34 elements");
+        }
+        std::array<int, 34> counts;
+        std::copy(counts_vec.begin(), counts_vec.end(), counts.begin());
+        auto result = compute_shape_hint(counts);
+        // chi(21) + outside_wait(24) + inside_wait(21) = 66 要素の連結リスト
+        std::vector<float> combined;
+        combined.reserve(66);
+        combined.insert(combined.end(), result.chi.begin(), result.chi.end());
+        combined.insert(combined.end(), result.outside_wait.begin(), result.outside_wait.end());
+        combined.insert(combined.end(), result.inside_wait.begin(), result.inside_wait.end());
+        return combined;
+    }, py::arg("counts"),
+       "手牌形状ヒント (chi[21]+outside_wait[24]+inside_wait[21]=66 要素)");
 
     // --- 定数 ---
     m.attr("NUM_TILES") = kNumTiles;

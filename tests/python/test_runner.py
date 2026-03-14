@@ -2887,3 +2887,94 @@ class TestPostRiichiE2E:
             exc = learner["post_riichi_exclusion"]
             assert "excluded_post_riichi_discards" in exc
             assert "used_samples" in exc
+
+
+@pytest.mark.smoke
+class TestEncoderFeatureWiring:
+    """encoder 新オプションの runner 配線テスト (CQ-0171)"""
+
+    def test_discard_ukeire_hint_on(self, tmp_path: Path):
+        """discard_ukeire_hint=on で run 完走し summary に記録される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["discard_ukeire_hint"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ef = summary.get("encoder_features", {})
+        assert ef.get("discard_ukeire_hint") is True
+        assert ef.get("input_dim") == 489  # full(455) + 34
+
+    def test_current_shanten_on(self, tmp_path: Path):
+        """current_shanten=on で run 完走し summary に記録される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["current_shanten"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ef = summary.get("encoder_features", {})
+        assert ef.get("current_shanten") is True
+        assert ef.get("input_dim") == 456  # full(455) + 1
+
+    def test_shape_hint_on(self, tmp_path: Path):
+        """shape_hint=on で run 完走し summary に記録される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["shape_hint"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ef = summary.get("encoder_features", {})
+        assert ef.get("shape_hint") is True
+        assert ef.get("input_dim") == 521  # full(455) + 66
+
+    def test_all_new_features_on(self, tmp_path: Path):
+        """全新オプション有効で run 完走"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["discard_ukeire_hint"] = {"enabled": True}
+        config.feature_encoder["current_shanten"] = {"enabled": True}
+        config.feature_encoder["shape_hint"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ef = summary.get("encoder_features", {})
+        assert ef.get("discard_ukeire_hint") is True
+        assert ef.get("current_shanten") is True
+        assert ef.get("shape_hint") is True
+        # full(455) + 34 + 1 + 66 = 556
+        assert ef.get("input_dim") == 556
+
+    def test_default_off_backward_compat(self, tmp_path: Path):
+        """新オプション既定 off で従来の次元を維持"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ef = summary.get("encoder_features", {})
+        assert ef.get("discard_ukeire_hint") is False
+        assert ef.get("current_shanten") is False
+        assert ef.get("shape_hint") is False
+        assert ef.get("input_dim") == 455

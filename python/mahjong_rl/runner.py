@@ -119,17 +119,25 @@ from mahjong_rl.evaluator import (
 )
 
 
+def _parse_encoder_flag(enc_cfg: dict, key: str) -> bool:
+    """encoder config のフラグを dict 形式/bool 形式の両方に対応して取得する"""
+    v = enc_cfg.get(key, {})
+    return v.get("enabled", False) if isinstance(v, dict) else bool(v)
+
+
 def _rebuild_encoder(encoder_config: dict, obs_mode: str):
-    """encoder_config からエンコーダを再構築する (worker 用ヘルパー, CQ-0119)"""
+    """encoder_config からエンコーダを再構築する (worker 用ヘルパー, CQ-0119, CQ-0171)"""
     enc_name = encoder_config.get("name", "FlatFeatureEncoder")
     enc_obs = encoder_config.get("observation_mode", obs_mode)
     if enc_name == "ChannelTensorEncoder":
         return ChannelTensorEncoder(observation_mode=enc_obs)
-    shanten_cfg = encoder_config.get("shanten_hint", {})
-    shanten_enabled = (shanten_cfg.get("enabled", False)
-                       if isinstance(shanten_cfg, dict) else bool(shanten_cfg))
-    return FlatFeatureEncoder(observation_mode=enc_obs,
-                              shanten_hint=shanten_enabled)
+    return FlatFeatureEncoder(
+        observation_mode=enc_obs,
+        shanten_hint=_parse_encoder_flag(encoder_config, "shanten_hint"),
+        discard_ukeire_hint=_parse_encoder_flag(encoder_config, "discard_ukeire_hint"),
+        current_shanten_input=_parse_encoder_flag(encoder_config, "current_shanten"),
+        shape_hint=_parse_encoder_flag(encoder_config, "shape_hint"),
+    )
 
 
 def _eval_worker_fn(
@@ -1504,7 +1512,7 @@ class Stage1Runner:
         return [base + (1 if i < remainder else 0) for i in range(num_workers)]
 
     def _create_encoder(self):
-        """設定からエンコーダを生成する"""
+        """設定からエンコーダを生成する (CQ-0119, CQ-0171)"""
         enc_cfg = self._config.feature_encoder
         name = enc_cfg.get("name", "FlatFeatureEncoder")
         obs_mode = enc_cfg.get(
@@ -1513,12 +1521,13 @@ class Stage1Runner:
         )
         if name == "ChannelTensorEncoder":
             return ChannelTensorEncoder(observation_mode=obs_mode)
-        # CQ-0119: shanten_hint 設定
-        shanten_cfg = enc_cfg.get("shanten_hint", {})
-        shanten_enabled = (shanten_cfg.get("enabled", False)
-                           if isinstance(shanten_cfg, dict) else bool(shanten_cfg))
-        return FlatFeatureEncoder(observation_mode=obs_mode,
-                                  shanten_hint=shanten_enabled)
+        return FlatFeatureEncoder(
+            observation_mode=obs_mode,
+            shanten_hint=_parse_encoder_flag(enc_cfg, "shanten_hint"),
+            discard_ukeire_hint=_parse_encoder_flag(enc_cfg, "discard_ukeire_hint"),
+            current_shanten_input=_parse_encoder_flag(enc_cfg, "current_shanten"),
+            shape_hint=_parse_encoder_flag(enc_cfg, "shape_hint"),
+        )
 
     def _create_model(self, encoder):
         """設定からモデルを生成する"""
@@ -1720,15 +1729,15 @@ class Stage1Runner:
         if phase_action:
             summary["phase_action"] = phase_action
 
-        # CQ-0121: encoder_features を記録
+        # CQ-0121, CQ-0171: encoder_features を記録
         enc_cfg = self._config.feature_encoder
-        shanten_cfg = enc_cfg.get("shanten_hint", {})
-        shanten_on = (shanten_cfg.get("enabled", False)
-                      if isinstance(shanten_cfg, dict) else bool(shanten_cfg))
         summary["encoder_features"] = {
             "name": enc_cfg.get("name", "FlatFeatureEncoder"),
             "observation_mode": enc_cfg.get("observation_mode", "?"),
-            "shanten_hint": shanten_on,
+            "shanten_hint": _parse_encoder_flag(enc_cfg, "shanten_hint"),
+            "discard_ukeire_hint": _parse_encoder_flag(enc_cfg, "discard_ukeire_hint"),
+            "current_shanten": _parse_encoder_flag(enc_cfg, "current_shanten"),
+            "shape_hint": _parse_encoder_flag(enc_cfg, "shape_hint"),
             "input_dim": result.get("input_dim"),
         }
 
@@ -2141,13 +2150,17 @@ class Stage1Runner:
         for phase, status in phase_status.items():
             lines.append(f"  - {phase}: {status}")
 
-        # CQ-0121: encoder 情報
+        # CQ-0121, CQ-0171: encoder 情報
         enc_cfg = self._config.feature_encoder
-        shanten_cfg = enc_cfg.get("shanten_hint", {})
-        shanten_on = (shanten_cfg.get("enabled", False)
-                      if isinstance(shanten_cfg, dict) else bool(shanten_cfg))
+        _flags = {
+            "shanten_hint": _parse_encoder_flag(enc_cfg, "shanten_hint"),
+            "discard_ukeire_hint": _parse_encoder_flag(enc_cfg, "discard_ukeire_hint"),
+            "current_shanten": _parse_encoder_flag(enc_cfg, "current_shanten"),
+            "shape_hint": _parse_encoder_flag(enc_cfg, "shape_hint"),
+        }
+        _flag_str = ", ".join(f"{k}={'on' if v else 'off'}" for k, v in _flags.items())
         lines.append(f"- encoder: {enc_cfg.get('name', '?')} "
-                     f"(shanten_hint={'on' if shanten_on else 'off'}, "
+                     f"({_flag_str}, "
                      f"input_dim={result.get('input_dim', '?')})")
 
         # デバイス情報

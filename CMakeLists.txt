@@ -29,6 +29,7 @@ add_library(mahjong_core STATIC
     src/rl/observation.cpp
     src/rl/reward_policy.cpp
     src/rl/search_utils.cpp
+    src/rl/shanten.cpp
     src/io/game_record.cpp
     src/io/display.cpp
 )

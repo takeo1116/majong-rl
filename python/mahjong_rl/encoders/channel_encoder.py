@@ -54,7 +54,12 @@ class ChannelTensorEncoder(FeatureEncoder):
     def __init__(self, observation_mode: str = "both"):
         self._observation_mode = observation_mode
 
-    def encode(self, obs: Observation) -> np.ndarray:
+    def encode(self, obs: Observation, *,
+               legal_mask: np.ndarray | None = None) -> np.ndarray:
+        """Observation をチャネルテンソルに変換する
+
+        legal_mask は API 統一のため受け取るが、本 encoder では使用しない。
+        """
         if isinstance(obs, FullObservation):
             return self._encode_full(obs)
         elif isinstance(obs, PartialObservation):

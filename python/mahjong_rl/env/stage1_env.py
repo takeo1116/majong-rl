@@ -15,6 +15,13 @@ from mahjong_rl._mahjong_core import (
 )
 from mahjong_rl.legal_mask import make_discard_mask_from_legal_actions
 
+# C++ 高速マスク生成 (Action リスト生成をスキップ)
+try:
+    from mahjong_rl._mahjong_core import make_discard_mask as _make_discard_mask_cpp
+    _HAS_CPP_MASK = True
+except ImportError:
+    _HAS_CPP_MASK = False
+
 
 class Stage1Env:
     """Stage 1 DiscardOnly 環境ラッパー"""
@@ -108,7 +115,14 @@ class Stage1Env:
         return obs, step_rewards, terminated, False, self._make_info()
 
     def get_legal_mask(self) -> np.ndarray:
-        """34 種打牌の legal mask を返す"""
+        """34 種打牌の legal mask を返す
+
+        C++ make_discard_mask が利用可能な場合は Action リスト生成をスキップし、
+        C++ 側で直接 mask を生成する (施策G)。
+        """
+        if _HAS_CPP_MASK:
+            mask_list = _make_discard_mask_cpp(self._engine, self._env)
+            return np.array(mask_list, dtype=np.float32)
         actions = self._engine.get_legal_actions(self._env)
         return make_discard_mask_from_legal_actions(actions)
 

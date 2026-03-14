@@ -34,3 +34,6 @@ experiments/**/driver_logs/
 
 # 実験 run 対応表（ローカル運用）
 experiments/**/run_map.json
+
+# 参照用
+reference/

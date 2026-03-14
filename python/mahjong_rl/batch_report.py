@@ -103,6 +103,10 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
                     mf = run_summary.get("model_features")
                     if mf is not None:
                         entry["model_features"] = mf
+                    # CQ-0171: encoder_features
+                    ef = run_summary.get("encoder_features")
+                    if ef is not None:
+                        entry["encoder_features"] = ef
                     # CQ-0137: learner PPO 診断統計
                     learner_stats = run_summary.get("phase_stats", {}).get("learner", {})
                     ppo_diag = learner_stats.get("ppo_diag")

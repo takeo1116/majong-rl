@@ -1,7 +1,14 @@
-"""シャンテン数計算 (最適化版)"""
+"""シャンテン数計算 (C++ 高速版 + Python fallback)"""
 from __future__ import annotations
 
 import numpy as np
+
+# C++ 版を優先使用。ビルドされていなければ Python fallback。
+try:
+    from mahjong_rl._mahjong_core import compute_shanten as _compute_shanten_cpp
+    _USE_CPP = True
+except ImportError:
+    _USE_CPP = False
 
 # 么九牌 (1m,9m,1p,9p,1s,9s,東,南,西,北,白,發,中)
 _TERMINALS_AND_HONORS = [0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33]
@@ -20,6 +27,9 @@ def compute_shanten(counts: np.ndarray | list[int]) -> int:
         c = counts.astype(int).tolist()
     else:
         c = list(counts)
+
+    if _USE_CPP:
+        return _compute_shanten_cpp(c)
 
     return min(
         _regular_shanten(c),

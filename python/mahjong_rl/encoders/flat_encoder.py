@@ -8,6 +8,25 @@ from mahjong_rl._mahjong_core import (
 )
 from .base import FeatureEncoder, EncoderMetadata, Observation
 
+# C++ 高速版 (ビルド済みなら使用)
+try:
+    from mahjong_rl._mahjong_core import analyze_discards as _analyze_discards_cpp
+    _HAS_CPP_ANALYZE = True
+except ImportError:
+    _HAS_CPP_ANALYZE = False
+
+try:
+    from mahjong_rl._mahjong_core import compute_shape_hint as _compute_shape_hint_cpp
+    _HAS_CPP_SHAPE = True
+except ImportError:
+    _HAS_CPP_SHAPE = False
+
+
+# 手牌形状ヒント次元数 (CQ-0170)
+_CHI_KIND_SIZE = 7 * 3          # 21: 各スート 中心牌2-8 の7種 × 3スート
+_SERIAL_PAIR_KIND_SIZE = 8 * 3  # 24: 各スート 12,23,...,89 の8種 × 3スート
+_INSIDE_WAIT_KIND_SIZE = 7 * 3  # 21: 各スート 中心牌2-8 の7種 × 3スート
+
 
 class FlatFeatureEncoder(FeatureEncoder):
     """フラット特徴量エンコーダ
@@ -32,6 +51,20 @@ class FlatFeatureEncoder(FeatureEncoder):
     shanten_hint=True 追加 (CQ-0119):
       - delta_shanten_sign: 34 (各打牌候補のシャンテン改善/維持/悪化)
       合計: Partial=387, Full=489
+
+    discard_ukeire_hint=True 追加 (CQ-0168):
+      - discard_ukeire_norm: 34 (各打牌候補の受け入れ枚数 / 局面内max)
+      値域: [0,1], 非合法候補=0.0
+
+    current_shanten_input=True 追加 (CQ-0169):
+      - current_shanten / 8.0: 1 (共通 trunk 入力)
+      値域: [0,1]
+
+    shape_hint=True 追加 (CQ-0170):
+      - closed_chi_hint: 21 (順子 multihot)
+      - closed_outside_wait_hint: 24 (塔子 multihot)
+      - closed_inside_wait_hint: 21 (嵌張 multihot)
+      合計: 66
     """
 
     # Partial 特徴量の次元
@@ -40,22 +73,45 @@ class FlatFeatureEncoder(FeatureEncoder):
     _FULL_EXTRA_DIM = 3 * 34  # 102
     # シャンテン補助特徴の次元 (CQ-0119)
     _SHANTEN_HINT_DIM = 34
+    # 打牌候補受け入れ枚数の次元 (CQ-0168)
+    _DISCARD_UKEIRE_DIM = 34
+    # policy 用 current_shanten の次元 (CQ-0169)
+    _CURRENT_SHANTEN_DIM = 1
+    # 手牌形状ヒントの次元 (CQ-0170)
+    _SHAPE_HINT_DIM = _CHI_KIND_SIZE + _SERIAL_PAIR_KIND_SIZE + _INSIDE_WAIT_KIND_SIZE  # 66
 
     def __init__(self, observation_mode: str = "both",
-                 shanten_hint: bool = False):
+                 shanten_hint: bool = False,
+                 discard_ukeire_hint: bool = False,
+                 current_shanten_input: bool = False,
+                 shape_hint: bool = False):
         """
         Args:
             observation_mode: "full", "partial", "both"
             shanten_hint: True でシャンテン補助特徴を追加 (CQ-0119)
+            discard_ukeire_hint: True で打牌候補受け入れ枚数を追加 (CQ-0168)
+            current_shanten_input: True で current_shanten を共通入力に追加 (CQ-0169)
+            shape_hint: True で手牌形状ヒントを追加 (CQ-0170)
         """
         self._observation_mode = observation_mode
         self._shanten_hint = shanten_hint
+        self._discard_ukeire_hint = discard_ukeire_hint
+        self._current_shanten_input = current_shanten_input
+        self._shape_hint = shape_hint
 
-    def encode(self, obs: Observation) -> np.ndarray:
+    def encode(self, obs: Observation, *,
+               legal_mask: np.ndarray | None = None) -> np.ndarray:
+        """Observation を特徴量ベクトルに変換する
+
+        Args:
+            obs: PartialObservation or FullObservation
+            legal_mask: 合法手マスク (34次元, optional, CQ-0172)。
+                discard_ukeire_hint 有効時に渡すと非合法候補を 0.0 にする。
+        """
         if isinstance(obs, FullObservation):
-            return self._encode_full(obs)
+            return self._encode_full(obs, legal_mask=legal_mask)
         elif isinstance(obs, PartialObservation):
-            return self._encode_partial(obs)
+            return self._encode_partial(obs, legal_mask=legal_mask)
         else:
             raise TypeError(f"未対応の Observation 型: {type(obs)}")
 
@@ -69,6 +125,12 @@ class FlatFeatureEncoder(FeatureEncoder):
             dim = self._PARTIAL_DIM + self._FULL_EXTRA_DIM
         if self._shanten_hint:
             dim += self._SHANTEN_HINT_DIM
+        if self._discard_ukeire_hint:
+            dim += self._DISCARD_UKEIRE_DIM
+        if self._current_shanten_input:
+            dim += self._CURRENT_SHANTEN_DIM
+        if self._shape_hint:
+            dim += self._SHAPE_HINT_DIM
         return EncoderMetadata(
             output_shape=(dim,),
             dtype=np.dtype(np.float32),
@@ -77,7 +139,8 @@ class FlatFeatureEncoder(FeatureEncoder):
             description="フラットな固定長数値ベクトル (MLP向け)",
         )
 
-    def _encode_partial(self, obs: PartialObservation) -> np.ndarray:
+    def _encode_partial(self, obs: PartialObservation, *,
+                        legal_mask: np.ndarray | None = None) -> np.ndarray:
         features: list[np.ndarray] = []
 
         # 自家手牌 34種カウント
@@ -85,8 +148,10 @@ class FlatFeatureEncoder(FeatureEncoder):
         for tid in obs.hand:
             hand_counts[tid // 4] += 1.0
         features.append(hand_counts)
-        # shanten_hint 用にコピーを保持 (CQ-0119)
-        hand_counts_for_hint = hand_counts.copy() if self._shanten_hint else None
+        # 追加特徴量用にコピーを保持
+        _need_hand_copy = (self._shanten_hint or self._discard_ukeire_hint
+                           or self._current_shanten_input or self._shape_hint)
+        hand_counts_for_hint = hand_counts.copy() if _need_hand_copy else None
 
         # 4家河
         for p in range(NUM_PLAYERS):
@@ -135,23 +200,39 @@ class FlatFeatureEncoder(FeatureEncoder):
         )
         features.append(riichi)
 
-        # シャンテン補助特徴 (CQ-0119)
-        if self._shanten_hint:
-            features.append(self._compute_shanten_hint(hand_counts_for_hint))
+        # シャンテン補助特徴 + 打牌候補受け入れ枚数 (CQ-0119, CQ-0168, CQ-0172)
+        if self._shanten_hint or self._discard_ukeire_hint:
+            hint, ukeire = self._compute_hint_and_ukeire(
+                hand_counts_for_hint, legal_mask)
+            if self._shanten_hint:
+                features.append(hint)
+            if self._discard_ukeire_hint:
+                features.append(ukeire)
+
+        # policy 用 current_shanten (CQ-0169)
+        if self._current_shanten_input:
+            features.append(self._compute_current_shanten(hand_counts_for_hint))
+
+        # 手牌形状ヒント (CQ-0170)
+        if self._shape_hint:
+            features.append(self._compute_shape_hint(hand_counts_for_hint))
 
         return np.concatenate(features)
 
-    def _encode_full(self, obs: FullObservation) -> np.ndarray:
+    def _encode_full(self, obs: FullObservation, *,
+                     legal_mask: np.ndarray | None = None) -> np.ndarray:
         features: list[np.ndarray] = []
 
         # 全4家手牌
-        hand_counts_p0 = None  # shanten_hint 用 (CQ-0119)
+        _need_p0 = (self._shanten_hint or self._discard_ukeire_hint
+                     or self._current_shanten_input or self._shape_hint)
+        hand_counts_p0 = None
         for p in range(NUM_PLAYERS):
             hand_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
             for tid in obs.hands[p]:
                 hand_counts[tid // 4] += 1.0
             features.append(hand_counts)
-            if p == 0 and self._shanten_hint:
+            if p == 0 and _need_p0:
                 hand_counts_p0 = hand_counts.copy()
 
         # 4家河
@@ -200,11 +281,63 @@ class FlatFeatureEncoder(FeatureEncoder):
         riichi = np.zeros(NUM_PLAYERS, dtype=np.float32)
         features.append(riichi)
 
-        # シャンテン補助特徴 (CQ-0119)
-        if self._shanten_hint:
-            features.append(self._compute_shanten_hint(hand_counts_p0))
+        # シャンテン補助特徴 + 打牌候補受け入れ枚数 (CQ-0119, CQ-0168, CQ-0172)
+        if self._shanten_hint or self._discard_ukeire_hint:
+            hint, ukeire = self._compute_hint_and_ukeire(
+                hand_counts_p0, legal_mask)
+            if self._shanten_hint:
+                features.append(hint)
+            if self._discard_ukeire_hint:
+                features.append(ukeire)
+
+        # policy 用 current_shanten (CQ-0169)
+        if self._current_shanten_input:
+            features.append(self._compute_current_shanten(hand_counts_p0))
+
+        # 手牌形状ヒント (CQ-0170)
+        if self._shape_hint:
+            features.append(self._compute_shape_hint(hand_counts_p0))
 
         return np.concatenate(features)
+
+    @staticmethod
+    def _compute_hint_and_ukeire(
+        hand_counts: np.ndarray,
+        legal_mask: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """shanten_hint と discard_ukeire_norm を一括計算する
+
+        C++ analyze_discards を1回呼び (全候補 mask=all-1)、
+        shanten_sign はそのまま、ukeire_norm は legal_mask で絞って再正規化。
+        C++ 未ビルド時は Python fallback。
+
+        Args:
+            hand_counts: 34種の手牌カウント (float32)
+            legal_mask: 合法手マスク (optional, discard_ukeire 用)
+
+        Returns:
+            (shanten_sign[34], ukeire_norm[34])
+        """
+        if _HAS_CPP_ANALYZE:
+            counts_list = hand_counts.astype(int).tolist()
+            # 1回の C++ 呼び出しで全候補の shanten_sign + acceptance を取得
+            result = _analyze_discards_cpp(counts_list, [1] * 34)
+            hint = np.array(result["shanten_sign"], dtype=np.float32)
+
+            # ukeire: acceptance を legal_mask で絞り、Python 側で再正規化
+            acceptance = np.array(result["acceptance"], dtype=np.float32)
+            if legal_mask is not None:
+                acceptance = acceptance * (legal_mask >= 0.5)
+            max_acc = acceptance.max()
+            ukeire = acceptance / max_acc if max_acc > 0 else acceptance
+
+            return hint, ukeire
+        else:
+            # Python fallback
+            hint = FlatFeatureEncoder._compute_shanten_hint(hand_counts.copy())
+            ukeire = FlatFeatureEncoder._compute_discard_ukeire(
+                hand_counts.copy(), legal_mask=legal_mask)
+            return hint, ukeire
 
     @staticmethod
     def _compute_shanten_hint(hand_counts: np.ndarray) -> np.ndarray:
@@ -246,3 +379,120 @@ class FlatFeatureEncoder(FeatureEncoder):
                 elif delta < 0:
                     hint[t] = -1.0
         return hint
+
+    @staticmethod
+    def _compute_discard_ukeire(hand_counts: np.ndarray, *,
+                                legal_mask: np.ndarray | None = None) -> np.ndarray:
+        """各打牌候補の受け入れ枚数を計算し、局面内 max で正規化する (CQ-0168, CQ-0172)
+
+        手牌にある牌種のみ計算し、非合法候補は 0.0。
+        legal_mask が与えられた場合、mask が 0 の牌種も 0.0 にする。
+        正規化: acceptance / max_acceptance (max=0 なら全て 0.0)。
+        値域: [0, 1]
+
+        Args:
+            hand_counts: 34種の手牌カウント (float32, 一時的に変更→復元)
+            legal_mask: 合法手マスク (34次元, optional)。
+                与えられた場合 legal_mask[t] < 0.5 の牌種を 0.0 にする。
+
+        Returns:
+            discard_ukeire_norm[34]: 正規化受け入れ枚数
+        """
+        from mahjong_rl.baseline.shanten import compute_shanten
+
+        raw = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        for t in range(NUM_TILE_TYPES):
+            if hand_counts[t] < 1:
+                continue
+            # legal_mask が指定されていて非合法なら skip (CQ-0172)
+            if legal_mask is not None and legal_mask[t] < 0.5:
+                continue
+            # t を切った後のシャンテン数を計算
+            hand_counts[t] -= 1
+            sh_after = compute_shanten(hand_counts)
+            # 受け入れ枚数: sh_after が下がる牌種の残り枚数合計
+            acceptance = 0
+            for u in range(NUM_TILE_TYPES):
+                if hand_counts[u] >= 4:
+                    continue
+                hand_counts[u] += 1
+                if compute_shanten(hand_counts) < sh_after:
+                    acceptance += 4 - int(hand_counts[u] - 1)  # 残り枚数概算
+                hand_counts[u] -= 1
+            hand_counts[t] += 1
+            raw[t] = float(acceptance)
+
+        max_acc = raw.max()
+        if max_acc > 0:
+            return raw / max_acc
+        return raw
+
+    @staticmethod
+    def _compute_current_shanten(hand_counts: np.ndarray) -> np.ndarray:
+        """current_shanten / 8.0 を共通特徴として返す (CQ-0169)
+
+        Args:
+            hand_counts: 34種の手牌カウント (float32)
+
+        Returns:
+            [current_shanten / 8.0]: shape=(1,), 値域 [0, 1]
+        """
+        from mahjong_rl.baseline.shanten import compute_shanten
+
+        sh = compute_shanten(hand_counts)
+        return np.array([sh / 8.0], dtype=np.float32)
+
+    @staticmethod
+    def _compute_shape_hint(hand_counts: np.ndarray) -> np.ndarray:
+        """手牌形状ヒント: 順子/塔子/嵌張の binary multihot (CQ-0170)
+
+        手牌中の閉じた形状を検出する。
+        - closed_chi: 連続3牌 (例: 1m2m3m) → 21次元
+        - closed_outside_wait: 隣接2牌 (例: 1m2m, 8m9m) → 24次元
+        - closed_inside_wait: 1つ飛び2牌 (例: 1m3m) → 21次元
+
+        各スートの数牌のみ対象 (字牌は除外)。
+        C++ 版が利用可能な場合はそちらを使用。
+
+        Args:
+            hand_counts: 34種の手牌カウント (float32)
+
+        Returns:
+            shape_hint[66]: binary multihot
+        """
+        if _HAS_CPP_SHAPE:
+            counts_list = hand_counts.astype(int).tolist()
+            result = _compute_shape_hint_cpp(counts_list)
+            return np.array(result, dtype=np.float32)
+
+        chi = np.zeros(_CHI_KIND_SIZE, dtype=np.float32)
+        outside_wait = np.zeros(_SERIAL_PAIR_KIND_SIZE, dtype=np.float32)
+        inside_wait = np.zeros(_INSIDE_WAIT_KIND_SIZE, dtype=np.float32)
+
+        for suit in range(3):  # 萬子, 筒子, 索子
+            base = suit * 9  # 牌種インデックスのベース (0, 9, 18)
+
+            # 順子 (closed_chi): 中心牌 2-8 (index 1-7)
+            for center in range(1, 8):
+                idx = base + center
+                if (hand_counts[idx - 1] >= 1 and
+                        hand_counts[idx] >= 1 and
+                        hand_counts[idx + 1] >= 1):
+                    chi[suit * 7 + (center - 1)] = 1.0
+
+            # 塔子 (closed_outside_wait): 隣接2牌ペア (12, 23, ..., 89)
+            for pair_start in range(8):  # 0-7 → ペア 12,23,...,89
+                idx = base + pair_start
+                if (hand_counts[idx] >= 1 and
+                        hand_counts[idx + 1] >= 1):
+                    outside_wait[suit * 8 + pair_start] = 1.0
+
+            # 嵌張 (closed_inside_wait): 中心牌 2-8 (index 1-7), 間が空く
+            for center in range(1, 8):
+                idx = base + center
+                if (hand_counts[idx - 1] >= 1 and
+                        hand_counts[idx] < 1 and
+                        hand_counts[idx + 1] >= 1):
+                    inside_wait[suit * 7 + (center - 1)] = 1.0
+
+        return np.concatenate([chi, outside_wait, inside_wait])

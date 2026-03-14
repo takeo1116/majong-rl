@@ -6,6 +6,13 @@ import numpy as np
 from mahjong_rl._mahjong_core import NUM_TILE_TYPES
 from .shanten import compute_shanten
 
+# C++ 高速版 (ビルド済みなら使用)
+try:
+    from mahjong_rl._mahjong_core import find_best_discard as _find_best_discard_cpp
+    _HAS_CPP_BEST = True
+except ImportError:
+    _HAS_CPP_BEST = False
+
 
 class RuleBasedBaseline:
     """ルールベースベースライン
@@ -21,9 +28,6 @@ class RuleBasedBaseline:
     ) -> int:
         """打牌を選択する (fast path)
 
-        best-set 収集（2パス目）を省略し、最良候補のみ返す。
-        評価規則は _find_best_score() で一本化されている (CQ-0128, CQ-0129)。
-
         Args:
             hand_tile_ids: 手牌の TileId リスト (0-135)
             legal_mask: 34種の合法手マスク (1=合法, 0=非合法)
@@ -31,9 +35,16 @@ class RuleBasedBaseline:
         Returns:
             選択された牌種 (TileType, 0-33)
         """
+        if _HAS_CPP_BEST:
+            counts = [0] * NUM_TILE_TYPES
+            for tid in hand_tile_ids:
+                counts[tid // 4] += 1
+            mask_list = (legal_mask >= 0.5).astype(int).tolist()
+            result = _find_best_discard_cpp(counts, mask_list)
+            return result["best_tile"]
+
         counts, best_shanten, best_acceptance = self._find_best_score(
             hand_tile_ids, legal_mask)
-        # best に一致する最初の候補を返す（1パスのみ）
         for t in range(NUM_TILE_TYPES):
             if legal_mask[t] < 0.5 or counts[t] <= 0:
                 continue
@@ -52,9 +63,6 @@ class RuleBasedBaseline:
     ) -> tuple[int, np.ndarray]:
         """打牌を選択し、同率最良候補の mask も返す (CQ-0125)
 
-        評価規則は _find_best_score() で一本化されている (CQ-0128, CQ-0129)。
-        best-set 収集のため2パス目を実行する。
-
         Args:
             hand_tile_ids: 手牌の TileId リスト (0-135)
             legal_mask: 34種の合法手マスク (1=合法, 0=非合法)
@@ -64,10 +72,17 @@ class RuleBasedBaseline:
               best_tile_type: 選択された牌種 (TileType, 0-33)
               best_mask: (34,) float32, 同率最良候補=1.0
         """
+        if _HAS_CPP_BEST:
+            counts = [0] * NUM_TILE_TYPES
+            for tid in hand_tile_ids:
+                counts[tid // 4] += 1
+            mask_list = (legal_mask >= 0.5).astype(int).tolist()
+            result = _find_best_discard_cpp(counts, mask_list)
+            best_mask = np.array(result["best_mask"], dtype=np.float32)
+            return result["best_tile"], best_mask
+
         counts, best_shanten, best_acceptance = self._find_best_score(
             hand_tile_ids, legal_mask)
-
-        # 2パス目: 同率候補を収集
         best_mask = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
         best_type = -1
         for t in range(NUM_TILE_TYPES):
@@ -81,7 +96,6 @@ class RuleBasedBaseline:
                 if best_type == -1:
                     best_type = t
             counts[t] += 1
-
         return best_type, best_mask
 
     def _find_best_score(

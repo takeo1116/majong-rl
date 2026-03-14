@@ -193,3 +193,104 @@ class TestDualObservation:
         full_obs, partial_obs = env_full.make_dual_observation()
         assert isinstance(full_obs, FullObservation)
         assert isinstance(partial_obs, PartialObservation)
+
+
+class TestCppMaskConsistency:
+    """C++ make_discard_mask と Python 版の一致テスト"""
+
+    def test_cpp_mask_matches_python(self):
+        """C++ mask と Python mask が全ステップで一致する"""
+        from mahjong_rl.legal_mask import make_discard_mask_from_legal_actions
+        from mahjong_rl._mahjong_core import (
+            GameEngine, EnvironmentState, make_discard_mask,
+        )
+
+        env = Stage1Env(observation_mode="full")
+        obs, _ = env.reset(seed=42)
+
+        engine = env._engine
+        env_state = env._env
+
+        steps = 0
+        while True:
+            # Python 経路
+            actions = engine.get_legal_actions(env_state)
+            py_mask = make_discard_mask_from_legal_actions(actions)
+            # C++ 経路
+            cpp_mask_list = make_discard_mask(engine, env_state)
+            cpp_mask = np.array(cpp_mask_list, dtype=np.float32)
+
+            np.testing.assert_array_equal(
+                py_mask, cpp_mask,
+                err_msg=f"mask mismatch at step {steps}")
+
+            legal_types = np.where(py_mask > 0.5)[0]
+            if len(legal_types) == 0:
+                break
+            obs, _, terminated, _, _ = env.step(int(legal_types[0]))
+            steps += 1
+            if terminated:
+                break
+
+        assert steps > 0, "少なくとも1ステップは実行されるべき"
+
+    def test_get_legal_mask_step_consistency(self):
+        """get_legal_mask → step の連携が正常に動作する (複数マッチ)"""
+        for seed in [42, 100, 200]:
+            env = Stage1Env(observation_mode="full")
+            obs, _ = env.reset(seed=seed)
+            steps = 0
+            while True:
+                mask = env.get_legal_mask()
+                legal_types = np.where(mask > 0.5)[0]
+                assert len(legal_types) > 0, \
+                    f"seed={seed} step={steps}: 合法手がない"
+                obs, _, terminated, _, _ = env.step(int(legal_types[0]))
+                steps += 1
+                if terminated:
+                    break
+            assert steps > 100, f"seed={seed}: マッチが短すぎる ({steps} steps)"
+
+    def test_riichi_mask_priority(self):
+        """立直時のマスク優先規則が C++ / Python で一致する"""
+        from mahjong_rl.legal_mask import make_discard_mask_from_legal_actions
+        from mahjong_rl._mahjong_core import (
+            GameEngine, EnvironmentState, make_discard_mask,
+        )
+
+        # 多数のマッチを回して立直局面を探す
+        found_riichi = False
+        for seed in range(500):
+            env = Stage1Env(observation_mode="full")
+            obs, _ = env.reset(seed=seed)
+            while True:
+                engine = env._engine
+                env_state = env._env
+                actions = engine.get_legal_actions(env_state)
+
+                has_riichi = any(
+                    a.type == ActionType.Discard and a.riichi
+                    for a in actions)
+
+                if has_riichi:
+                    py_mask = make_discard_mask_from_legal_actions(actions)
+                    cpp_mask = np.array(
+                        make_discard_mask(engine, env_state),
+                        dtype=np.float32)
+                    np.testing.assert_array_equal(
+                        py_mask, cpp_mask,
+                        err_msg=f"riichi mask mismatch at seed={seed}")
+                    found_riichi = True
+
+                mask = env.get_legal_mask()
+                legal_types = np.where(mask > 0.5)[0]
+                if len(legal_types) == 0:
+                    break
+                obs, _, terminated, _, _ = env.step(int(legal_types[0]))
+                if terminated:
+                    break
+
+            if found_riichi:
+                break
+
+        assert found_riichi, "立直局面が見つからなかった"

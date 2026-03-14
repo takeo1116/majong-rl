@@ -30,8 +30,15 @@ class FeatureEncoder(ABC):
     """
 
     @abstractmethod
-    def encode(self, obs: Observation) -> np.ndarray:
-        """Observation を特徴量ベクトル/テンソルに変換する"""
+    def encode(self, obs: Observation, *,
+               legal_mask: np.ndarray | None = None) -> np.ndarray:
+        """Observation を特徴量ベクトル/テンソルに変換する
+
+        Args:
+            obs: PartialObservation or FullObservation
+            legal_mask: 合法手マスク (34次元, optional)。
+                利用するかどうかは各 encoder 実装の責務。
+        """
         ...
 
     @abstractmethod

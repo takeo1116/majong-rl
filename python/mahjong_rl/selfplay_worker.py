@@ -84,6 +84,12 @@ class SelfPlayWorker:
             self._shanten_tracker = None
             self._shanten_schedule = None
 
+        # 推論用 tensor バッファの事前確保 (per-step 割り当て削減)
+        input_dim = encoder.metadata().output_shape[0] if len(encoder.metadata().output_shape) == 1 else int(np.prod(encoder.metadata().output_shape))
+        self._features_buf = torch.zeros(1, input_dim, dtype=torch.float32, device=self._device)
+        self._mask_buf = torch.zeros(1, 34, dtype=torch.float32, device=self._device)
+        self._value_aux_buf = torch.zeros(1, 1, dtype=torch.float32, device=self._device)
+
         # CQ-0151: value head 用 current shanten 特徴
         model_cfg = config.get("model", {})
         vf_cfg = model_cfg.get("value_features", {})
@@ -215,10 +221,10 @@ class SelfPlayWorker:
             teacher_best_mask = None  # CQ-0125: baseline 席のみ非 None
             if seat_is_policy[current]:
                 # ポリシー席: action 選択前の観測を保存用にエンコード
-                pre_features = self._encoder.encode(obs)
+                pre_features = self._encoder.encode(obs, legal_mask=mask)
                 pre_features_flat = pre_features.flatten() if pre_features.ndim > 1 else pre_features
                 tile_type, log_prob, value = self._policy_step(
-                    obs, mask, current_shanten=current_shanten_val)
+                    pre_features_flat, mask, current_shanten=current_shanten_val)
             else:
                 # ベースライン席: ルールベースで選択
                 tile_type, teacher_best_mask = self._baseline_step(env, mask)
@@ -226,7 +232,7 @@ class SelfPlayWorker:
                 value = 0.0
                 # baseline 保存が有効なら観測をエンコード
                 if self._save_baseline_actions:
-                    pre_features = self._encoder.encode(obs)
+                    pre_features = self._encoder.encode(obs, legal_mask=mask)
                     pre_features_flat = pre_features.flatten() if pre_features.ndim > 1 else pre_features
                 else:
                     pre_features_flat = None
@@ -324,24 +330,29 @@ class SelfPlayWorker:
         rng = np.random.RandomState(seed)
         return [rng.random() < self._policy_ratio for _ in range(4)]
 
-    def _policy_step(self, obs, mask: np.ndarray,
+    def _policy_step(self, features_flat: np.ndarray, mask: np.ndarray,
                      current_shanten: int | None = None) -> tuple[int, float, float]:
-        """ポリシーモデルで打牌を選択する"""
-        features = self._encoder.encode(obs)
-        features_flat = features.flatten() if features.ndim > 1 else features
-        features_t = torch.from_numpy(features_flat).unsqueeze(0).to(self._device)
-        mask_t = torch.from_numpy(mask).unsqueeze(0).to(self._device)
+        """ポリシーモデルで打牌を選択する
+
+        Args:
+            features_flat: エンコード済み特徴量 (1-D float32)
+            mask: 合法手マスク
+            current_shanten: value head 補助特徴用
+        """
+        # バッファに書き込み (tensor 再生成を回避)
+        self._features_buf[0].copy_(torch.from_numpy(features_flat))
+        self._mask_buf[0].copy_(torch.from_numpy(mask))
 
         # CQ-0151: value head 専用補助特徴
         value_aux = None
         if self._value_shanten_enabled and current_shanten is not None:
-            value_aux = torch.tensor(
-                [[current_shanten / 8.0]], dtype=torch.float32, device=self._device)
+            self._value_aux_buf[0, 0] = current_shanten / 8.0
+            value_aux = self._value_aux_buf
 
         with torch.no_grad():
-            output = self._model(features_t, mask_t, value_aux_features=value_aux)
+            output = self._model(self._features_buf, self._mask_buf, value_aux_features=value_aux)
 
-        tile_type, log_prob = self._selector.select(output.logits[0], mask_t[0])
+        tile_type, log_prob = self._selector.select(output.logits[0], self._mask_buf[0])
 
         # value head の最初の値を使用
         value = 0.0

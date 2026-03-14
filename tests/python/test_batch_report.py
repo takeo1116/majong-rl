@@ -1484,3 +1484,63 @@ class TestLearnerAuxStatsBatch:
             summary = json.load(f)
         assert summary["success_count"] == 1
         assert "post_riichi_exclusion" not in summary["runs"][0]
+
+
+class TestEncoderFeaturesBatch:
+    """encoder_features の batch_summary 転送テスト (CQ-0171)"""
+
+    @staticmethod
+    def _make_result_with_encoder(tmp_path: Path, seed: int,
+                                   encoder_features: dict) -> dict:
+        run_dir = tmp_path / f"run_{seed}"
+        run_dir.mkdir()
+        summary = {
+            "encoder_features": encoder_features,
+            "phase_stats": {},
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {"avg_rank": 2.5, "run_dir": str(run_dir)},
+        }
+
+    def test_encoder_features_transferred(self, tmp_path: Path):
+        """encoder_features が batch_summary に転送される"""
+        ef = {
+            "name": "FlatFeatureEncoder",
+            "observation_mode": "full",
+            "shanten_hint": True,
+            "discard_ukeire_hint": True,
+            "current_shanten": False,
+            "shape_hint": True,
+            "input_dim": 555,
+        }
+        results = [self._make_result_with_encoder(tmp_path, 42, ef)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run = summary["runs"][0]
+        assert "encoder_features" in run
+        assert run["encoder_features"]["discard_ukeire_hint"] is True
+        assert run["encoder_features"]["current_shanten"] is False
+        assert run["encoder_features"]["shape_hint"] is True
+
+    def test_no_encoder_features_ok(self, tmp_path: Path):
+        """encoder_features がない summary でもクラッシュしない"""
+        run_dir = tmp_path / "run_42"
+        run_dir.mkdir()
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump({"phase_stats": {}}, f)
+        results = [{
+            "seed": 42,
+            "success": True,
+            "result": {"avg_rank": 2.5, "run_dir": str(run_dir)},
+        }]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert "encoder_features" not in summary["runs"][0]
