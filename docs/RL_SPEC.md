@@ -160,20 +160,50 @@ Observation、Feature 表現、Model は分離する。
 
 ただし現在の主力実験は `FlatFeatureEncoder`。
 
+共通 API (CQ-0173):
+
+- `encode(obs, *, legal_mask=None) -> np.ndarray`
+- `legal_mask` は optional。利用するかどうかは各 encoder 実装の責務。
+- `FlatFeatureEncoder` は `discard_ukeire_hint` 有効時のみ `legal_mask` を利用する。
+- `ChannelTensorEncoder` は `legal_mask` を受け取るが無視する。
+
 #### 7.3.1 FlatFeatureEncoder のオプション特徴量
 
-`feature_encoder.shanten_hint.enabled=true` で `delta_shanten_sign[34]` を追加できる。
+以下のオプションはすべて既定 `false` で、`true` 時のみ特徴量が追加される。
+`false` 時は既存入力次元を維持する（完全後方互換）。
 
-現仕様:
+**shanten_hint** (`feature_encoder.shanten_hint.enabled`)
 
+- `delta_shanten_sign[34]` を追加（+34次元）
 - 各打牌候補について、打牌後シャンテン変化の符号を補助特徴として持つ
-- 既定は `false`
-- feature off 時は既存入力次元を維持する
+
+**discard_ukeire_hint** (`feature_encoder.discard_ukeire_hint.enabled`) (CQ-0168, CQ-0172)
+
+- `discard_ukeire_norm[34]` を追加（+34次元）
+- 各打牌候補の受け入れ枚数を局面内 max で正規化した値 ([0, 1])
+- 非合法打牌候補は 0.0: `legal_mask` が `encode()` に渡された場合は mask 基準、未指定時は手牌カウント基準
+- selfplay / evaluator の `encode()` 呼び出しでは `legal_mask=mask` を渡しており、立直後などの非合法候補も正しく 0.0 になる
+- 受け入れ枚数の定義は `RuleBasedBaseline._count_acceptance()` と整合
+
+**current_shanten** (`feature_encoder.current_shanten.enabled`) (CQ-0169)
+
+- `current_shanten / 8.0` を追加（+1次元）
+- policy/value 共通 trunk 入力として共有される
+- 既存の `model.value_features.current_shanten.enabled`（value_aux）との併用可
+  - 併用時は trunk 入力と value_aux の両方に同等の情報が入る
+
+**shape_hint** (`feature_encoder.shape_hint.enabled`) (CQ-0170)
+
+- 手牌形状ヒント `closed_chi[21] + closed_outside_wait[24] + closed_inside_wait[21]` を追加（+66次元）
+- 手牌のみ対象（副露情報は除外）
+- binary multihot（有無のみ）
+- 各スートの数牌について: 順子(中心牌2-8)、塔子(隣接ペア12~89)、嵌張(中心牌2-8)を検出
 
 現運用上の注意:
 
-- これはあくまで補助特徴であり、教師方策そのものを直接埋め込むものではない
-- 比較実験では on/off を config 上で明示的に追跡する
+- これらはあくまで補助特徴であり、教師方策そのものを直接埋め込むものではない
+- 比較実験では各オプションの on/off を config 上で明示的に追跡する
+- 全オプション有効時の追加次元: +34+34+1+66 = +135
 
 ### 7.4 Model
 
