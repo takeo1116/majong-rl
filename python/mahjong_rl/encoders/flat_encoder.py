@@ -79,12 +79,15 @@ class FlatFeatureEncoder(FeatureEncoder):
     _CURRENT_SHANTEN_DIM = 1
     # 手牌形状ヒントの次元 (CQ-0170)
     _SHAPE_HINT_DIM = _CHI_KIND_SIZE + _SERIAL_PAIR_KIND_SIZE + _INSIDE_WAIT_KIND_SIZE  # 66
+    # turn_context の次元 (CQ-0175): turn_progress(1) + bucket_one_hot(3) = 4
+    _TURN_CONTEXT_DIM = 4
 
     def __init__(self, observation_mode: str = "both",
                  shanten_hint: bool = False,
                  discard_ukeire_hint: bool = False,
                  current_shanten_input: bool = False,
-                 shape_hint: bool = False):
+                 shape_hint: bool = False,
+                 turn_context: bool = False):
         """
         Args:
             observation_mode: "full", "partial", "both"
@@ -92,12 +95,14 @@ class FlatFeatureEncoder(FeatureEncoder):
             discard_ukeire_hint: True で打牌候補受け入れ枚数を追加 (CQ-0168)
             current_shanten_input: True で current_shanten を共通入力に追加 (CQ-0169)
             shape_hint: True で手牌形状ヒントを追加 (CQ-0170)
+            turn_context: True で turn/time 文脈特徴を追加 (CQ-0175)
         """
         self._observation_mode = observation_mode
         self._shanten_hint = shanten_hint
         self._discard_ukeire_hint = discard_ukeire_hint
         self._current_shanten_input = current_shanten_input
         self._shape_hint = shape_hint
+        self._turn_context = turn_context
 
     def encode(self, obs: Observation, *,
                legal_mask: np.ndarray | None = None) -> np.ndarray:
@@ -131,6 +136,8 @@ class FlatFeatureEncoder(FeatureEncoder):
             dim += self._CURRENT_SHANTEN_DIM
         if self._shape_hint:
             dim += self._SHAPE_HINT_DIM
+        if self._turn_context:
+            dim += self._TURN_CONTEXT_DIM
         return EncoderMetadata(
             output_shape=(dim,),
             dtype=np.dtype(np.float32),
@@ -217,6 +224,10 @@ class FlatFeatureEncoder(FeatureEncoder):
         if self._shape_hint:
             features.append(self._compute_shape_hint(hand_counts_for_hint))
 
+        # turn/time 文脈特徴 (CQ-0175)
+        if self._turn_context:
+            features.append(self._compute_turn_context(obs.turn_number))
+
         return np.concatenate(features)
 
     def _encode_full(self, obs: FullObservation, *,
@@ -297,6 +308,10 @@ class FlatFeatureEncoder(FeatureEncoder):
         # 手牌形状ヒント (CQ-0170)
         if self._shape_hint:
             features.append(self._compute_shape_hint(hand_counts_p0))
+
+        # turn/time 文脈特徴 (CQ-0175)
+        if self._turn_context:
+            features.append(self._compute_turn_context(obs.turn_number))
 
         return np.concatenate(features)
 
@@ -496,3 +511,22 @@ class FlatFeatureEncoder(FeatureEncoder):
                     inside_wait[suit * 7 + (center - 1)] = 1.0
 
         return np.concatenate([chi, outside_wait, inside_wait])
+
+    @staticmethod
+    def _compute_turn_context(turn_number: int) -> np.ndarray:
+        """turn/time 文脈特徴を計算する (CQ-0175)
+
+        turn_progress: turn_number / 18.0 (0..1 連続値)
+        turn_bucket: early(0-5)/mid(6-11)/late(12-17) の 3次元 one-hot
+
+        Args:
+            turn_number: 巡目 (0-based, 最大17)
+
+        Returns:
+            turn_context[4]: [turn_progress, early, mid, late]
+        """
+        progress = min(turn_number / 18.0, 1.0)
+        early = 1.0 if turn_number <= 5 else 0.0
+        mid = 1.0 if 6 <= turn_number <= 11 else 0.0
+        late = 1.0 if turn_number >= 12 else 0.0
+        return np.array([progress, early, mid, late], dtype=np.float32)

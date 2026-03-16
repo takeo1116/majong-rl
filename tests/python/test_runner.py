@@ -2977,4 +2977,608 @@ class TestEncoderFeatureWiring:
         assert ef.get("discard_ukeire_hint") is False
         assert ef.get("current_shanten") is False
         assert ef.get("shape_hint") is False
+        assert ef.get("turn_context") is False
         assert ef.get("input_dim") == 455
+
+    def test_turn_context_on(self, tmp_path: Path):
+        """turn_context=on で run 完走し summary に記録される (CQ-0177)"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["turn_context"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ef = summary.get("encoder_features", {})
+        assert ef.get("turn_context") is True
+        assert ef.get("input_dim") == 459  # full(455) + 4
+
+
+@pytest.mark.smoke
+class TestEvalBeforeAndPhaseTiming:
+    """eval_before / phase_timing の summary 保存テスト (CQ-0174)"""
+
+    def test_eval_before_in_phase_stats(self, tmp_path: Path):
+        """eval_before が phase_stats に保存される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        eb = summary.get("phase_stats", {}).get("eval_before")
+        assert eb is not None, "eval_before が phase_stats にない"
+        assert "avg_rank" in eb
+        assert "avg_score" in eb
+        assert "win_rate" in eb
+        assert "deal_in_rate" in eb
+        assert eb["avg_rank"] is not None
+
+    def test_phase_timing_in_summary(self, tmp_path: Path):
+        """phase_timing が summary に保存される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        pt = summary.get("phase_timing")
+        assert pt is not None, "phase_timing がない"
+        # selfplay, eval_before, learner, eval は存在するはず
+        for phase in ["selfplay", "learner", "eval"]:
+            assert phase in pt, f"{phase} が phase_timing にない"
+            assert pt[phase].get("duration_sec") is not None
+
+
+@pytest.mark.smoke
+class TestMultiCycle:
+    """multi-cycle 反復テスト (CQ-0179, CQ-0180)"""
+
+    def test_multi_cycle_runs(self, tmp_path: Path):
+        """multi_cycle enabled=true, num_cycles=2 で完走する"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True,
+            "num_cycles": 2,
+            "eval_each_cycle": True,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        # cycles が結果に含まれる
+        assert "cycles" in result
+        assert len(result["cycles"]) == 2
+
+        # 各 cycle にメトリクスがある
+        for ci, cyc in enumerate(result["cycles"]):
+            assert cyc["cycle_index"] == ci
+            assert "train_metrics" in cyc
+            assert "selfplay_stats" in cyc
+
+        # 最終結果が single-cycle 互換
+        assert "train_metrics" in result
+        assert "eval_metrics" in result
+
+    def test_multi_cycle_summary(self, tmp_path: Path):
+        """summary.json に cycles が保存される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True,
+            "num_cycles": 2,
+            "eval_each_cycle": True,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+
+        cycles = summary.get("phase_stats", {}).get("cycles")
+        assert cycles is not None
+        assert len(cycles) == 2
+        assert cycles[0]["cycle_index"] == 0
+        assert cycles[1]["cycle_index"] == 1
+
+    def test_multi_cycle_checkpoint_continuity(self, tmp_path: Path):
+        """cycle 間で checkpoint が引き継がれる"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True,
+            "num_cycles": 2,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        ckpt_dir = run_dir / "checkpoints"
+        # cycle_00, cycle_01 の checkpoint が存在
+        assert (ckpt_dir / "checkpoint_cycle_00.pt").exists()
+        assert (ckpt_dir / "checkpoint_cycle_01.pt").exists()
+
+    def test_single_cycle_backward_compat(self, tmp_path: Path):
+        """multi_cycle 未設定で既存挙動維持"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        assert "cycles" not in result
+        assert "train_metrics" in result
+
+    def test_disabled_backward_compat(self, tmp_path: Path):
+        """multi_cycle enabled=false で既存挙動維持"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {"enabled": False, "num_cycles": 3}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        assert "cycles" not in result
+
+    def test_eval_diff_last_cycle_basis(self, tmp_path: Path):
+        """CQ-0181: eval_before/eval_diff が最終 cycle 基準"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True,
+            "num_cycles": 2,
+            "eval_each_cycle": True,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        assert len(result["cycles"]) == 2
+
+        last = result["cycles"][-1]
+        # result.eval_before は最終 cycle の eval_before
+        if "eval_before" in last:
+            assert result.get("eval_before") == last["eval_before"]
+        # result.eval_diff は最終 cycle の before vs after
+        if "eval_diff" in result and "eval_diff" in last:
+            assert result["eval_diff"]["avg_rank"]["before"] == \
+                last["eval_before"]["avg_rank"]
+            assert result["eval_diff"]["avg_rank"]["after"] == \
+                last["eval"]["avg_rank"]
+
+    def test_selfplay_uses_run_selfplay(self, tmp_path: Path):
+        """CQ-0181: multi-cycle selfplay が _run_selfplay 経路を使用"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True,
+            "num_cycles": 2,
+            "selfplay_matches_per_cycle": 5,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        # cycle_00/selfplay/worker_0 ディレクトリに shard がある
+        cyc0_sp = run_dir / "cycle_00" / "selfplay" / "worker_0"
+        assert cyc0_sp.exists(), "cycle_00 selfplay output が存在しない"
+        shards = list(cyc0_sp.glob("shard_*.parquet"))
+        assert len(shards) > 0, "cycle selfplay shard が生成されていない"
+
+    def test_eval_each_cycle_false_phase_status(self, tmp_path: Path):
+        """CQ-0181: eval_each_cycle=false 時 eval の phase_status が不正に立たない"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True,
+            "num_cycles": 2,
+            "eval_each_cycle": False,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        # eval_each_cycle=false なので eval は実施されていない
+        # → phase_status["eval"] は "success" にならないはず
+        ps = summary.get("phase_status", {})
+        assert ps.get("eval") != "success", \
+            "eval_each_cycle=false なのに eval が success"
+
+
+@pytest.mark.smoke
+class TestPolicyAnchorIntegration:
+    """policy_anchor の runner 統合テスト (CQ-0183)"""
+
+    def test_anchor_kl_run_succeeds(self, tmp_path: Path):
+        """anchor kl 有効で imitation→PPO run が完走し summary に policy_anchor が保存"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        # imitation + PPO の両方を実行
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.training["policy_anchor"] = {
+            "enabled": True, "type": "kl", "coef": 0.1,
+            "reference": "imitation_fixed",
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        pa = summary["phase_stats"]["learner"]["ppo_diag"]["policy_anchor"]
+        assert pa["enabled"] is True
+        assert pa["type"] == "kl"
+        assert "anchor_loss_mean" in pa
+
+
+@pytest.mark.smoke
+class TestRuleMixMultiCycle:
+    """rule混合 multi-cycle テスト (CQ-0184/0185/0186)"""
+
+    def test_rule_mix_off_backward_compat(self, tmp_path: Path):
+        """rule_mix OFF で既存 multi-cycle 挙動維持"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {"enabled": True, "num_cycles": 2}
+        # rule_mix 未設定 → デフォルトOFF
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        assert len(result["cycles"]) == 2
+
+    def test_rule_mix_on_baseline_collected(self, tmp_path: Path):
+        """rule_mix ON で baseline サンプルが収集される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 5,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True,
+            "policy_ratio": 0.75,
+            "save_baseline_actions": True,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        # cycle に actor_type_counts がある
+        cycles = result["cycles"]
+        has_baseline = False
+        for cyc in cycles:
+            atc = cyc.get("actor_type_counts", {})
+            if atc.get("baseline", 0) > 0:
+                has_baseline = True
+        assert has_baseline, "baseline サンプルが収集されていない"
+
+    def test_rule_mix_learner_two_stage(self, tmp_path: Path):
+        """2段学習 (baseline BC → policy PPO) が実行される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 5,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True,
+            "policy_ratio": 0.75,
+            "save_baseline_actions": True,
+        }
+        config.training["rule_mix_learner"] = {
+            "enabled": True,
+            "baseline_imitation_epochs": 1,
+            "policy_ppo_epochs": 1,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        for cyc in result["cycles"]:
+            ls = cyc.get("learner_stages", {})
+            assert "policy_ppo" in ls
+            assert ls["policy_ppo"]["executed"] is True
+
+    def test_rule_mix_learner_baseline_zero_samples(self, tmp_path: Path):
+        """baseline データ 0 件でもクラッシュしない"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 3,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True,
+            "policy_ratio": 1.0,  # 全席 policy → baseline 0件
+            "save_baseline_actions": False,
+        }
+        config.training["rule_mix_learner"] = {
+            "enabled": True,
+            "baseline_imitation_epochs": 1,
+            "policy_ppo_epochs": 1,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        ls = result["cycles"][0].get("learner_stages", {})
+        # baseline stage は skip (0件 or 例外)
+        bl = ls.get("baseline_imitation", {})
+        # executed=False or missing — いずれにせよクラッシュしない
+        assert bl.get("executed") is not True or bl.get("used_samples", 0) == 0
+
+    def test_rule_mix_learner_invalid_order(self, tmp_path: Path):
+        """不正な order で実行失敗"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {"enabled": True, "num_cycles": 2}
+        config.training["rule_mix"] = {"enabled": True}
+        config.training["rule_mix_learner"] = {
+            "enabled": True,
+            "order": "policy_then_baseline",
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" in result
+        assert "order" in result["error"]
+
+    def test_summary_cycle_learner_stages(self, tmp_path: Path):
+        """summary.json に cycle 別 learner_stages が保存される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 5,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True, "policy_ratio": 0.75,
+            "save_baseline_actions": True,
+        }
+        config.training["rule_mix_learner"] = {
+            "enabled": True,
+            "baseline_imitation_epochs": 1,
+            "policy_ppo_epochs": 1,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        cycles = summary["phase_stats"].get("cycles", [])
+        assert len(cycles) == 2
+        for cyc in cycles:
+            assert "learner_stages" in cyc
+
+    def test_rule_mix_on_learner_off_ppo_policy_only(self, tmp_path: Path):
+        """CQ-0187: rule_mix ON + rule_mix_learner OFF で PPO が policy-only"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 5,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True, "policy_ratio": 0.75,
+            "save_baseline_actions": True,
+        }
+        # rule_mix_learner は OFF → 単一 learner パスだが policy-only になるはず
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        # train_metrics.total_steps < selfplay.total_steps (baseline 除外分)
+        for cyc in result["cycles"]:
+            atc = cyc.get("actor_type_counts", {})
+            sp_total = cyc["selfplay_stats"]["total_steps"]
+            learn_total = cyc["train_metrics"]["total_steps"]
+            if atc.get("baseline", 0) > 0:
+                assert learn_total < sp_total, \
+                    "baseline が除外されていない (PPO にmixされている)"
+
+    def test_baseline_zero_skip_reason(self, tmp_path: Path):
+        """CQ-0188: baseline 0件で skipped_reason が記録される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 3,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True, "policy_ratio": 1.0,
+            "save_baseline_actions": False,
+        }
+        config.training["rule_mix_learner"] = {
+            "enabled": True,
+            "baseline_imitation_epochs": 1,
+            "policy_ppo_epochs": 1,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        for cyc in result["cycles"]:
+            ls = cyc.get("learner_stages", {})
+            bl = ls.get("baseline_imitation", {})
+            assert bl.get("executed") is False
+            assert bl.get("skipped_reason") == "no_baseline_samples"
+
+    def test_actor_type_count_failure_propagates(self, tmp_path: Path):
+        """CQ-0190: actor_type 集計で異常が起きると run が失敗する"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 3,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {"enabled": True, "policy_ratio": 0.75}
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+
+        # _count_actor_types を壊して RuntimeError を発生させる
+        original = runner._count_actor_types
+        def _broken_count(run_dir):
+            raise RuntimeError("shard read failure (mock)")
+        runner._count_actor_types = _broken_count
+
+        result = runner.run()
+        # multi-cycle 内で例外が伝播して error になる
+        assert "error" in result
+        assert "shard read failure" in result["error"]
+
+        # 元に戻す (念のため)
+        runner._count_actor_types = original
+
+    def test_mixed_ppo_mode(self, tmp_path: Path):
+        """CQ-0192: mixed PPO で BC スキップ + 混合 PPO 1段"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 5,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True, "policy_ratio": 0.75,
+            "save_baseline_actions": True,
+        }
+        config.training["rule_mix_learner"] = {
+            "enabled": True,
+            "ppo_mode": "mixed",
+            "baseline_sample_weight": 0.5,
+            "policy_ppo_epochs": 1,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        for cyc in result["cycles"]:
+            ls = cyc.get("learner_stages", {})
+            # mixed mode: baseline_imitation は存在しない
+            assert "baseline_imitation" not in ls
+            # mixed_ppo が存在する
+            assert "mixed_ppo" in ls
+            assert ls["mixed_ppo"]["executed"] is True
+            assert ls["mixed_ppo"]["mode"] == "mixed"
+
+    def test_mixed_ppo_summary_diag(self, tmp_path: Path):
+        """CQ-0192: summary に mixed_ppo 診断が保存される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 5,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True, "policy_ratio": 0.75,
+            "save_baseline_actions": True,
+        }
+        config.training["rule_mix_learner"] = {
+            "enabled": True,
+            "ppo_mode": "mixed",
+            "baseline_sample_weight": 0.5,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ppo_diag = summary["phase_stats"]["learner"]["ppo_diag"]
+        mp = ppo_diag.get("mixed_ppo", {})
+        assert mp.get("mixed_ppo_enabled") is True
+        assert mp.get("baseline_sample_weight") == 0.5
+
+    def test_mixed_ppo_backward_compat(self, tmp_path: Path):
+        """CQ-0192: ppo_mode=separated(default) で既存挙動維持"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 5,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True, "policy_ratio": 0.75,
+            "save_baseline_actions": True,
+        }
+        config.training["rule_mix_learner"] = {
+            "enabled": True,
+            "ppo_mode": "separated",
+            "baseline_imitation_epochs": 1,
+            "policy_ppo_epochs": 1,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        for cyc in result["cycles"]:
+            ls = cyc.get("learner_stages", {})
+            assert "policy_ppo" in ls
+            assert "mixed_ppo" not in ls
+
+
+@pytest.mark.smoke
+class TestTeacherAgreementE2E:
+    """teacher_agreement の runner E2E テスト (CQ-0202)"""
+
+    def test_teacher_agreement_in_summary(self, tmp_path: Path):
+        """mixed PPO + baseline で summary に teacher_agreement が保存される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.training["multi_cycle"] = {
+            "enabled": True, "num_cycles": 2,
+            "selfplay_matches_per_cycle": 5,
+            "eval_each_cycle": False,
+        }
+        config.training["rule_mix"] = {
+            "enabled": True, "policy_ratio": 0.75,
+            "save_baseline_actions": True,
+        }
+        config.training["rule_mix_learner"] = {
+            "enabled": True,
+            "ppo_mode": "mixed",
+            "baseline_sample_weight": 0.5,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        cycles = summary["phase_stats"].get("cycles", [])
+        assert len(cycles) >= 1
+        # 少なくとも1つの cycle で teacher_agreement が出る
+        found = False
+        for cyc in cycles:
+            ld = cyc.get("learner_diag", {})
+            ta = ld.get("teacher_agreement")
+            if ta and ta.get("enabled"):
+                found = True
+                assert ta["num_baseline_samples"] > 0
+                assert "action_match_rate_before" in ta
+                assert "action_match_rate_after" in ta
+        assert found, "teacher_agreement が summary cycles に見つからない"

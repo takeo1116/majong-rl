@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +57,83 @@ class Learner:
         eprd = tc.get("exclude_post_riichi_discards", {})
         self._exclude_post_riichi = eprd.get("enabled", False)
 
+        # CQ-0176, CQ-0177: value_loss 安定化 + 入力検証
+        vl_cfg = tc.get("value_loss", {})
+        self._value_loss_type = vl_cfg.get("type", "mse")
+        _VALID_VALUE_LOSS_TYPES = {"mse", "huber"}
+        if self._value_loss_type not in _VALID_VALUE_LOSS_TYPES:
+            raise ValueError(
+                f"training.value_loss.type の値が不正: {self._value_loss_type!r}。"
+                f"許容値: {_VALID_VALUE_LOSS_TYPES}")
+        self._huber_delta = vl_cfg.get("huber_delta", 1.0)
+        # CQ-0178: huber_delta 検証
+        if (isinstance(self._huber_delta, bool)
+                or not isinstance(self._huber_delta, (int, float))
+                or not math.isfinite(self._huber_delta)
+                or self._huber_delta <= 0):
+            raise ValueError(
+                f"training.value_loss.huber_delta は正の有限実数を"
+                f"指定してください: {self._huber_delta!r}")
+
+        # CQ-0176, CQ-0177, CQ-0178: advantage 安定化 + 入力検証
+        adv_stab = tc.get("advantage_stabilization", {})
+        self._advantage_clip = adv_stab.get("clip", None)  # None = 無効
+        if self._advantage_clip is not None:
+            if isinstance(self._advantage_clip, bool):
+                raise ValueError(
+                    f"training.advantage_stabilization.clip に bool は"
+                    f"指定できません: {self._advantage_clip!r}")
+            if not isinstance(self._advantage_clip, (int, float)):
+                raise ValueError(
+                    f"training.advantage_stabilization.clip は数値または None を"
+                    f"指定してください: {self._advantage_clip!r}")
+            if not math.isfinite(self._advantage_clip) or self._advantage_clip <= 0:
+                raise ValueError(
+                    f"training.advantage_stabilization.clip は正の有限実数を"
+                    f"指定してください: {self._advantage_clip!r}")
+
+        # CQ-0182, CQ-0183: policy anchor (参照方策アンカー損失)
+        # 設定検証は __init__ で行うが、参照モデルロードは PPO 実行時に遅延
+        # (imitation フェーズでは _train_ppo が呼ばれないため誤発火しない)
+        pa_cfg = tc.get("policy_anchor", {})
+        self._anchor_enabled = pa_cfg.get("enabled", False)
+        self._anchor_type = pa_cfg.get("type", "kl")
+        self._anchor_coef = pa_cfg.get("coef", 0.0)
+        self._anchor_reference = pa_cfg.get("reference", "imitation_fixed")
+        self._ref_model: nn.Module | None = None
+        self._anchor_ref_loaded = False
+
+        if self._anchor_enabled:
+            _VALID_ANCHOR_TYPES = {"kl", "bc"}
+            if self._anchor_type not in _VALID_ANCHOR_TYPES:
+                raise ValueError(
+                    f"training.policy_anchor.type の値が不正: {self._anchor_type!r}。"
+                    f"許容値: {_VALID_ANCHOR_TYPES}")
+            if (isinstance(self._anchor_coef, bool)
+                    or not isinstance(self._anchor_coef, (int, float))
+                    or not math.isfinite(self._anchor_coef)
+                    or self._anchor_coef <= 0):
+                raise ValueError(
+                    f"training.policy_anchor.coef は正の有限実数を"
+                    f"指定してください: {self._anchor_coef!r}")
+            if self._anchor_reference != "imitation_fixed":
+                raise ValueError(
+                    f"training.policy_anchor.reference は 'imitation_fixed' のみ"
+                    f"対応: {self._anchor_reference!r}")
+
+        # CQ-0192: mixed PPO 設定
+        rml_cfg = tc.get("rule_mix_learner", {})
+        self._mixed_ppo = rml_cfg.get("ppo_mode", "separated") == "mixed"
+        self._baseline_sample_weight = rml_cfg.get("baseline_sample_weight", 1.0)
+        if self._mixed_ppo:
+            if (isinstance(self._baseline_sample_weight, bool)
+                    or not isinstance(self._baseline_sample_weight, (int, float))
+                    or not math.isfinite(self._baseline_sample_weight)
+                    or self._baseline_sample_weight <= 0):
+                raise ValueError(
+                    f"training.rule_mix_learner.baseline_sample_weight は"
+                    f"正の有限実数を指定してください: {self._baseline_sample_weight!r}")
+
         self._optimizer = torch.optim.Adam(model.parameters(), lr=self._lr)
 
     @property
@@ -101,6 +179,8 @@ class Learner:
         old_log_probs = torch.from_numpy(data["log_probs"]).to(self._device)
         old_values = torch.from_numpy(data["values"]).to(self._device)
         terminateds = torch.from_numpy(data["terminateds"]).to(self._device)
+        # CQ-0192, CQ-0194: actor_types for mixed PPO sample weights
+        raw_actor_types = data.get("actor_types")  # numpy object array
         profiler.stop("shard_read")
 
         n_before_filter = len(observations)
@@ -144,6 +224,10 @@ class Learner:
                 old_log_probs = old_log_probs[keep]
                 old_values = old_values[keep]
                 terminateds = terminateds[keep]
+                # CQ-0194: actor_types も同期
+                if raw_actor_types is not None:
+                    keep_np = keep.cpu().numpy() if isinstance(keep, torch.Tensor) else keep
+                    raw_actor_types = raw_actor_types[keep_np]
 
         # CQ-0164: 立直後打牌除外
         post_riichi_exclusion_stats = None
@@ -181,6 +265,9 @@ class Learner:
                 raw_is_post_riichi_discards = raw_is_post_riichi_discards[exclude_np]
             if raw_teacher_best_masks is not None:
                 raw_teacher_best_masks = raw_teacher_best_masks[exclude_np]
+            # CQ-0194: actor_types も同期
+            if raw_actor_types is not None:
+                raw_actor_types = raw_actor_types[exclude_np]
 
         n = len(observations)
         if n == 0:
@@ -234,6 +321,18 @@ class Learner:
                 value_aux_features=current_shantens_t)
             metrics.update(repro)
         else:
+            # CQ-0192, CQ-0194: mixed PPO sample weights (最終サンプル集合に対して算出)
+            sample_weights = None
+            if self._mixed_ppo and raw_actor_types is not None:
+                if len(raw_actor_types) != n:
+                    raise ValueError(
+                        f"mixed PPO: actor_types ({len(raw_actor_types)}) と"
+                        f" 学習サンプル数 ({n}) が不一致。"
+                        f" filter/exclude 処理で同期が崩れた可能性があります")
+                w = np.ones(n, dtype=np.float32)
+                bl_mask = raw_actor_types == "baseline"
+                w[bl_mask] = self._baseline_sample_weight
+                sample_weights = torch.from_numpy(w).to(self._device)
             metrics = self._train_ppo(
                 observations, legal_masks, actions, rewards,
                 old_log_probs, old_values, terminateds, n, epochs,
@@ -242,7 +341,10 @@ class Learner:
                 turn_numbers=raw_turn_numbers,
                 point_delta_rewards=raw_point_delta_rewards,
                 shanten_delta_rewards=raw_shanten_delta_rewards,
-                is_post_riichi_discards=raw_is_post_riichi_discards)
+                is_post_riichi_discards=raw_is_post_riichi_discards,
+                sample_weights=sample_weights,
+                actor_types=raw_actor_types,
+                teacher_best_masks=raw_teacher_best_masks)
         profiler.stop("model_forward")
 
         metrics["mode"] = self._mode
@@ -286,6 +388,79 @@ class Learner:
 
         return keep
 
+    def _load_anchor_ref_model(self) -> None:
+        """CQ-0183: 参照モデルを遅延ロードする (PPO 初回呼び出し時)"""
+        if not self._anchor_enabled or self._anchor_ref_loaded:
+            return
+        import copy
+        self._ref_model = copy.deepcopy(self._model)
+        imi_ckpt_path = self._run_dir / "checkpoints" / "checkpoint_imitation.pt"
+        if not imi_ckpt_path.exists():
+            raise FileNotFoundError(
+                f"policy_anchor.reference='imitation_fixed' が有効ですが"
+                f" checkpoint が見つかりません: {imi_ckpt_path}")
+        ckpt_data = torch.load(imi_ckpt_path, map_location="cpu")
+        if isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data:
+            self._ref_model.load_state_dict(ckpt_data["model_state_dict"])
+        else:
+            self._ref_model.load_state_dict(ckpt_data)
+        self._ref_model.to(self._device)
+        self._ref_model.eval()
+        for p in self._ref_model.parameters():
+            p.requires_grad = False
+        self._anchor_ref_loaded = True
+
+    def _eval_teacher_agreement(
+        self,
+        observations: torch.Tensor,
+        legal_masks: torch.Tensor,
+        actions: torch.Tensor,
+        bl_indices: np.ndarray,
+        value_aux_features: torch.Tensor | None,
+        teacher_best_masks: np.ndarray | None,
+    ) -> dict:
+        """CQ-0199, CQ-0201: baseline サンプルに対する teacher agreement を計算する
+
+        全 index/比較は CPU 上で行い device 混在を回避する。
+        """
+        idx = torch.from_numpy(bl_indices).long().to(self._device)
+        bl_obs = observations[idx]
+        bl_masks = legal_masks[idx]
+        bl_actions = actions[idx]
+        bl_vaux = value_aux_features[idx] if value_aux_features is not None else None
+
+        self._model.eval()
+        with torch.no_grad():
+            out = self._model(bl_obs, bl_masks, value_aux_features=bl_vaux)
+        self._model.train()
+
+        # argmax — CPU に移して numpy 比較
+        logits_masked = out.logits + (1 - bl_masks) * (-1e9)
+        actor_argmax_np = logits_masked.argmax(dim=-1).cpu().numpy()
+        bl_actions_np = bl_actions.cpu().numpy()
+
+        # action_match_rate
+        action_match_rate = float(np.mean(actor_argmax_np == bl_actions_np))
+
+        # best_set_hit_rate
+        best_set_hit_rate = None
+        num_best_set = 0
+        if teacher_best_masks is not None:
+            tbm = teacher_best_masks[bl_indices]  # numpy (n_bl, 34)
+            valid = tbm.sum(axis=1) > 0
+            num_best_set = int(valid.sum())
+            if num_best_set > 0:
+                tbm_valid = tbm[valid]  # numpy
+                argmax_valid = actor_argmax_np[valid]  # numpy
+                hits = tbm_valid[np.arange(num_best_set), argmax_valid]
+                best_set_hit_rate = float(np.mean(hits > 0))
+
+        return {
+            "action_match_rate": action_match_rate,
+            "best_set_hit_rate": best_set_hit_rate,
+            "num_best_set_samples": num_best_set,
+        }
+
     def _train_ppo(
         self,
         observations: torch.Tensor,
@@ -303,14 +478,42 @@ class Learner:
         point_delta_rewards: np.ndarray | None = None,
         shanten_delta_rewards: np.ndarray | None = None,
         is_post_riichi_discards: np.ndarray | None = None,
+        sample_weights: torch.Tensor | None = None,
+        actor_types: np.ndarray | None = None,
+        teacher_best_masks: np.ndarray | None = None,
     ) -> dict:
         """PPO 学習"""
+        # CQ-0183: anchor 参照モデルの遅延ロード (PPO 実行時のみ)
+        self._load_anchor_ref_model()
+
         advantages, returns = self._compute_gae(rewards, old_values, terminateds)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # CQ-0176: advantage clip 安定化
+        _adv_abs_mean_before_clip = float(advantages.abs().mean().item())
+        _adv_clip_fraction = 0.0
+        if self._advantage_clip is not None:
+            clip_val = self._advantage_clip
+            clipped_mask = advantages.abs() > clip_val
+            _adv_clip_fraction = float(clipped_mask.float().mean().item())
+            advantages = advantages.clamp(-clip_val, clip_val)
+        _adv_abs_mean_after_clip = float(advantages.abs().mean().item())
+
+        # CQ-0199: teacher agreement (before)
+        _ta_bl_idx = None
+        _ta_before = None
+        if actor_types is not None:
+            _ta_bl_mask = actor_types == "baseline"
+            _ta_bl_idx = np.where(_ta_bl_mask)[0]
+            if len(_ta_bl_idx) > 0:
+                _ta_before = self._eval_teacher_agreement(
+                    observations, legal_masks, actions, _ta_bl_idx,
+                    value_aux_features, teacher_best_masks)
 
         all_policy_losses = []
         all_value_losses = []
         all_entropies = []
+        all_anchor_losses = []  # CQ-0182
         # CQ-0135: 診断統計用テンソル収集
         all_ratios = []
         all_new_values = []
@@ -329,6 +532,7 @@ class Learner:
                 batch_advantages = advantages[idx]
                 batch_returns = returns[idx]
                 batch_vaux = value_aux_features[idx] if value_aux_features is not None else None
+                batch_w = sample_weights[idx] if sample_weights is not None else None
 
                 output = self._model(batch_obs, batch_masks, value_aux_features=batch_vaux)
 
@@ -339,18 +543,62 @@ class Learner:
                 ratio = torch.exp(action_log_probs - batch_old_log_probs)
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1 - self._clip_epsilon, 1 + self._clip_epsilon) * batch_advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
+                per_sample_policy = -torch.min(surr1, surr2)
 
-                # バリューロス
+                # バリューロス (CQ-0176: mse / huber 切替)
                 value = list(output.values.values())[0].squeeze(-1)
-                value_loss = nn.functional.mse_loss(value, batch_returns)
+                if self._value_loss_type == "huber":
+                    per_sample_value = nn.functional.huber_loss(
+                        value, batch_returns, delta=self._huber_delta, reduction="none")
+                else:
+                    per_sample_value = (value - batch_returns) ** 2
 
                 # エントロピーボーナス
                 probs = torch.softmax(output.logits, dim=-1)
-                entropy = -(probs * log_probs).sum(dim=-1).mean()
+                per_sample_entropy = -(probs * log_probs).sum(dim=-1)
+
+                # CQ-0192: weighted mean
+                if batch_w is not None:
+                    w_sum = batch_w.sum()
+                    policy_loss = (batch_w * per_sample_policy).sum() / w_sum
+                    value_loss = (batch_w * per_sample_value).sum() / w_sum
+                    entropy = (batch_w * per_sample_entropy).sum() / w_sum
+                else:
+                    policy_loss = per_sample_policy.mean()
+                    value_loss = per_sample_value.mean()
+                    entropy = per_sample_entropy.mean()
 
                 # 合計ロス
                 loss = policy_loss + self._value_loss_coef * value_loss - self._entropy_coef * entropy
+
+                # CQ-0182: policy anchor 損失
+                anchor_loss_val = 0.0
+                if self._anchor_enabled and self._ref_model is not None:
+                    with torch.no_grad():
+                        ref_output = self._ref_model(batch_obs, batch_masks,
+                                                     value_aux_features=batch_vaux)
+                    # 合法手マスク後の分布
+                    _eps = 1e-8
+                    cur_logits_masked = output.logits + (1 - batch_masks) * (-1e9)
+                    ref_logits_masked = ref_output.logits + (1 - batch_masks) * (-1e9)
+                    cur_probs_m = torch.softmax(cur_logits_masked, dim=-1)
+                    ref_probs_m = torch.softmax(ref_logits_masked, dim=-1)
+
+                    if self._anchor_type == "kl":
+                        # KL(pi_current || pi_ref)
+                        anchor_loss = (cur_probs_m * (
+                            torch.log(cur_probs_m + _eps) - torch.log(ref_probs_m + _eps)
+                        )).sum(dim=-1).mean()
+                    else:  # bc
+                        # CE with ref argmax as target
+                        ref_actions = ref_probs_m.argmax(dim=-1)
+                        anchor_loss = nn.functional.cross_entropy(
+                            cur_logits_masked, ref_actions)
+
+                    loss = loss + self._anchor_coef * anchor_loss
+                    anchor_loss_val = anchor_loss.item()
+
+                all_anchor_losses.append(anchor_loss_val)
 
                 self._optimizer.zero_grad()
                 loss.backward()
@@ -379,6 +627,60 @@ class Learner:
                 all_ratios, all_new_values,
                 clip_epsilon=self._clip_epsilon,
             )
+            # CQ-0176: advantage/value 安定化診断
+            metrics["ppo_diag"]["value_loss_type"] = self._value_loss_type
+            metrics["ppo_diag"]["advantage_abs_mean_before_clip"] = _adv_abs_mean_before_clip
+            metrics["ppo_diag"]["advantage_abs_mean_after_clip"] = _adv_abs_mean_after_clip
+            metrics["ppo_diag"]["advantage_clip_fraction"] = _adv_clip_fraction
+            if self._advantage_clip is not None:
+                metrics["ppo_diag"]["advantage_clip_value"] = self._advantage_clip
+
+            # CQ-0182: policy anchor 診断
+            anchor_diag: dict = {"enabled": self._anchor_enabled}
+            if self._anchor_enabled:
+                anchor_diag["type"] = self._anchor_type
+                anchor_diag["coef"] = self._anchor_coef
+                mean_anchor = float(np.mean(all_anchor_losses)) if all_anchor_losses else 0.0
+                anchor_diag["anchor_loss_mean"] = mean_anchor
+                if self._anchor_type == "kl":
+                    anchor_diag["anchor_kl_mean"] = mean_anchor
+                else:
+                    anchor_diag["anchor_ce_mean"] = mean_anchor
+            metrics["ppo_diag"]["policy_anchor"] = anchor_diag
+
+            # CQ-0192: mixed PPO 診断
+            mixed_diag: dict = {"mixed_ppo_enabled": self._mixed_ppo}
+            if self._mixed_ppo and actor_types is not None:
+                # CQ-0194: actor_types は最終サンプル集合と同期済み
+                n_policy = int(np.sum(actor_types == "policy"))
+                n_baseline = int(np.sum(actor_types == "baseline"))
+                mixed_diag["baseline_sample_weight"] = self._baseline_sample_weight
+                mixed_diag["num_policy_samples"] = n_policy
+                mixed_diag["num_baseline_samples"] = n_baseline
+                mixed_diag["effective_weight_sum_policy"] = float(n_policy)
+                mixed_diag["effective_weight_sum_baseline"] = round(
+                    float(n_baseline * self._baseline_sample_weight), 4)
+            metrics["ppo_diag"]["mixed_ppo"] = mixed_diag
+
+            # CQ-0199: teacher agreement (after + 結合)
+            if _ta_bl_idx is not None and len(_ta_bl_idx) > 0 and _ta_before is not None:
+                _ta_after = self._eval_teacher_agreement(
+                    observations, legal_masks, actions, _ta_bl_idx,
+                    value_aux_features, teacher_best_masks)
+                ta_diag: dict = {
+                    "enabled": True,
+                    "num_baseline_samples": int(len(_ta_bl_idx)),
+                    "num_best_set_samples": _ta_before["num_best_set_samples"],
+                    "action_match_rate_before": _ta_before["action_match_rate"],
+                    "action_match_rate_after": _ta_after["action_match_rate"],
+                    "best_set_hit_rate_before": _ta_before["best_set_hit_rate"],
+                    "best_set_hit_rate_after": _ta_after["best_set_hit_rate"],
+                }
+            elif _ta_bl_idx is None or len(_ta_bl_idx) == 0:
+                ta_diag = {"enabled": False, "skipped_reason": "no_baseline_samples"}
+            else:
+                ta_diag = {"enabled": False, "skipped_reason": "no_baseline_samples"}
+            metrics["ppo_diag"]["teacher_agreement"] = ta_diag
 
             # CQ-0155: per-sample final new_values (学習完了後の value 予測)
             final_new_values_parts: list[torch.Tensor] = []

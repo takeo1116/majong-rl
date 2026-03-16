@@ -665,6 +665,18 @@ Learner は shard を読み込み、model を更新し、training metrics / chec
 - `value_error_*`
 - `ratio_*`
 - `clip_fraction`
+- `value_loss_type` (CQ-0176)
+- `advantage_abs_mean_before_clip`, `advantage_abs_mean_after_clip`, `advantage_clip_fraction`, `advantage_clip_value` (CQ-0176)
+
+#### 12.5.1 learner 安定化オプションの設定検証 (CQ-0177)
+
+learner 初期化時に以下の入力検証を実施する。不正値は `ValueError` で fail-fast する。
+
+| 設定キー | 許容値 | デフォルト |
+|---|---|---|
+| `training.value_loss.type` | `"mse"`, `"huber"` | `"mse"` |
+| `training.value_loss.huber_delta` | 正の有限実数 (`> 0`, finite, bool不可) | `1.0` |
+| `training.advantage_stabilization.clip` | `None` (無効) または正の有限実数 (bool不可) | `None` |
 
 出力先:
 
@@ -673,10 +685,152 @@ Learner は shard を読み込み、model を更新し、training metrics / chec
 - `batch_summary.json.runs[].learner_diag`
 - `batch_summary.json.aggregate.learner_diag`
 
-### 12.6 現仕様での解釈上の注意
+### 12.6 policy anchor — 参照方策アンカー損失 (CQ-0182)
+
+PPO 本体を維持したまま、imitation 固定参照への補助損失を追加して方策ドリフトを抑制する。
+
+適用フェーズ: **PPO のみ** (CQ-0183)。imitation フェーズでは `enabled=true` でも anchor は作動しない（参照モデルのロードは PPO 実行時に遅延される）。
+
+設定:
+
+```yaml
+training:
+  policy_anchor:
+    enabled: true
+    type: "kl"        # "kl" | "bc"
+    coef: 0.1         # 正の有限実数
+    reference: "imitation_fixed"  # 第一段はこれのみ
+```
+
+損失定義:
+
+- `type=kl`: `KL(pi_current || pi_ref)` — 合法手マスク後の確率分布で計算
+- `type=bc`: `CE(cur_logits, argmax(ref_logits))` — 参照の argmax 行動に対する交差エントロピー
+- 総損失: `loss = ppo_loss + value_coef * value_loss - entropy_coef * entropy + anchor_coef * anchor_loss`
+
+参照方策:
+
+- `checkpoints/checkpoint_imitation.pt` を読み込み、freeze + eval で固定
+- checkpoint 不在時は `FileNotFoundError` で fail-fast
+- 参照モデル構造は現行 model と同一（deepcopy + state_dict load）
+
+入力検証:
+
+| 設定キー | 許容値 | デフォルト |
+|---|---|---|
+| `enabled` | bool | `false` |
+| `type` | `"kl"`, `"bc"` | `"kl"` |
+| `coef` | 正の有限実数 (bool不可) | `0.0` |
+| `reference` | `"imitation_fixed"` | `"imitation_fixed"` |
+
+診断出力 (`ppo_diag.policy_anchor`):
+
+- `enabled`, `type`, `coef`
+- `anchor_loss_mean`
+- `anchor_kl_mean` (type=kl 時) / `anchor_ce_mean` (type=bc 時)
+
+### 12.7 現仕様での解釈上の注意
 
 - reuse 実験では self-play が共通なので `value_error` など一部統計は条件間で同じになりうる
 - learner 診断統計は「改善そのもの」ではなく「悪化理由の候補切り分け」に使う
+
+### 12.7 multi-cycle 反復学習 (CQ-0179, CQ-0180)
+
+1 run 内で selfplay→learner→eval を複数回反復する機能。
+
+設定:
+
+```yaml
+training:
+  multi_cycle:
+    enabled: true
+    num_cycles: 3
+    selfplay_matches_per_cycle: 10  # 省略時 selfplay.num_matches
+    eval_each_cycle: true           # cycle ごとに eval_before/eval を実行
+```
+
+実行フロー:
+
+- `imitation` は run 先頭で1回のみ（cycle 外）
+- `enabled=false`（デフォルト）では既存の1回実行と同一
+- `enabled=true` では learner phase 内で num_cycles 回反復:
+  1. eval_before (eval_each_cycle=true 時)
+  2. selfplay (cycle_XX/selfplay/)
+  3. learner (checkpoint_cycle_XX.pt)
+  4. eval (eval_each_cycle=true 時)
+- model は in-place 更新で cycle 間引き継ぎ
+
+成果物:
+
+- `summary.json.phase_stats.cycles[]`: cycle 別メトリクス (eval_before, eval, eval_diff, train_metrics, learner_diag, selfplay_stats)
+- `batch_summary.json.aggregate.cycles[]`: cycle_index 別集約 (eval.avg_rank, eval_diff_avg_rank, learner_diag.clip_fraction 等)
+- `run_dir/cycle_XX/`: cycle 別ディレクトリ (selfplay/, eval_before/, eval/)
+- `checkpoints/checkpoint_cycle_XX.pt`: cycle 別 checkpoint
+
+### 12.9 rule 混合 self-play と 2段学習 (CQ-0184, CQ-0185, CQ-0186)
+
+multi-cycle 実行時に、rule (baseline) 由来データを継続注入し、分離学習する機能。
+
+設定:
+
+```yaml
+training:
+  rule_mix:
+    enabled: true
+    policy_ratio: 0.75          # cycle selfplay 時の policy 席比率
+    save_baseline_actions: true  # baseline 席の行動を shard に保存
+  rule_mix_learner:
+    enabled: true
+    baseline_imitation_epochs: 2  # baseline BC の epoch 数 (0=skip)
+    policy_ppo_epochs: 4          # policy PPO の epoch 数
+    order: "baseline_then_policy" # 現在はこれのみ対応
+```
+
+2段学習フロー (各 cycle 内):
+
+1. **baseline BC stage**: `filter_actor_type="baseline"`, imitation 学習
+2. **policy PPO stage**: `filter_actor_type="policy"`, PPO 学習
+
+条件:
+- `rule_mix.enabled=false` → 既存動作（policy-only selfplay）
+- `rule_mix_learner.enabled=false` → 既存単一 learner
+- baseline 0件時は BC stage をスキップ（クラッシュしない）
+- PPO に baseline サンプルは混入しない
+
+cycle 別診断 (`phase_stats.cycles[*]`):
+- `actor_type_counts`: `{"policy": N, "baseline": M}`
+- `learner_stages.baseline_imitation`: `{executed, used_samples, policy_loss, ...}`
+- `learner_stages.policy_ppo`: `{executed, used_samples, policy_loss, ppo_diag}`
+- `learner_stages.mixed_ppo`: `{executed, used_samples, policy_loss, mode, ppo_diag}` (mixed 時)
+
+### 12.10 mixed PPO — biased 混合学習 (CQ-0192)
+
+baseline/policy サンプルを同一 PPO 更新に投入する MVP。
+
+設定:
+
+```yaml
+training:
+  rule_mix_learner:
+    enabled: true
+    ppo_mode: "mixed"               # "separated" (default) | "mixed"
+    baseline_sample_weight: 0.5     # baseline サンプルの重み (>0)
+```
+
+動作:
+- `ppo_mode="mixed"` のとき BC stage をスキップし、`filter_actor_type=None` で1段 PPO
+- PPO の各 loss 項（policy, value, entropy）に per-sample weight を適用
+  - policy: `1.0`, baseline: `baseline_sample_weight`
+  - 重み付き平均: `sum(w * x) / sum(w)`
+
+selfplay 側の準備:
+- `save_baseline_actions=true` + `ppo_mode="mixed"` のとき、baseline サンプルの `log_prob` / `value` を actor model 出力で保存
+- 従来の `log_prob=0, value=0` ではなく、actor model が baseline 行動に対して出力する値を使用
+
+診断 (`ppo_diag.mixed_ppo`):
+- `mixed_ppo_enabled`, `baseline_sample_weight`
+- `num_policy_samples`, `num_baseline_samples`
+- `effective_weight_sum_policy`, `effective_weight_sum_baseline`
 
 ---
 

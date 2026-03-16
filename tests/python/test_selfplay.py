@@ -717,3 +717,154 @@ class TestPostRiichiFlag:
         # 麻雀のゲームでは一部は立直後打牌になるはず（確率的だが2局あれば十分）
         # 完全に全部 False でも壊れていない証拠にはなる
         assert n_true >= 0  # 最低限非負
+
+
+@pytest.mark.slow
+class TestBaselineActorEvalConsistency:
+    """baseline_actor_eval の value/log_prob 期待値一致テスト (CQ-0195, CQ-0196)
+
+    shard 保存値を同一モデル forward の期待値と直接比較する。
+    """
+
+    def test_baseline_value_with_current_shanten(self, tmp_path: Path):
+        """baseline value がモデル forward と一致 (value_aux なしの基本検証)"""
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = MLPPolicyValueModel(
+            input_dim=encoder.output_dim, hidden_dims=[32])
+        config = _make_config(policy_ratio=0.5)
+        config["selfplay"]["save_baseline_actions"] = True
+        config["selfplay"]["temperature"] = 1.0
+        config["training"] = {"rule_mix_learner": {"ppo_mode": "mixed"}}
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "sp", worker_id="test_w",
+        )
+        worker.run(num_matches=2, seed_start=42)
+
+        reader = ShardReader(tmp_path / "sp")
+        data = reader.read_as_tensors()
+
+        bl_mask = data["actor_types"] == "baseline"
+        n_bl = int(bl_mask.sum())
+        assert n_bl > 0, "baseline サンプルが 0 件: テスト不成立"
+
+        bl_obs = data["observations"][bl_mask]
+        bl_masks = data["legal_masks"][bl_mask]
+        bl_values_saved = data["values"][bl_mask]
+
+        # selfplay と同じモード (training=True) でモデル forward
+        for i in range(min(n_bl, 5)):
+            obs_t = torch.from_numpy(bl_obs[i]).unsqueeze(0)
+            mask_t = torch.from_numpy(bl_masks[i]).unsqueeze(0)
+            with torch.no_grad():
+                out = model(obs_t, mask_t)
+            expected_value = float(list(out.values.values())[0].item())
+            assert np.isclose(bl_values_saved[i], expected_value, atol=1e-5, rtol=1e-5), \
+                f"baseline value 不一致 (sample {i}): saved={bl_values_saved[i]}, expected={expected_value}"
+
+    def test_baseline_value_with_value_aux(self, tmp_path: Path):
+        """CQ-0197, CQ-0198: current_shanten 有効時、baseline value が
+        value_aux 付きモデル forward と直接一致"""
+        import pyarrow.parquet as pq
+
+        encoder = FlatFeatureEncoder(
+            observation_mode="full", current_shanten_input=True)
+        model = MLPPolicyValueModel(
+            input_dim=encoder.output_dim, hidden_dims=[32],
+            value_aux_dim=1)
+        config = _make_config(policy_ratio=0.5)
+        config["selfplay"]["save_baseline_actions"] = True
+        config["selfplay"]["temperature"] = 1.0
+        config["model"] = {"value_features": {"current_shanten": {"enabled": True}}}
+        config["training"] = {"rule_mix_learner": {"ppo_mode": "mixed"}}
+
+        sp_dir = tmp_path / "sp"
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=sp_dir, worker_id="test_w",
+        )
+        worker.run(num_matches=3, seed_start=42)
+
+        # raw parquet から current_shanten を直接読む
+        # (shard reader の all(v>=0) チェックを回避)
+        reader = ShardReader(sp_dir)
+        data = reader.read_as_tensors()
+        all_cs_raw: list[int] = []
+        for shard_path in sorted(sp_dir.glob("shard_*.parquet")):
+            table = pq.read_table(shard_path)
+            if "current_shanten" in table.column_names:
+                all_cs_raw.extend(table.column("current_shanten").to_pylist())
+            else:
+                all_cs_raw.extend([-1] * len(table))
+        cs_array = np.array(all_cs_raw, dtype=np.int32)
+
+        bl_mask = data["actor_types"] == "baseline"
+        n_bl = int(bl_mask.sum())
+        assert n_bl > 0, "baseline サンプルが 0 件: テスト不成立"
+
+        bl_obs = data["observations"][bl_mask]
+        bl_masks = data["legal_masks"][bl_mask]
+        bl_values_saved = data["values"][bl_mask]
+        bl_cs = cs_array[bl_mask]
+
+        # current_shanten >= 0 のサンプルのみ検証
+        valid_indices = [i for i in range(n_bl) if bl_cs[i] >= 0]
+        assert len(valid_indices) > 0, \
+            "current_shanten >= 0 の baseline サンプルが 0 件: テスト不成立"
+
+        matched = 0
+        for i in valid_indices[:5]:
+            obs_t = torch.from_numpy(bl_obs[i]).unsqueeze(0)
+            mask_t = torch.from_numpy(bl_masks[i]).unsqueeze(0)
+            value_aux = torch.tensor([[bl_cs[i] / 8.0]], dtype=torch.float32)
+            with torch.no_grad():
+                out = model(obs_t, mask_t, value_aux_features=value_aux)
+            expected_value = float(list(out.values.values())[0].item())
+            assert np.isclose(bl_values_saved[i], expected_value, atol=1e-5, rtol=1e-5), \
+                f"baseline value 不一致 (sample {i}): saved={bl_values_saved[i]}, expected={expected_value}"
+            matched += 1
+        assert matched > 0
+
+    def test_baseline_logprob_with_temperature(self, tmp_path: Path):
+        """temperature != 1.0 で baseline log_prob がモデル forward + temperature 定義と一致"""
+        temperature = 2.0
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        model = MLPPolicyValueModel(
+            input_dim=encoder.output_dim, hidden_dims=[32])
+        config = _make_config(policy_ratio=0.5)
+        config["selfplay"]["save_baseline_actions"] = True
+        config["selfplay"]["temperature"] = temperature
+        config["training"] = {"rule_mix_learner": {"ppo_mode": "mixed"}}
+
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=encoder,
+            output_dir=tmp_path / "sp", worker_id="test_w",
+        )
+        worker.run(num_matches=2, seed_start=42)
+
+        reader = ShardReader(tmp_path / "sp")
+        data = reader.read_as_tensors()
+
+        bl_mask = data["actor_types"] == "baseline"
+        n_bl = int(bl_mask.sum())
+        assert n_bl > 0, "baseline サンプルが 0 件: テスト不成立"
+
+        bl_obs = data["observations"][bl_mask]
+        bl_masks = data["legal_masks"][bl_mask]
+        bl_actions = data["actions"][bl_mask]
+        bl_lp_saved = data["log_probs"][bl_mask]
+
+        for i in range(min(n_bl, 5)):
+            obs_t = torch.from_numpy(bl_obs[i]).unsqueeze(0)
+            mask_t = torch.from_numpy(bl_masks[i]).unsqueeze(0)
+            with torch.no_grad():
+                out = model(obs_t, mask_t)
+            # mask -> temperature -> log_softmax (policy 定義と同一)
+            logits = out.logits[0]
+            logits_masked = logits + (1 - mask_t[0]) * (-1e9)
+            logits_tempered = logits_masked / temperature
+            lp = torch.log_softmax(logits_tempered, dim=-1)
+            expected_lp = float(lp[int(bl_actions[i])].item())
+            assert np.isclose(bl_lp_saved[i], expected_lp, atol=1e-5, rtol=1e-5), \
+                f"baseline log_prob 不一致 (sample {i}): saved={bl_lp_saved[i]}, expected={expected_lp}"

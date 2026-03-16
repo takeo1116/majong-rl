@@ -53,6 +53,11 @@ class SelfPlayWorker:
         self._policy_ratio = sp.get("policy_ratio", 0.5)
         self._temperature = sp.get("temperature", 1.0)
         self._save_baseline_actions = sp.get("save_baseline_actions", False)
+        # CQ-0192: baseline サンプルに actor model の log_prob/value を保存
+        rml = config.get("training", {}).get("rule_mix_learner", {})
+        self._baseline_actor_eval = (
+            rml.get("ppo_mode", "separated") == "mixed"
+            and self._save_baseline_actions)
         max_per_shard = sp.get("max_samples_per_shard", 10000)
 
         self._selector = ActionSelector(
@@ -234,6 +239,30 @@ class SelfPlayWorker:
                 if self._save_baseline_actions:
                     pre_features = self._encoder.encode(obs, legal_mask=mask)
                     pre_features_flat = pre_features.flatten() if pre_features.ndim > 1 else pre_features
+                    # CQ-0192, CQ-0194: mixed PPO 用に actor model の log_prob/value を計算
+                    # policy 経路と同一の入力定義 (value_aux, temperature) を使用
+                    if self._baseline_actor_eval:
+                        self._features_buf[0].copy_(torch.from_numpy(pre_features_flat))
+                        self._mask_buf[0].copy_(torch.from_numpy(mask))
+                        # value_aux: policy 経路と同一 (CQ-0194)
+                        value_aux = None
+                        if self._value_shanten_enabled and current_shanten_val is not None:
+                            self._value_aux_buf[0, 0] = current_shanten_val / 8.0
+                            value_aux = self._value_aux_buf
+                        with torch.no_grad():
+                            out = self._model(self._features_buf, self._mask_buf,
+                                              value_aux_features=value_aux)
+                        # log_prob: temperature 付き分布で算出 (CQ-0194)
+                        logits = out.logits[0]
+                        logits_masked = logits + (1 - self._mask_buf[0]) * (-1e9)
+                        if self._temperature != 1.0:
+                            logits_masked = logits_masked / self._temperature
+                        lp = torch.log_softmax(logits_masked, dim=-1)
+                        log_prob = float(lp[tile_type].item())
+                        # value
+                        for v_tensor in out.values.values():
+                            value = float(v_tensor.item())
+                            break
                 else:
                     pre_features_flat = None
 

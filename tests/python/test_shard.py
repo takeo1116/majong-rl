@@ -770,3 +770,87 @@ class TestPostRiichiDiscardShard:
         data = reader.read_as_tensors()
         # 旧 shard に -1 sentinel が混入するため、全 shard 揃い条件を満たさず None
         assert data["is_post_riichi_discards"] is None
+
+
+class TestTeacherBestMaskFilterDeferred:
+    """teacher_best_mask の filter 後判定テスト (CQ-0191)"""
+
+    def test_mixed_shard_baseline_filter_returns_tbm(self, tmp_path: Path):
+        """policy-only shard (tbm なし) + baseline shard (tbm あり) の mixed で、
+        filter_actor_type="baseline" なら teacher_best_masks が返る"""
+        # shard 1: policy のみ (tbm なし)
+        dir1 = tmp_path / "worker_0"
+        dir1.mkdir()
+        writer1 = ShardWriter(dir1, max_samples=100)
+        for i in range(3):
+            s = _make_sample(step_id=i)
+            s.actor_type = "policy"
+            writer1.add(s)
+        writer1.close()
+
+        # shard 2: baseline のみ (tbm あり)
+        dir2 = tmp_path / "worker_1"
+        dir2.mkdir()
+        writer2 = ShardWriter(dir2, max_samples=100)
+        for i in range(3):
+            s = _make_sample(step_id=10 + i)
+            s.actor_type = "baseline"
+            s.teacher_best_mask = np.zeros(34, dtype=np.float32)
+            s.teacher_best_mask[i] = 1.0
+            writer2.add(s)
+        writer2.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors(filter_actor_type="baseline")
+        assert data["teacher_best_masks"] is not None
+        assert data["teacher_best_masks"].shape == (3, 34)
+        assert data["teacher_best_masks"][0, 0] == 1.0
+
+    def test_mixed_shard_no_filter_returns_none(self, tmp_path: Path):
+        """mixed shard を filter なしで読むと tbm は None (後方互換)"""
+        dir1 = tmp_path / "worker_0"
+        dir1.mkdir()
+        writer1 = ShardWriter(dir1, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.actor_type = "policy"
+        writer1.add(s1)
+        writer1.close()
+
+        dir2 = tmp_path / "worker_1"
+        dir2.mkdir()
+        writer2 = ShardWriter(dir2, max_samples=100)
+        s2 = _make_sample(step_id=1)
+        s2.actor_type = "baseline"
+        s2.teacher_best_mask = np.ones(34, dtype=np.float32)
+        writer2.add(s2)
+        writer2.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors()
+        assert data["teacher_best_masks"] is None
+
+    def test_baseline_cross_shard_tbm_gap_returns_none(self, tmp_path: Path):
+        """baseline 行が shard 1 (tbm なし) と shard 2 (tbm あり) に分散 → None"""
+        # shard 1: baseline without tbm
+        dir1 = tmp_path / "worker_0"
+        dir1.mkdir()
+        writer1 = ShardWriter(dir1, max_samples=100)
+        s1 = _make_sample(step_id=0)
+        s1.actor_type = "baseline"
+        writer1.add(s1)
+        writer1.close()
+
+        # shard 2: baseline with tbm
+        dir2 = tmp_path / "worker_1"
+        dir2.mkdir()
+        writer2 = ShardWriter(dir2, max_samples=100)
+        s2 = _make_sample(step_id=1)
+        s2.actor_type = "baseline"
+        s2.teacher_best_mask = np.ones(34, dtype=np.float32)
+        writer2.add(s2)
+        writer2.close()
+
+        reader = ShardReader(tmp_path)
+        data = reader.read_as_tensors(filter_actor_type="baseline")
+        # shard 1 の baseline 行に tbm 欠落があるので None
+        assert data["teacher_best_masks"] is None

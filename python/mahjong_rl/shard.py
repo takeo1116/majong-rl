@@ -442,11 +442,10 @@ class ShardReader:
             "actor_types": np.array(all_actor_types, dtype=object),
         }
 
-        # teacher_best_masks (CQ-0125): 全 shard にカラムがある場合のみ配列化
-        if has_teacher_best_mask and all(m is not None for m in all_teacher_best_masks):
-            result["teacher_best_masks"] = np.stack(all_teacher_best_masks)
-        else:
-            result["teacher_best_masks"] = None
+        # teacher_best_masks (CQ-0125, CQ-0191): 判定を filter 後に遅延
+        # all_teacher_best_masks を raw list のまま保持し、filter 後に最終判定する
+        result["_raw_teacher_best_masks"] = all_teacher_best_masks
+        result["_has_teacher_best_mask"] = has_teacher_best_mask
         # CQ-0128: shard ごとの有無情報
         result["teacher_best_mask_shard_info"] = {
             "available": tbm_shard_count,
@@ -495,7 +494,8 @@ class ShardReader:
 
         if filter_actor_type is not None:
             actor_mask = result["actor_types"] == filter_actor_type
-            tbm = result.pop("teacher_best_masks")
+            raw_tbm = result.pop("_raw_teacher_best_masks")
+            has_tbm = result.pop("_has_teacher_best_mask")
             shard_info = result.pop("teacher_best_mask_shard_info")
             sd = result.pop("shanten_deltas")
             sd_shard_info = result.pop("shanten_delta_shard_info")
@@ -505,7 +505,12 @@ class ShardReader:
             sdr = result.pop("shanten_delta_rewards")
             iprd = result.pop("is_post_riichi_discards")
             result = {k: v[actor_mask] for k, v in result.items()}
-            result["teacher_best_masks"] = tbm[actor_mask] if tbm is not None else None
+            # CQ-0191: filter 後の行で teacher_best_masks を判定
+            filtered_tbm = [raw_tbm[i] for i, m in enumerate(actor_mask) if m]
+            if has_tbm and filtered_tbm and all(m is not None for m in filtered_tbm):
+                result["teacher_best_masks"] = np.stack(filtered_tbm)
+            else:
+                result["teacher_best_masks"] = None
             result["teacher_best_mask_shard_info"] = shard_info
             result["shanten_deltas"] = sd[actor_mask] if sd is not None else None
             result["shanten_delta_shard_info"] = sd_shard_info
@@ -514,5 +519,13 @@ class ShardReader:
             result["point_delta_rewards"] = pdr[actor_mask] if pdr is not None else None
             result["shanten_delta_rewards"] = sdr[actor_mask] if sdr is not None else None
             result["is_post_riichi_discards"] = iprd[actor_mask] if iprd is not None else None
+        else:
+            # non-filter: raw list を最終化 (CQ-0191)
+            raw_tbm = result.pop("_raw_teacher_best_masks")
+            has_tbm = result.pop("_has_teacher_best_mask")
+            if has_tbm and all(m is not None for m in raw_tbm):
+                result["teacher_best_masks"] = np.stack(raw_tbm)
+            else:
+                result["teacher_best_masks"] = None
 
         return result

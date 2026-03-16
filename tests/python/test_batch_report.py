@@ -1528,6 +1528,22 @@ class TestEncoderFeaturesBatch:
         assert run["encoder_features"]["current_shanten"] is False
         assert run["encoder_features"]["shape_hint"] is True
 
+    def test_turn_context_transferred(self, tmp_path: Path):
+        """turn_context が batch_summary に転送される (CQ-0177)"""
+        ef = {
+            "name": "FlatFeatureEncoder",
+            "observation_mode": "full",
+            "turn_context": True,
+            "input_dim": 459,
+        }
+        results = [self._make_result_with_encoder(tmp_path, 42, ef)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        run = summary["runs"][0]
+        assert run["encoder_features"]["turn_context"] is True
+
     def test_no_encoder_features_ok(self, tmp_path: Path):
         """encoder_features がない summary でもクラッシュしない"""
         run_dir = tmp_path / "run_42"
@@ -1544,3 +1560,403 @@ class TestEncoderFeaturesBatch:
         with open(tmp_path / "batch_summary.json") as f:
             summary = json.load(f)
         assert "encoder_features" not in summary["runs"][0]
+
+
+class TestEvalBeforeAndPhaseTimingBatch:
+    """eval_before / phase_timing の batch_summary 転送・集約テスト (CQ-0174)"""
+
+    @staticmethod
+    def _make_result(tmp_path, seed, eval_before=None, phase_timing=None):
+        run_dir = tmp_path / f"run_{seed}"
+        run_dir.mkdir(exist_ok=True)
+        summary = {"phase_stats": {}}
+        if eval_before is not None:
+            summary["phase_stats"]["eval_before"] = eval_before
+        if phase_timing is not None:
+            summary["phase_timing"] = phase_timing
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {"avg_rank": 2.5, "run_dir": str(run_dir)},
+        }
+
+    def test_eval_before_transferred_and_aggregated(self, tmp_path: Path):
+        """eval_before が runs に転送され aggregate に集約される"""
+        results = [
+            self._make_result(tmp_path, 42, eval_before={
+                "avg_rank": 3.0, "avg_score": -10000,
+                "win_rate": 0.1, "deal_in_rate": 0.5,
+            }),
+            self._make_result(tmp_path, 43, eval_before={
+                "avg_rank": 2.5, "avg_score": -5000,
+                "win_rate": 0.2, "deal_in_rate": 0.4,
+            }),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+
+        # runs に転送
+        for run in summary["runs"]:
+            assert "eval_before" in run
+        assert summary["runs"][0]["eval_before"]["avg_rank"] == 3.0
+
+        # aggregate に集約
+        agg_eb = summary["aggregate"].get("eval_before")
+        assert agg_eb is not None, "aggregate.eval_before がない"
+        assert "avg_rank" in agg_eb
+        assert agg_eb["avg_rank"]["count"] == 2
+        assert agg_eb["avg_rank"]["mean"] == pytest.approx(2.75)
+
+    def test_phase_timing_transferred_and_aggregated(self, tmp_path: Path):
+        """phase_timing が runs に転送され aggregate に集約される"""
+        results = [
+            self._make_result(tmp_path, 42, phase_timing={
+                "selfplay": {"start_ts": "t", "end_ts": "t", "duration_sec": 10.0},
+                "learner": {"start_ts": "t", "end_ts": "t", "duration_sec": 2.0},
+                "eval": {"start_ts": "t", "end_ts": "t", "duration_sec": 30.0},
+            }),
+            self._make_result(tmp_path, 43, phase_timing={
+                "selfplay": {"start_ts": "t", "end_ts": "t", "duration_sec": 12.0},
+                "learner": {"start_ts": "t", "end_ts": "t", "duration_sec": 3.0},
+                "eval": {"start_ts": "t", "end_ts": "t", "duration_sec": 28.0},
+            }),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+
+        # runs に転送
+        assert "phase_timing" in summary["runs"][0]
+
+        # aggregate に集約
+        agg_pt = summary["aggregate"].get("phase_timing")
+        assert agg_pt is not None, "aggregate.phase_timing がない"
+        assert "selfplay" in agg_pt
+        assert agg_pt["selfplay"]["mean"] == pytest.approx(11.0)
+        assert agg_pt["selfplay"]["count"] == 2
+        assert "learner" in agg_pt
+        assert "eval" in agg_pt
+        # total
+        assert "total" in agg_pt
+        assert agg_pt["total"]["mean"] == pytest.approx(42.5)
+
+    def test_no_eval_before_ok(self, tmp_path: Path):
+        """eval_before がない run でもクラッシュしない"""
+        results = [self._make_result(tmp_path, 42)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert "eval_before" not in summary["runs"][0]
+        assert "eval_before" not in summary["aggregate"]
+
+    def test_no_phase_timing_ok(self, tmp_path: Path):
+        """phase_timing がない run でもクラッシュしない"""
+        results = [self._make_result(tmp_path, 42)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert "phase_timing" not in summary["runs"][0]
+        assert "phase_timing" not in summary["aggregate"]
+
+
+class TestCycleMetricsBatch:
+    """cycle 別メトリクスの batch_summary 転送・集約テスト (CQ-0180)"""
+
+    @staticmethod
+    def _make_result_with_cycles(tmp_path, seed, cycles):
+        run_dir = tmp_path / f"run_{seed}"
+        run_dir.mkdir(exist_ok=True)
+        summary = {
+            "phase_stats": {"cycles": cycles},
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {"avg_rank": 2.5, "run_dir": str(run_dir)},
+        }
+
+    def test_cycles_transferred(self, tmp_path: Path):
+        """cycles が runs に転送される"""
+        cycles = [
+            {"cycle_index": 0, "eval": {"avg_rank": 3.0},
+             "train_metrics": {"policy_loss": 0.1}},
+            {"cycle_index": 1, "eval": {"avg_rank": 2.5},
+             "train_metrics": {"policy_loss": 0.05}},
+        ]
+        results = [self._make_result_with_cycles(tmp_path, 42, cycles)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert "cycles" in summary["runs"][0]
+        assert len(summary["runs"][0]["cycles"]) == 2
+
+    def test_cycles_aggregate(self, tmp_path: Path):
+        """cycle 別 aggregate が生成される"""
+        cycles_a = [
+            {"cycle_index": 0,
+             "eval": {"avg_rank": 3.0, "avg_score": -10000},
+             "eval_before": {"avg_rank": 3.5},
+             "eval_diff": {"avg_rank": {"delta": -0.5}},
+             "learner_diag": {"clip_fraction": 0.05, "ratio_std": 0.1}},
+            {"cycle_index": 1,
+             "eval": {"avg_rank": 2.5, "avg_score": -5000},
+             "eval_diff": {"avg_rank": {"delta": -0.3}},
+             "learner_diag": {"clip_fraction": 0.03, "ratio_std": 0.08}},
+        ]
+        cycles_b = [
+            {"cycle_index": 0,
+             "eval": {"avg_rank": 2.8, "avg_score": -8000},
+             "eval_diff": {"avg_rank": {"delta": -0.4}},
+             "learner_diag": {"clip_fraction": 0.04, "ratio_std": 0.12}},
+            {"cycle_index": 1,
+             "eval": {"avg_rank": 2.3, "avg_score": -3000},
+             "eval_diff": {"avg_rank": {"delta": -0.2}},
+             "learner_diag": {"clip_fraction": 0.02, "ratio_std": 0.06}},
+        ]
+        results = [
+            self._make_result_with_cycles(tmp_path, 42, cycles_a),
+            self._make_result_with_cycles(tmp_path, 43, cycles_b),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        agg_cycles = summary["aggregate"].get("cycles")
+        assert agg_cycles is not None
+        assert len(agg_cycles) == 2
+        # cycle 0
+        assert agg_cycles[0]["cycle_index"] == 0
+        assert agg_cycles[0]["count"] == 2
+        assert "eval" in agg_cycles[0]
+        assert agg_cycles[0]["eval"]["avg_rank"]["count"] == 2
+        assert agg_cycles[0]["eval"]["avg_rank"]["mean"] == pytest.approx(2.9)
+        # eval_diff
+        assert "eval_diff_avg_rank" in agg_cycles[0]
+        assert agg_cycles[0]["eval_diff_avg_rank"]["mean"] == pytest.approx(-0.45)
+        # learner_diag
+        assert "learner_diag" in agg_cycles[0]
+        assert agg_cycles[0]["learner_diag"]["clip_fraction"]["mean"] == pytest.approx(0.045)
+
+    def test_no_cycles_ok(self, tmp_path: Path):
+        """cycles がない run でもクラッシュしない"""
+        run_dir = tmp_path / "run_42"
+        run_dir.mkdir()
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump({"phase_stats": {}}, f)
+        results = [{
+            "seed": 42,
+            "success": True,
+            "result": {"avg_rank": 2.5, "run_dir": str(run_dir)},
+        }]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert "cycles" not in summary["runs"][0]
+        assert "cycles" not in summary["aggregate"]
+
+
+class TestPolicyAnchorBatch:
+    """policy_anchor の batch 転送テスト (CQ-0183)"""
+
+    @staticmethod
+    def _make_result_with_anchor(tmp_path, seed, policy_anchor):
+        run_dir = tmp_path / f"run_{seed}"
+        run_dir.mkdir(exist_ok=True)
+        summary = {
+            "phase_stats": {
+                "learner": {
+                    "ppo_diag": {
+                        "clip_fraction": 0.05,
+                        "policy_anchor": policy_anchor,
+                    },
+                },
+            },
+        }
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary, f)
+        return {
+            "seed": seed,
+            "success": True,
+            "result": {"avg_rank": 2.5, "run_dir": str(run_dir)},
+        }
+
+    def test_anchor_in_learner_diag(self, tmp_path: Path):
+        """policy_anchor が learner_diag に転送される"""
+        pa = {"enabled": True, "type": "kl", "coef": 0.1,
+              "anchor_loss_mean": 0.05, "anchor_kl_mean": 0.05}
+        results = [self._make_result_with_anchor(tmp_path, 42, pa)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        diag = summary["runs"][0].get("learner_diag", {})
+        assert "policy_anchor" in diag
+        assert diag["policy_anchor"]["enabled"] is True
+        assert diag["policy_anchor"]["anchor_loss_mean"] == 0.05
+
+    def test_mixed_anchor_no_crash(self, tmp_path: Path):
+        """anchor あり/なしが混在してもクラッシュしない"""
+        pa_on = {"enabled": True, "type": "kl", "coef": 0.1,
+                 "anchor_loss_mean": 0.05}
+        pa_off = {"enabled": False}
+        results = [
+            self._make_result_with_anchor(tmp_path, 42, pa_on),
+            self._make_result_with_anchor(tmp_path, 43, pa_off),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert summary["success_count"] == 2
+
+
+class TestCycleAggregateExtended:
+    """cycle 集約拡張テスト (CQ-0189)"""
+
+    @staticmethod
+    def _make_result(tmp_path, seed, cycles):
+        run_dir = tmp_path / f"run_{seed}"
+        run_dir.mkdir(exist_ok=True)
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump({"phase_stats": {"cycles": cycles}}, f)
+        return {
+            "seed": seed, "success": True,
+            "result": {"avg_rank": 2.5, "run_dir": str(run_dir)},
+        }
+
+    def test_actor_type_counts_aggregated(self, tmp_path: Path):
+        """actor_type_counts が cycle 集約に含まれる"""
+        cycles_a = [{"cycle_index": 0,
+                      "actor_type_counts": {"policy": 100, "baseline": 30}}]
+        cycles_b = [{"cycle_index": 0,
+                      "actor_type_counts": {"policy": 80, "baseline": 50}}]
+        results = [
+            self._make_result(tmp_path, 42, cycles_a),
+            self._make_result(tmp_path, 43, cycles_b),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        agg = summary["aggregate"]["cycles"][0]
+        assert "actor_type_counts" in agg
+        assert agg["actor_type_counts"]["policy"]["mean"] == pytest.approx(90.0)
+        assert agg["actor_type_counts"]["baseline"]["mean"] == pytest.approx(40.0)
+
+    def test_learner_stages_aggregated(self, tmp_path: Path):
+        """learner_stages が cycle 集約に含まれる"""
+        cycles_a = [{"cycle_index": 0, "learner_stages": {
+            "baseline_imitation": {"executed": True, "used_samples": 30, "policy_loss": 0.1},
+            "policy_ppo": {"executed": True, "used_samples": 70, "policy_loss": 0.05},
+        }}]
+        cycles_b = [{"cycle_index": 0, "learner_stages": {
+            "baseline_imitation": {"executed": True, "used_samples": 50, "policy_loss": 0.08},
+            "policy_ppo": {"executed": True, "used_samples": 80, "policy_loss": 0.04},
+        }}]
+        results = [
+            self._make_result(tmp_path, 42, cycles_a),
+            self._make_result(tmp_path, 43, cycles_b),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        ls = summary["aggregate"]["cycles"][0].get("learner_stages", {})
+        assert "baseline_imitation" in ls
+        assert ls["baseline_imitation"]["executed_count"] == 2
+        assert ls["baseline_imitation"]["used_samples"]["mean"] == pytest.approx(40.0)
+        assert "policy_ppo" in ls
+        assert ls["policy_ppo"]["used_samples"]["mean"] == pytest.approx(75.0)
+
+    def test_mixed_old_new_no_crash(self, tmp_path: Path):
+        """旧run（新キーなし）混在でクラッシュしない"""
+        cycles_new = [{"cycle_index": 0,
+                        "actor_type_counts": {"policy": 100},
+                        "learner_stages": {"policy_ppo": {"executed": True, "used_samples": 70}}}]
+        cycles_old = [{"cycle_index": 0, "eval": {"avg_rank": 2.5}}]
+        results = [
+            self._make_result(tmp_path, 42, cycles_new),
+            self._make_result(tmp_path, 43, cycles_old),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        assert len(summary["runs"]) == 2
+        assert "cycles" in summary["aggregate"]
+
+
+class TestTeacherAgreementBatch:
+    """teacher_agreement の batch 転送・集約テスト (CQ-0200)"""
+
+    @staticmethod
+    def _make_result(tmp_path, seed, cycles):
+        run_dir = tmp_path / f"run_{seed}"
+        run_dir.mkdir(exist_ok=True)
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump({"phase_stats": {"cycles": cycles}}, f)
+        return {
+            "seed": seed, "success": True,
+            "result": {"avg_rank": 2.5, "run_dir": str(run_dir)},
+        }
+
+    def test_teacher_agreement_aggregated(self, tmp_path: Path):
+        """teacher_agreement が cycle 集約に含まれる"""
+        ta = {
+            "enabled": True,
+            "num_baseline_samples": 50,
+            "num_best_set_samples": 40,
+            "action_match_rate_before": 0.3,
+            "action_match_rate_after": 0.5,
+            "best_set_hit_rate_before": 0.4,
+            "best_set_hit_rate_after": 0.6,
+        }
+        cycles_a = [{"cycle_index": 0,
+                      "learner_diag": {"clip_fraction": 0.05, "teacher_agreement": ta}}]
+        ta2 = dict(ta)
+        ta2["action_match_rate_after"] = 0.7
+        cycles_b = [{"cycle_index": 0,
+                      "learner_diag": {"clip_fraction": 0.03, "teacher_agreement": ta2}}]
+        results = [
+            self._make_result(tmp_path, 42, cycles_a),
+            self._make_result(tmp_path, 43, cycles_b),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        agg_ta = summary["aggregate"]["cycles"][0]["learner_diag"].get("teacher_agreement")
+        assert agg_ta is not None
+        assert agg_ta["action_match_rate_after"]["count"] == 2
+        assert agg_ta["action_match_rate_after"]["mean"] == pytest.approx(0.6)
+
+    def test_missing_teacher_agreement_no_crash(self, tmp_path: Path):
+        """teacher_agreement がない run が混在しても壊れない"""
+        cycles_new = [{"cycle_index": 0,
+                        "learner_diag": {"clip_fraction": 0.05, "teacher_agreement": {
+                            "enabled": True, "num_baseline_samples": 50,
+                            "action_match_rate_before": 0.3, "action_match_rate_after": 0.5,
+                        }}}]
+        cycles_old = [{"cycle_index": 0,
+                        "learner_diag": {"clip_fraction": 0.04}}]
+        results = [
+            self._make_result(tmp_path, 42, cycles_new),
+            self._make_result(tmp_path, 43, cycles_old),
+        ]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        # クラッシュしない
+        assert summary["success_count"] == 2

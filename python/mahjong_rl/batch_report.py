@@ -125,6 +125,18 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
                     rs = sp_stats.get("reward_shaping")
                     if rs is not None:
                         entry["reward_shaping"] = rs
+                    # CQ-0174: eval_before を転送
+                    eb_stats = run_summary.get("phase_stats", {}).get("eval_before")
+                    if eb_stats is not None:
+                        entry["eval_before"] = eb_stats
+                    # CQ-0174: phase_timing を転送
+                    pt = run_summary.get("phase_timing")
+                    if pt is not None:
+                        entry["phase_timing"] = pt
+                    # CQ-0180: cycles を転送
+                    cycles = run_summary.get("phase_stats", {}).get("cycles")
+                    if cycles is not None:
+                        entry["cycles"] = cycles
         else:
             entry["error"] = r.get("error", "unknown")
         runs_info.append(entry)
@@ -191,6 +203,163 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
             rc_agg["shanten_delta_enabled"] = True
         if rc_agg:
             aggregate["reward_composition"] = rc_agg
+
+    # CQ-0174: eval_before 集約
+    eb_list = [
+        entry["eval_before"]
+        for entry in runs_info
+        if entry.get("eval_before")
+    ]
+    if eb_list:
+        aggregate["eval_before"] = _compute_aggregate_generic(
+            eb_list,
+            ["avg_rank", "avg_score", "win_rate", "deal_in_rate"],
+        )
+
+    # CQ-0174: phase_timing 集約
+    pt_list = [
+        entry["phase_timing"]
+        for entry in runs_info
+        if entry.get("phase_timing")
+    ]
+    if pt_list:
+        # 全 run に出現するフェーズ名を集める
+        all_phases: set[str] = set()
+        for pt in pt_list:
+            all_phases.update(pt.keys())
+        pt_agg: dict = {}
+        for phase_name in sorted(all_phases):
+            durations = [
+                pt[phase_name]["duration_sec"]
+                for pt in pt_list
+                if phase_name in pt and pt[phase_name].get("duration_sec") is not None
+            ]
+            if durations:
+                n = len(durations)
+                mean = sum(durations) / n
+                if n > 1:
+                    variance = sum((d - mean) ** 2 for d in durations) / (n - 1)
+                    std = variance ** 0.5
+                else:
+                    std = 0.0
+                pt_agg[phase_name] = {
+                    "mean": round(mean, 3),
+                    "std": round(std, 3),
+                    "count": n,
+                }
+        # total_duration_sec も集約
+        total_durations = []
+        for entry in runs_info:
+            if entry.get("phase_timing"):
+                total = sum(
+                    p.get("duration_sec", 0)
+                    for p in entry["phase_timing"].values()
+                    if p.get("duration_sec") is not None
+                )
+                total_durations.append(total)
+        if total_durations:
+            n = len(total_durations)
+            mean = sum(total_durations) / n
+            if n > 1:
+                variance = sum((d - mean) ** 2 for d in total_durations) / (n - 1)
+                std = variance ** 0.5
+            else:
+                std = 0.0
+            pt_agg["total"] = {
+                "mean": round(mean, 3),
+                "std": round(std, 3),
+                "count": n,
+            }
+        if pt_agg:
+            aggregate["phase_timing"] = pt_agg
+
+    # CQ-0180: cycle 別 aggregate
+    # 各 run の cycles を cycle_index でまとめて集約
+    all_cycles = [entry["cycles"] for entry in runs_info if entry.get("cycles")]
+    if all_cycles:
+        # cycle_index ごとにメトリクスを集める
+        max_cycles = max(len(c) for c in all_cycles)
+        cycle_agg: list[dict] = []
+        _CYCLE_EVAL_KEYS = ["avg_rank", "avg_score", "win_rate", "deal_in_rate"]
+        _CYCLE_DIAG_KEYS = ["clip_fraction", "ratio_std",
+                            "advantage_abs_mean_before_clip"]
+        for ci in range(max_cycles):
+            ci_entries = [c[ci] for c in all_cycles if ci < len(c)]
+            ci_agg: dict = {"cycle_index": ci, "count": len(ci_entries)}
+            # eval avg_rank 集約
+            eval_dicts = [e["eval"] for e in ci_entries if e.get("eval")]
+            if eval_dicts:
+                ci_agg["eval"] = _compute_aggregate_generic(
+                    eval_dicts, _CYCLE_EVAL_KEYS)
+            # eval_diff 集約
+            diff_ranks = [
+                e["eval_diff"]["avg_rank"]["delta"]
+                for e in ci_entries
+                if e.get("eval_diff") and "avg_rank" in e["eval_diff"]
+            ]
+            if diff_ranks:
+                n = len(diff_ranks)
+                mean = sum(diff_ranks) / n
+                std = (sum((v - mean) ** 2 for v in diff_ranks) / (n - 1)) ** 0.5 if n > 1 else 0.0
+                ci_agg["eval_diff_avg_rank"] = {
+                    "mean": round(mean, 6), "std": round(std, 6), "count": n}
+            # learner_diag 集約
+            diag_dicts = [e["learner_diag"] for e in ci_entries if e.get("learner_diag")]
+            if diag_dicts:
+                ld_agg = _compute_aggregate_generic(diag_dicts, _CYCLE_DIAG_KEYS)
+                # CQ-0200: teacher_agreement 集約
+                ta_list = [d["teacher_agreement"] for d in diag_dicts
+                           if d.get("teacher_agreement") and d["teacher_agreement"].get("enabled")]
+                if ta_list:
+                    _TA_KEYS = [
+                        "action_match_rate_before", "action_match_rate_after",
+                        "best_set_hit_rate_before", "best_set_hit_rate_after",
+                        "num_baseline_samples", "num_best_set_samples",
+                    ]
+                    ld_agg["teacher_agreement"] = _compute_aggregate_generic(ta_list, _TA_KEYS)
+                ci_agg["learner_diag"] = ld_agg
+            # CQ-0189: actor_type_counts 集約
+            atc_list = [e["actor_type_counts"] for e in ci_entries if e.get("actor_type_counts")]
+            if atc_list:
+                atc_agg: dict = {}
+                for key in ("policy", "baseline"):
+                    vals = [a.get(key, 0) for a in atc_list]
+                    if any(v > 0 for v in vals):
+                        n = len(vals)
+                        mean = sum(vals) / n
+                        atc_agg[key] = {"mean": round(mean, 1), "count": n}
+                if atc_agg:
+                    ci_agg["actor_type_counts"] = atc_agg
+            # CQ-0189: learner_stages 集約
+            ls_list = [e["learner_stages"] for e in ci_entries if e.get("learner_stages")]
+            if ls_list:
+                ls_agg: dict = {}
+                # baseline_imitation
+                bl_entries = [ls["baseline_imitation"] for ls in ls_list
+                              if ls.get("baseline_imitation")]
+                if bl_entries:
+                    executed_count = sum(1 for b in bl_entries if b.get("executed"))
+                    bl_agg_data: dict = {
+                        "executed_count": executed_count,
+                        "total_count": len(bl_entries),
+                    }
+                    bl_exec = [b for b in bl_entries if b.get("executed")]
+                    if bl_exec:
+                        bl_agg_data.update(_compute_aggregate_generic(
+                            bl_exec, ["used_samples", "policy_loss"]))
+                    ls_agg["baseline_imitation"] = bl_agg_data
+                # policy_ppo
+                pp_entries = [ls["policy_ppo"] for ls in ls_list
+                              if ls.get("policy_ppo")]
+                if pp_entries:
+                    pp_exec = [p for p in pp_entries if p.get("executed")]
+                    if pp_exec:
+                        ls_agg["policy_ppo"] = _compute_aggregate_generic(
+                            pp_exec, ["used_samples", "policy_loss"])
+                if ls_agg:
+                    ci_agg["learner_stages"] = ls_agg
+            cycle_agg.append(ci_agg)
+        aggregate["cycles"] = cycle_agg
 
     summary = {
         "num_seeds": len(seeds),

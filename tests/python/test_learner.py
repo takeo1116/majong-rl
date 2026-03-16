@@ -1530,3 +1530,481 @@ class TestPostRiichiExclusion:
         assert "post_riichi_exclusion" in metrics
         exc = metrics["post_riichi_exclusion"]
         assert exc["excluded_post_riichi_discards"] > 0
+
+
+class TestValueLossStabilization:
+    """value_loss / advantage 安定化テスト (CQ-0176)"""
+
+    def test_default_mse(self, tmp_path: Path):
+        """デフォルトは mse で既存挙動維持"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)
+        config = _make_config()
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        assert "ppo_diag" in metrics
+        diag = metrics["ppo_diag"]
+        assert diag["value_loss_type"] == "mse"
+        assert diag["advantage_clip_fraction"] == 0.0
+        assert "advantage_clip_value" not in diag
+
+    def test_huber_loss(self, tmp_path: Path):
+        """huber loss が有効になる"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["value_loss"] = {"type": "huber", "huber_delta": 0.5}
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        assert metrics["ppo_diag"]["value_loss_type"] == "huber"
+
+    def test_advantage_clip(self, tmp_path: Path):
+        """advantage clip が有効になり診断値が出る"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["advantage_stabilization"] = {"clip": 1.0}
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        diag = metrics["ppo_diag"]
+        assert "advantage_abs_mean_before_clip" in diag
+        assert "advantage_abs_mean_after_clip" in diag
+        assert "advantage_clip_fraction" in diag
+        assert "advantage_clip_value" in diag
+        assert diag["advantage_clip_value"] == 1.0
+        assert diag["advantage_abs_mean_after_clip"] <= diag["advantage_abs_mean_before_clip"] + 1e-6
+
+    def test_combined_huber_and_clip(self, tmp_path: Path):
+        """huber + advantage clip の併用"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["value_loss"] = {"type": "huber", "huber_delta": 1.0}
+        config["training"]["advantage_stabilization"] = {"clip": 2.0}
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        diag = metrics["ppo_diag"]
+        assert diag["value_loss_type"] == "huber"
+        assert diag["advantage_clip_value"] == 2.0
+
+
+class TestStabilizationValidation:
+    """安定化設定の入力検証テスト (CQ-0177)"""
+
+    def test_invalid_value_loss_type(self, tmp_path: Path):
+        """不正な value_loss.type で ValueError"""
+        config = _make_config()
+        config["training"]["value_loss"] = {"type": "l1"}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="value_loss.type"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_advantage_clip_zero(self, tmp_path: Path):
+        """advantage_stabilization.clip=0 で ValueError"""
+        config = _make_config()
+        config["training"]["advantage_stabilization"] = {"clip": 0}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="advantage_stabilization.clip"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_advantage_clip_negative(self, tmp_path: Path):
+        """advantage_stabilization.clip=-1 で ValueError"""
+        config = _make_config()
+        config["training"]["advantage_stabilization"] = {"clip": -1.0}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="advantage_stabilization.clip"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_advantage_clip_string(self, tmp_path: Path):
+        """advantage_stabilization.clip=文字列 で ValueError"""
+        config = _make_config()
+        config["training"]["advantage_stabilization"] = {"clip": "auto"}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="advantage_stabilization.clip"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_valid_mse(self, tmp_path: Path):
+        """mse は正常に通る"""
+        config = _make_config()
+        config["training"]["value_loss"] = {"type": "mse"}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        assert learner._value_loss_type == "mse"
+
+    def test_valid_huber(self, tmp_path: Path):
+        """huber は正常に通る"""
+        config = _make_config()
+        config["training"]["value_loss"] = {"type": "huber"}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        assert learner._value_loss_type == "huber"
+
+    def test_valid_clip_positive(self, tmp_path: Path):
+        """正のclipは正常に通る"""
+        config = _make_config()
+        config["training"]["advantage_stabilization"] = {"clip": 3.0}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        assert learner._advantage_clip == 3.0
+
+
+class TestStabilizationValidationExtended:
+    """安定化設定の入力検証強化テスト (CQ-0178)"""
+
+    def test_huber_delta_zero(self, tmp_path: Path):
+        config = _make_config()
+        config["training"]["value_loss"] = {"type": "huber", "huber_delta": 0}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="huber_delta"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_huber_delta_negative(self, tmp_path: Path):
+        config = _make_config()
+        config["training"]["value_loss"] = {"type": "huber", "huber_delta": -1.0}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="huber_delta"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_huber_delta_nan(self, tmp_path: Path):
+        config = _make_config()
+        config["training"]["value_loss"] = {"type": "huber", "huber_delta": float("nan")}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="huber_delta"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_clip_nan(self, tmp_path: Path):
+        config = _make_config()
+        config["training"]["advantage_stabilization"] = {"clip": float("nan")}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="advantage_stabilization.clip"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_clip_inf(self, tmp_path: Path):
+        config = _make_config()
+        config["training"]["advantage_stabilization"] = {"clip": float("inf")}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="advantage_stabilization.clip"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_clip_bool_true(self, tmp_path: Path):
+        config = _make_config()
+        config["training"]["advantage_stabilization"] = {"clip": True}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="advantage_stabilization.clip"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_clip_bool_false(self, tmp_path: Path):
+        config = _make_config()
+        config["training"]["advantage_stabilization"] = {"clip": False}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        with pytest.raises(ValueError, match="advantage_stabilization.clip"):
+            Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+    def test_valid_huber_delta_positive(self, tmp_path: Path):
+        config = _make_config()
+        config["training"]["value_loss"] = {"type": "huber", "huber_delta": 0.5}
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        assert learner._huber_delta == 0.5
+
+
+def _setup_anchor_run(tmp_path: Path, obs_dim: int = 100, n: int = 80):
+    """anchor テスト用の shard + imitation checkpoint を準備する"""
+    run_dir = tmp_path / "run"
+    shard_dir = run_dir / "shards"
+    _write_dummy_shards(shard_dir, n=n, obs_dim=obs_dim)
+    # imitation checkpoint を作成
+    model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+    ckpt_dir = run_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save({"model_state_dict": model.state_dict()}, ckpt_dir / "checkpoint_imitation.pt")
+    return run_dir, shard_dir, obs_dim
+
+
+class TestPolicyAnchor:
+    """policy anchor (参照方策アンカー) テスト (CQ-0182)"""
+
+    def test_anchor_disabled_default(self, tmp_path: Path):
+        """デフォルト (enabled=false) で既存挙動維持"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)
+        config = _make_config()
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        assert "ppo_diag" in metrics
+        pa = metrics["ppo_diag"]["policy_anchor"]
+        assert pa["enabled"] is False
+        assert "anchor_loss_mean" not in pa
+
+    def test_anchor_kl(self, tmp_path: Path):
+        """type=kl で学習完走し診断キーが出る"""
+        run_dir, shard_dir, obs_dim = _setup_anchor_run(tmp_path)
+        config = _make_config()
+        config["training"]["policy_anchor"] = {
+            "enabled": True, "type": "kl", "coef": 0.1,
+            "reference": "imitation_fixed",
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=run_dir)
+        metrics = learner.train(shard_dir)
+        assert "ppo_diag" in metrics
+        pa = metrics["ppo_diag"]["policy_anchor"]
+        assert pa["enabled"] is True
+        assert pa["type"] == "kl"
+        assert pa["coef"] == 0.1
+        assert "anchor_loss_mean" in pa
+        assert "anchor_kl_mean" in pa
+        assert pa["anchor_loss_mean"] >= 0
+
+    def test_anchor_bc(self, tmp_path: Path):
+        """type=bc で学習完走し診断キーが出る"""
+        run_dir, shard_dir, obs_dim = _setup_anchor_run(tmp_path)
+        config = _make_config()
+        config["training"]["policy_anchor"] = {
+            "enabled": True, "type": "bc", "coef": 0.05,
+            "reference": "imitation_fixed",
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=run_dir)
+        metrics = learner.train(shard_dir)
+        pa = metrics["ppo_diag"]["policy_anchor"]
+        assert pa["enabled"] is True
+        assert pa["type"] == "bc"
+        assert "anchor_ce_mean" in pa
+
+    def test_missing_checkpoint_error(self, tmp_path: Path):
+        """checkpoint_imitation.pt 欠落時に PPO 学習で FileNotFoundError (CQ-0183)"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["policy_anchor"] = {
+            "enabled": True, "type": "kl", "coef": 0.1,
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        # __init__ は成功する (遅延ロード)
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        # train() 時に PPO が参照モデルをロードしようとして失敗
+        with pytest.raises(FileNotFoundError, match="checkpoint_imitation"):
+            learner.train(shard_dir)
+
+    def test_imitation_with_anchor_config_ok(self, tmp_path: Path):
+        """CQ-0183: imitation フェーズで anchor 設定があっても例外にならない"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)
+        config = _make_config()
+        config["training"]["algorithm"] = "imitation"
+        config["training"]["epochs"] = 1
+        config["training"]["policy_anchor"] = {
+            "enabled": True, "type": "kl", "coef": 0.1,
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        # imitation では checkpoint_imitation.pt が不在でも問題ない
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        # imitation は ppo_diag を出さないので anchor 診断もない
+        assert metrics.get("mode") == "imitation"
+        assert "ppo_diag" not in metrics
+
+    def test_invalid_type(self, tmp_path: Path):
+        """不正な type で ValueError"""
+        run_dir, _, obs_dim = _setup_anchor_run(tmp_path)
+        config = _make_config()
+        config["training"]["policy_anchor"] = {
+            "enabled": True, "type": "l2", "coef": 0.1,
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        with pytest.raises(ValueError, match="policy_anchor.type"):
+            Learner(config=config, model=model, run_dir=run_dir)
+
+    def test_invalid_coef(self, tmp_path: Path):
+        """coef=0 で ValueError"""
+        run_dir, _, obs_dim = _setup_anchor_run(tmp_path)
+        config = _make_config()
+        config["training"]["policy_anchor"] = {
+            "enabled": True, "type": "kl", "coef": 0,
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        with pytest.raises(ValueError, match="policy_anchor.coef"):
+            Learner(config=config, model=model, run_dir=run_dir)
+
+    def test_invalid_reference(self, tmp_path: Path):
+        """不正な reference で ValueError"""
+        run_dir, _, obs_dim = _setup_anchor_run(tmp_path)
+        config = _make_config()
+        config["training"]["policy_anchor"] = {
+            "enabled": True, "type": "kl", "coef": 0.1,
+            "reference": "latest",
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        with pytest.raises(ValueError, match="policy_anchor.reference"):
+            Learner(config=config, model=model, run_dir=run_dir)
+
+
+def _write_mixed_shards(shard_dir: Path, n: int = 80, obs_dim: int = 100,
+                         post_riichi_ratio: float = 0.3):
+    """policy/baseline 混合 shard (post_riichi 付き)"""
+    writer = ShardWriter(shard_dir, max_samples=10000)
+    for i in range(n):
+        is_bl = (i % 4 == 0)  # 25% baseline
+        is_pr = (i < int(n * post_riichi_ratio))
+        writer.add(LearningSample(
+            observation=np.random.randn(obs_dim).astype(np.float32),
+            legal_mask=(np.random.rand(34) > 0.5).astype(np.float32),
+            action=np.random.randint(0, 34),
+            reward=np.random.randn() * 0.01,
+            log_prob=-np.random.rand(),
+            value=np.random.randn() * 0.1,
+            terminated=(i == n - 1),
+            round_over=(i % 20 == 19),
+            experiment_id="dummy_exp",
+            run_id="dummy_run",
+            worker_id="dummy_worker",
+            episode_id="dummy_ep",
+            step_id=i,
+            actor_type="baseline" if is_bl else "policy",
+            is_post_riichi_discard=is_pr,
+        ))
+    writer.close()
+
+
+class TestMixedPPOActorSync:
+    """mixed PPO の actor_types 同期テスト (CQ-0194)"""
+
+    def test_mixed_ppo_with_exclude_post_riichi(self, tmp_path: Path):
+        """exclude_post_riichi + mixed PPO で actor_types がズレない"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_mixed_shards(shard_dir, n=80, obs_dim=obs_dim, post_riichi_ratio=0.3)
+        config = _make_config()
+        config["training"]["exclude_post_riichi_discards"] = {"enabled": True}
+        config["training"]["rule_mix_learner"] = {
+            "ppo_mode": "mixed",
+            "baseline_sample_weight": 0.5,
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        assert "ppo_diag" in metrics
+        mp = metrics["ppo_diag"]["mixed_ppo"]
+        # 件数合計 == total_steps
+        assert mp["num_policy_samples"] + mp["num_baseline_samples"] == metrics["total_steps"]
+
+    def test_separated_default_backward_compat(self, tmp_path: Path):
+        """separated (default) で既存挙動維持"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)
+        config = _make_config()
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        mp = metrics["ppo_diag"]["mixed_ppo"]
+        assert mp["mixed_ppo_enabled"] is False
+
+
+class TestTeacherAgreement:
+    """teacher_agreement 診断テスト (CQ-0199)"""
+
+    def test_with_baseline_samples(self, tmp_path: Path):
+        """baseline サンプルありで teacher_agreement が出力される"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_mixed_shards(shard_dir, n=80, obs_dim=obs_dim, post_riichi_ratio=0.0)
+        config = _make_config()
+        config["training"]["rule_mix_learner"] = {
+            "ppo_mode": "mixed", "baseline_sample_weight": 1.0,
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        ta = metrics["ppo_diag"]["teacher_agreement"]
+        assert ta["enabled"] is True
+        assert ta["num_baseline_samples"] > 0
+        assert 0.0 <= ta["action_match_rate_before"] <= 1.0
+        assert 0.0 <= ta["action_match_rate_after"] <= 1.0
+
+    def test_no_baseline_samples(self, tmp_path: Path):
+        """baseline 0件で skip になる"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_dummy_shards(shard_dir, n=80, obs_dim=obs_dim)  # actor_type 未設定 = policy-like
+        config = _make_config()
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        ta = metrics["ppo_diag"]["teacher_agreement"]
+        assert ta["enabled"] is False
+
+    def test_no_teacher_best_masks(self, tmp_path: Path):
+        """teacher_best_masks なしで best_set_hit_rate が null"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        _write_mixed_shards(shard_dir, n=80, obs_dim=obs_dim, post_riichi_ratio=0.0)
+        config = _make_config()
+        config["training"]["rule_mix_learner"] = {
+            "ppo_mode": "mixed", "baseline_sample_weight": 1.0,
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        ta = metrics["ppo_diag"]["teacher_agreement"]
+        assert ta["enabled"] is True
+        assert ta["num_best_set_samples"] == 0
+        assert ta["best_set_hit_rate_before"] is None
+        assert ta["best_set_hit_rate_after"] is None
+
+    def test_with_teacher_best_masks(self, tmp_path: Path):
+        """CQ-0201: teacher_best_masks ありで best_set_hit_rate が正常算出"""
+        obs_dim = 100
+        shard_dir = tmp_path / "shards"
+        # baseline + teacher_best_mask 付き shard を作成
+        writer = ShardWriter(shard_dir, max_samples=10000)
+        for i in range(80):
+            is_bl = (i % 4 == 0)
+            tbm = None
+            if is_bl:
+                tbm = np.zeros(34, dtype=np.float32)
+                tbm[i % 34] = 1.0  # best action
+                tbm[(i + 1) % 34] = 1.0  # 2nd best
+            writer.add(LearningSample(
+                observation=np.random.randn(obs_dim).astype(np.float32),
+                legal_mask=(np.random.rand(34) > 0.3).astype(np.float32),
+                action=i % 34,
+                reward=np.random.randn() * 0.01,
+                log_prob=-np.random.rand(),
+                value=np.random.randn() * 0.1,
+                terminated=(i == 79),
+                round_over=(i % 20 == 19),
+                experiment_id="dummy", run_id="dummy", worker_id="w0",
+                episode_id="ep0", step_id=i,
+                actor_type="baseline" if is_bl else "policy",
+                teacher_best_mask=tbm,
+            ))
+        writer.close()
+
+        config = _make_config()
+        config["training"]["rule_mix_learner"] = {
+            "ppo_mode": "mixed", "baseline_sample_weight": 1.0,
+        }
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[16])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        ta = metrics["ppo_diag"]["teacher_agreement"]
+        assert ta["enabled"] is True
+        assert ta["num_best_set_samples"] > 0
+        assert ta["best_set_hit_rate_before"] is not None
+        assert 0.0 <= ta["best_set_hit_rate_before"] <= 1.0
+        assert ta["best_set_hit_rate_after"] is not None
+        assert 0.0 <= ta["best_set_hit_rate_after"] <= 1.0

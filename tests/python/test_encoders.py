@@ -766,3 +766,72 @@ class TestCppBindingKeyContract:
         assert isinstance(result["best_acceptance"], int)
         assert isinstance(result["best_tile"], int)
         assert len(result["best_mask"]) == 34
+
+
+class TestTurnContext:
+    """turn/time 文脈特徴テスト (CQ-0175)"""
+
+    def test_off_preserves_partial_dim(self):
+        enc = FlatFeatureEncoder(observation_mode="partial", turn_context=False)
+        assert enc.metadata().output_shape == (353,)
+
+    def test_on_adds_4_partial(self):
+        enc = FlatFeatureEncoder(observation_mode="partial", turn_context=True)
+        assert enc.metadata().output_shape == (357,)
+
+    def test_on_adds_4_full(self):
+        enc = FlatFeatureEncoder(observation_mode="full", turn_context=True)
+        assert enc.metadata().output_shape == (459,)
+
+    def test_metadata_matches_output_partial(self, partial_obs):
+        enc = FlatFeatureEncoder(observation_mode="partial", turn_context=True)
+        result = enc.encode(partial_obs)
+        assert result.shape == enc.metadata().output_shape
+
+    def test_metadata_matches_output_full(self, full_obs):
+        enc = FlatFeatureEncoder(observation_mode="full", turn_context=True)
+        result = enc.encode(full_obs)
+        assert result.shape == enc.metadata().output_shape
+
+    def test_turn_progress_range(self, partial_obs):
+        enc = FlatFeatureEncoder(observation_mode="partial", turn_context=True)
+        result = enc.encode(partial_obs)
+        tc = result[353:]
+        assert tc.shape == (4,)
+        progress = tc[0]
+        assert 0.0 <= progress <= 1.0
+
+    def test_bucket_one_hot(self):
+        """各巡目で exactly 1 つの bucket が立つ"""
+        for turn in range(18):
+            ctx = FlatFeatureEncoder._compute_turn_context(turn)
+            assert ctx.shape == (4,)
+            bucket = ctx[1:]
+            assert bucket.sum() == 1.0, f"turn={turn}: bucket={bucket}"
+
+    def test_early_mid_late_boundaries(self):
+        """early(0-5), mid(6-11), late(12-17) の境界"""
+        # early
+        for turn in [0, 3, 5]:
+            ctx = FlatFeatureEncoder._compute_turn_context(turn)
+            assert ctx[1] == 1.0, f"turn={turn} should be early"
+        # mid
+        for turn in [6, 9, 11]:
+            ctx = FlatFeatureEncoder._compute_turn_context(turn)
+            assert ctx[2] == 1.0, f"turn={turn} should be mid"
+        # late
+        for turn in [12, 15, 17]:
+            ctx = FlatFeatureEncoder._compute_turn_context(turn)
+            assert ctx[3] == 1.0, f"turn={turn} should be late"
+
+    def test_combined_all_features(self):
+        enc = FlatFeatureEncoder(
+            observation_mode="partial",
+            shanten_hint=True,
+            discard_ukeire_hint=True,
+            current_shanten_input=True,
+            shape_hint=True,
+            turn_context=True,
+        )
+        # 353 + 34 + 34 + 1 + 66 + 4 = 492
+        assert enc.metadata().output_shape == (492,)

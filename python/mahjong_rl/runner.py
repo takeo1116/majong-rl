@@ -137,6 +137,7 @@ def _rebuild_encoder(encoder_config: dict, obs_mode: str):
         discard_ukeire_hint=_parse_encoder_flag(encoder_config, "discard_ukeire_hint"),
         current_shanten_input=_parse_encoder_flag(encoder_config, "current_shanten"),
         shape_hint=_parse_encoder_flag(encoder_config, "shape_hint"),
+        turn_context=_parse_encoder_flag(encoder_config, "turn_context"),
     )
 
 
@@ -734,48 +735,282 @@ class Stage1Runner:
                     return result
 
             elif phase == "learner":
-                # 学習前評価 (eval も phases に含まれる場合のみ)
-                if "eval" in phases:
-                    if "eval_before" in completed_phases:
-                        # CQ-0111: eval_before スキップ
-                        logger.info(f"{label} eval_before はスキップ（完了済み）")
-                        # CQ-0115: phase_action に記録
-                        phase_action["eval_before"] = "skipped"
-                        self._restore_phase_result(run_dir, "eval_before", result)
-                    else:
-                        _record_start("eval_before")
-                        try:
-                            logger.info(f"{label} 学習前評価 (eval_before)")
-                            eval_before_dir = run_dir / "eval_before"
-                            result["eval_before"] = self._run_eval(
-                                run_dir, model, encoder, obs_mode,
-                                eval_dir_override=eval_before_dir)
-                            logger.info(f"  eval_before avg_rank: {result['eval_before'].get('avg_rank', '?')}")
-                            _record_end("eval_before")
-                        except Exception as e:
-                            logger.warning(f"  学習前評価をスキップ: {e}")
-                            _record_end("eval_before")
+                # CQ-0179: multi-cycle 判定
+                mc_cfg = self._config.training.get("multi_cycle", {})
+                mc_enabled = mc_cfg.get("enabled", False)
+                num_cycles = mc_cfg.get("num_cycles", 1) if mc_enabled else 1
 
-                logger.info(f"{label} learner 学習")
-                _record_start("learner")
-                profiler.start("learner_total")
-                try:
-                    selfplay_dir = run_dir / "selfplay"
-                    result["train_metrics"] = self._run_learner(
-                        run_dir, selfplay_dir, model, profiler)
-                    phase_status["learner"] = "success"
-                    profiler.stop("learner_total")
-                    _record_end("learner")
-                except Exception as e:
-                    logger.error(f"  learner フェーズで失敗: {e}")
-                    result["error"] = f"learner: {e}"
-                    phase_status["learner"] = "failed"
-                    result["total_duration_sec"] = round(
-                        (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
-                    self._finalize(run_dir, result, phase_status, file_handler)
-                    return result
+                if num_cycles > 1:
+                    # --- multi-cycle 反復 (CQ-0179, CQ-0181, CQ-0184/0185/0186) ---
+                    logger.info(f"{label} multi-cycle 学習 ({num_cycles} cycles)")
+                    _record_start("learner")
+                    profiler.start("learner_total")
+                    cycles_data: list[dict] = []
+                    _mc_eval_done = False  # CQ-0181: eval 実施有無を追跡
+                    try:
+                        sp_matches = mc_cfg.get(
+                            "selfplay_matches_per_cycle",
+                            self._config.selfplay.get("num_matches", 10))
+                        eval_each = mc_cfg.get("eval_each_cycle", True)
+                        orig_num_matches = self._config.selfplay.get("num_matches", 10)
+                        orig_seed_start = self._config.selfplay.get("seed_start", 0)
+
+                        # CQ-0184: rule_mix 設定
+                        rm_cfg = self._config.training.get("rule_mix", {})
+                        rm_enabled = rm_cfg.get("enabled", False)
+                        rm_policy_ratio = rm_cfg.get("policy_ratio", 1.0)
+                        rm_save_baseline = rm_cfg.get("save_baseline_actions", False)
+                        orig_policy_ratio = self._config.selfplay.get("policy_ratio", 0.5)
+                        orig_save_baseline = self._config.selfplay.get("save_baseline_actions", False)
+
+                        # CQ-0185: rule_mix_learner 設定
+                        rml_cfg = self._config.training.get("rule_mix_learner", {})
+                        rml_enabled = rml_cfg.get("enabled", False)
+                        rml_bl_epochs = rml_cfg.get("baseline_imitation_epochs", 0)
+                        rml_ppo_epochs = rml_cfg.get("policy_ppo_epochs",
+                                                      self._config.training.get("epochs", 4))
+                        rml_order = rml_cfg.get("order", "baseline_then_policy")
+                        rml_ppo_mode = rml_cfg.get("ppo_mode", "separated")
+                        if rml_enabled and rml_order != "baseline_then_policy" and rml_ppo_mode == "separated":
+                            raise ValueError(
+                                f"training.rule_mix_learner.order は"
+                                f" 'baseline_then_policy' のみ対応: {rml_order!r}")
+                        if rml_ppo_mode not in ("separated", "mixed"):
+                            raise ValueError(
+                                f"training.rule_mix_learner.ppo_mode は"
+                                f" 'separated' or 'mixed': {rml_ppo_mode!r}")
+
+                        for ci in range(num_cycles):
+                            cyc_label = f"cycle_{ci:02d}"
+                            cyc_dir = run_dir / cyc_label
+                            cyc_dir.mkdir(parents=True, exist_ok=True)
+                            logger.info(f"  === {cyc_label} ({ci+1}/{num_cycles}) ===")
+                            cycle_entry: dict = {"cycle_index": ci}
+
+                            # cycle eval_before
+                            if eval_each and "eval" in phases:
+                                try:
+                                    eb_dir = cyc_dir / "eval_before"
+                                    eb = self._run_eval(
+                                        run_dir, model, encoder, obs_mode,
+                                        eval_dir_override=eb_dir)
+                                    cycle_entry["eval_before"] = eb
+                                    logger.info(
+                                        "    eval_before avg_rank: %s, avg_score: %s",
+                                        eb.get("avg_rank", "?"),
+                                        eb.get("avg_score", "?"),
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"    cycle eval_before をスキップ: {e}")
+
+                            # CQ-0184: cycle selfplay — rule_mix 適用
+                            cyc_sp_dir = cyc_dir / "selfplay"
+                            self._config.selfplay["num_matches"] = sp_matches
+                            self._config.selfplay["seed_start"] = orig_seed_start + ci * sp_matches
+                            if rm_enabled:
+                                self._config.selfplay["policy_ratio"] = rm_policy_ratio
+                                self._config.selfplay["save_baseline_actions"] = rm_save_baseline
+                            try:
+                                sp_stats = self._run_selfplay(
+                                    cyc_dir, model, encoder, profiler)
+                            finally:
+                                self._config.selfplay["num_matches"] = orig_num_matches
+                                self._config.selfplay["seed_start"] = orig_seed_start
+                                if rm_enabled:
+                                    self._config.selfplay["policy_ratio"] = orig_policy_ratio
+                                    self._config.selfplay["save_baseline_actions"] = orig_save_baseline
+                            cycle_entry["selfplay_stats"] = {
+                                "total_steps": sp_stats.get("total_steps", 0),
+                                "num_matches": sp_stats.get("num_matches", 0),
+                            }
+                            # CQ-0186, CQ-0190: actor_type_counts (shard から集計)
+                            atc = self._count_actor_types(cyc_dir)
+                            if atc:
+                                cycle_entry["actor_type_counts"] = atc
+                            logger.info(f"    selfplay steps: {sp_stats.get('total_steps', 0)}")
+
+                            # CQ-0185, CQ-0187, CQ-0188, CQ-0192: cycle learner
+                            learner_stages: dict = {}
+                            if rml_enabled and rm_enabled and rml_ppo_mode == "mixed":
+                                # CQ-0192: mixed PPO — baseline/policy 混合で1段学習
+                                logger.info(f"    mixed PPO ({rml_ppo_epochs} epochs)")
+                                tm = self._run_learner(
+                                    run_dir, cyc_sp_dir, model, profiler,
+                                    checkpoint_tag=f"cycle_{ci:02d}",
+                                    override_epochs=rml_ppo_epochs,
+                                    filter_actor_type=None)  # 混合: filter なし
+                                learner_stages["mixed_ppo"] = {
+                                    "executed": True,
+                                    "used_samples": tm.get("total_steps", 0),
+                                    "policy_loss": tm.get("policy_loss", 0.0),
+                                    "mode": "mixed",
+                                }
+                                ppo_diag = tm.get("ppo_diag")
+                                if ppo_diag is not None:
+                                    learner_stages["mixed_ppo"]["ppo_diag"] = ppo_diag
+                            elif rml_enabled and rm_enabled:
+                                # separated: baseline BC → policy PPO
+                                if rml_bl_epochs > 0:
+                                    logger.info(f"    baseline BC ({rml_bl_epochs} epochs)")
+                                    _bl_count = cycle_entry.get("actor_type_counts", {}).get("baseline", 0)
+                                    if _bl_count == 0:
+                                        logger.info("    baseline サンプル 0 件 → BC スキップ")
+                                        learner_stages["baseline_imitation"] = {
+                                            "executed": False,
+                                            "skipped_reason": "no_baseline_samples",
+                                        }
+                                    else:
+                                        bl_tm = self._run_learner(
+                                            run_dir, cyc_sp_dir, model, profiler,
+                                            checkpoint_tag=f"cycle_{ci:02d}_bl",
+                                            override_algorithm="imitation",
+                                            override_epochs=rml_bl_epochs,
+                                            filter_actor_type="baseline")
+                                        learner_stages["baseline_imitation"] = {
+                                            "executed": True,
+                                            "used_samples": bl_tm.get("total_steps", 0),
+                                            "policy_loss": bl_tm.get("policy_loss", 0.0),
+                                            "teacher_top1_match_rate": bl_tm.get("teacher_top1_match_rate"),
+                                            "teacher_best_set_hit_rate": bl_tm.get("teacher_best_set_hit_rate"),
+                                        }
+
+                                logger.info(f"    policy PPO ({rml_ppo_epochs} epochs)")
+                                tm = self._run_learner(
+                                    run_dir, cyc_sp_dir, model, profiler,
+                                    checkpoint_tag=f"cycle_{ci:02d}",
+                                    override_epochs=rml_ppo_epochs,
+                                    filter_actor_type="policy")
+                                learner_stages["policy_ppo"] = {
+                                    "executed": True,
+                                    "used_samples": tm.get("total_steps", 0),
+                                    "policy_loss": tm.get("policy_loss", 0.0),
+                                }
+                                ppo_diag = tm.get("ppo_diag")
+                                if ppo_diag is not None:
+                                    learner_stages["policy_ppo"]["ppo_diag"] = ppo_diag
+                            else:
+                                # CQ-0187: rule_mix ON 時は PPO を policy-only に強制
+                                _filter = "policy" if rm_enabled else None
+                                tm = self._run_learner(
+                                    run_dir, cyc_sp_dir, model, profiler,
+                                    checkpoint_tag=f"cycle_{ci:02d}",
+                                    filter_actor_type=_filter)
+
+                            cycle_entry["train_metrics"] = {
+                                "policy_loss": tm.get("policy_loss", 0.0),
+                                "value_loss": tm.get("value_loss", 0.0),
+                                "total_steps": tm.get("total_steps", 0),
+                                "num_updates": tm.get("num_updates", 0),
+                            }
+                            ppo_diag = tm.get("ppo_diag")
+                            if ppo_diag is not None:
+                                cycle_entry["learner_diag"] = ppo_diag
+                            if learner_stages:
+                                cycle_entry["learner_stages"] = learner_stages
+                            logger.info(f"    policy_loss: {tm['policy_loss']:.4f}")
+
+                            # cycle eval_after
+                            if eval_each and "eval" in phases:
+                                try:
+                                    ea_dir = cyc_dir / "eval"
+                                    ea = self._run_eval(
+                                        run_dir, model, encoder, obs_mode,
+                                        eval_dir_override=ea_dir)
+                                    cycle_entry["eval"] = ea
+                                    _mc_eval_done = True
+                                    logger.info(
+                                        "    eval avg_rank: %s, avg_score: %s",
+                                        ea.get("avg_rank", "?"),
+                                        ea.get("avg_score", "?"),
+                                    )
+                                    # eval_diff
+                                    if "eval_before" in cycle_entry:
+                                        cycle_entry["eval_diff"] = compute_eval_diff(
+                                            cycle_entry["eval_before"], ea)
+                                except Exception as e:
+                                    logger.warning(f"    cycle eval をスキップ: {e}")
+
+                            cycles_data.append(cycle_entry)
+
+                        # CQ-0181: 最終 cycle 基準で result に反映 (single-cycle 互換)
+                        last = cycles_data[-1]
+                        result["train_metrics"] = tm
+                        # eval_before/eval_diff は最終 cycle 基準
+                        if "eval_before" in last:
+                            result["eval_before"] = last["eval_before"]
+                        if "eval" in last:
+                            result["eval_metrics"] = last["eval"]
+                        if "eval_before" in last and "eval" in last:
+                            result["eval_diff"] = compute_eval_diff(
+                                last["eval_before"], last["eval"])
+                        result["cycles"] = cycles_data
+                        phase_status["learner"] = "success"
+                        # CQ-0181: eval の phase_status は実際に eval を実行した場合のみ
+                        if _mc_eval_done:
+                            phase_status["eval"] = "success"
+                        profiler.stop("learner_total")
+                        _record_end("learner")
+                    except Exception as e:
+                        logger.error(f"  multi-cycle で失敗: {e}")
+                        result["error"] = f"multi-cycle: {e}"
+                        result["cycles"] = cycles_data
+                        phase_status["learner"] = "failed"
+                        result["total_duration_sec"] = round(
+                            (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
+                        self._finalize(run_dir, result, phase_status, file_handler)
+                        return result
+                else:
+                    # --- single-cycle (既存動作) ---
+                    # 学習前評価 (eval も phases に含まれる場合のみ)
+                    if "eval" in phases:
+                        if "eval_before" in completed_phases:
+                            logger.info(f"{label} eval_before はスキップ（完了済み）")
+                            phase_action["eval_before"] = "skipped"
+                            self._restore_phase_result(run_dir, "eval_before", result)
+                        else:
+                            _record_start("eval_before")
+                            try:
+                                logger.info(f"{label} 学習前評価 (eval_before)")
+                                eval_before_dir = run_dir / "eval_before"
+                                result["eval_before"] = self._run_eval(
+                                    run_dir, model, encoder, obs_mode,
+                                    eval_dir_override=eval_before_dir)
+                                logger.info(
+                                    "  eval_before avg_rank: %s, avg_score: %s",
+                                    result["eval_before"].get("avg_rank", "?"),
+                                    result["eval_before"].get("avg_score", "?"),
+                                )
+                                _record_end("eval_before")
+                            except Exception as e:
+                                logger.warning(f"  学習前評価をスキップ: {e}")
+                                _record_end("eval_before")
+
+                    logger.info(f"{label} learner 学習")
+                    _record_start("learner")
+                    profiler.start("learner_total")
+                    try:
+                        selfplay_dir = run_dir / "selfplay"
+                        result["train_metrics"] = self._run_learner(
+                            run_dir, selfplay_dir, model, profiler)
+                        phase_status["learner"] = "success"
+                        profiler.stop("learner_total")
+                        _record_end("learner")
+                    except Exception as e:
+                        logger.error(f"  learner フェーズで失敗: {e}")
+                        result["error"] = f"learner: {e}"
+                        phase_status["learner"] = "failed"
+                        result["total_duration_sec"] = round(
+                            (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
+                        self._finalize(run_dir, result, phase_status, file_handler)
+                        return result
 
             elif phase == "eval":
+                # multi-cycle 時は learner phase 内で eval 済み
+                if result.get("cycles"):
+                    if "eval_metrics" in result:
+                        phase_status["eval"] = "success"
+                    continue
+
                 logger.info(f"{label} evaluator 評価")
                 _record_start("eval")
                 profiler.start("eval_total")
@@ -1185,18 +1420,29 @@ class Stage1Runner:
         return result
 
     def _run_learner(self, run_dir: Path, shard_dir: Path, model,
-                     profiler=None) -> dict:
-        """learner フェーズ"""
+                     profiler=None, checkpoint_tag: str = "final",
+                     override_algorithm: str | None = None,
+                     override_epochs: int | None = None,
+                     filter_actor_type: str | None = None) -> dict:
+        """learner フェーズ (CQ-0185: override パラメータ追加)"""
         training_device = resolve_device(
             self._config.training.get("device", "auto"))
+        # override_algorithm が指定された場合、一時的に config を差し替え
+        config_dict = self._as_dict()
+        if override_algorithm is not None:
+            config_dict = dict(config_dict)
+            config_dict["training"] = dict(config_dict.get("training", {}))
+            config_dict["training"]["algorithm"] = override_algorithm
         learner = Learner(
-            config=self._as_dict(),
+            config=config_dict,
             model=model,
             run_dir=run_dir,
             device=training_device,
         )
-        train_metrics = learner.train(shard_dir, profiler=profiler)
-        learner.save_checkpoint(tag="final")
+        train_metrics = learner.train(
+            shard_dir, num_epochs=override_epochs,
+            filter_actor_type=filter_actor_type, profiler=profiler)
+        learner.save_checkpoint(tag=checkpoint_tag)
         logger.info(f"  policy_loss: {train_metrics['policy_loss']:.4f}")
         return train_metrics
 
@@ -1527,6 +1773,7 @@ class Stage1Runner:
             discard_ukeire_hint=_parse_encoder_flag(enc_cfg, "discard_ukeire_hint"),
             current_shanten_input=_parse_encoder_flag(enc_cfg, "current_shanten"),
             shape_hint=_parse_encoder_flag(enc_cfg, "shape_hint"),
+            turn_context=_parse_encoder_flag(enc_cfg, "turn_context"),
         )
 
     def _create_model(self, encoder):
@@ -1675,6 +1922,16 @@ class Stage1Runner:
             fs = tm.get("filter_stats")
             if fs is not None:
                 phase_stats["learner"]["filter_stats"] = fs
+        # CQ-0174: eval_before を phase_stats に保存
+        if "eval_before" in result:
+            eb = result["eval_before"]
+            phase_stats["eval_before"] = {
+                "eval_mode": eb.get("eval_mode"),
+                "avg_rank": eb.get("avg_rank"),
+                "avg_score": eb.get("avg_score"),
+                "win_rate": eb.get("win_rate"),
+                "deal_in_rate": eb.get("deal_in_rate"),
+            }
         if "eval_metrics" in result:
             em = result["eval_metrics"]
             phase_stats["eval"] = {
@@ -1685,8 +1942,11 @@ class Stage1Runner:
                 "deal_in_rate": em.get("deal_in_rate"),
             }
 
-        # actor_type 内訳 (shard から集計)
-        actor_type_counts = self._count_actor_types(run_dir)
+        # actor_type 内訳 (shard から集計, summary 報告用なので失敗時は空)
+        try:
+            actor_type_counts = self._count_actor_types(run_dir)
+        except Exception:
+            actor_type_counts = {}
 
         # device 情報
         resolved = result.get("resolved_devices", {})
@@ -1704,6 +1964,11 @@ class Stage1Runner:
                 "resolved": resolved.get("evaluation", "cpu"),
             },
         }
+
+        # CQ-0179/CQ-0180: cycle 別メトリクスを phase_stats に追加
+        cycles = result.get("cycles")
+        if cycles:
+            phase_stats["cycles"] = cycles
 
         # CQ-0115: phase_action を取り出し（内部キーなので pop）
         phase_action = result.pop("_phase_action", {})
@@ -1738,6 +2003,7 @@ class Stage1Runner:
             "discard_ukeire_hint": _parse_encoder_flag(enc_cfg, "discard_ukeire_hint"),
             "current_shanten": _parse_encoder_flag(enc_cfg, "current_shanten"),
             "shape_hint": _parse_encoder_flag(enc_cfg, "shape_hint"),
+            "turn_context": _parse_encoder_flag(enc_cfg, "turn_context"),
             "input_dim": result.get("input_dim"),
         }
 
@@ -2117,7 +2383,11 @@ class Stage1Runner:
                 phase_status["eval_before"] = "reused"
 
     def _count_actor_types(self, run_dir: Path) -> dict[str, int]:
-        """shard ファイルから actor_type ごとの件数を集計する"""
+        """shard ファイルから actor_type ごとの件数を集計する (CQ-0190)
+
+        shard 読み取り失敗時は RuntimeError を送出する。
+        shard が存在しないディレクトリはスキップする。
+        """
         from mahjong_rl.shard import ShardReader
         counts: dict[str, int] = {}
         for subdir_name in ["selfplay", "imitation"]:
@@ -2131,8 +2401,9 @@ class Stage1Runner:
                 tensors = reader.read_as_tensors()
                 for at in tensors.get("actor_types", []):
                     counts[at] = counts.get(at, 0) + 1
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError(
+                    f"actor_type 集計に失敗しました ({subdir}): {e}") from e
         return counts
 
     def _append_notes(self, run_dir: Path, result: dict,
@@ -2157,6 +2428,7 @@ class Stage1Runner:
             "discard_ukeire_hint": _parse_encoder_flag(enc_cfg, "discard_ukeire_hint"),
             "current_shanten": _parse_encoder_flag(enc_cfg, "current_shanten"),
             "shape_hint": _parse_encoder_flag(enc_cfg, "shape_hint"),
+            "turn_context": _parse_encoder_flag(enc_cfg, "turn_context"),
         }
         _flag_str = ", ".join(f"{k}={'on' if v else 'off'}" for k, v in _flags.items())
         lines.append(f"- encoder: {enc_cfg.get('name', '?')} "
