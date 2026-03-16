@@ -1,6 +1,6 @@
 # PROJECT.md
 
-最終更新: 2026-03-13  
+最終更新: 2026-03-16  
 この文書の役割: プロジェクトの大目標・現在地・次アクションを短時間で復元する意思決定ハブ。
 
 ---
@@ -8,13 +8,14 @@
 ## 1. 北極星（不変）
 
 最終目標は、麻雀AIの学習基盤を段階的に拡張し、最終的に実戦ルールに近い環境で強い方策を学習できる状態に到達すること。  
-短期的には、**imitation 初期方策を PPO で壊さず改善する条件の確立**が最優先。
+短期的には、**imitation 初期方策を安定して超える更新設計の確立**が最優先。  
+現時点では「PPO を壊さず回す」段階はかなり進み、焦点は **学習信号の質** に移っている。
 
 ---
 
-## 2. 現在地（2026-03-13）
+## 2. 現在地（2026-03-16）
 
-フェーズ: **Stage1後半（post-fix 基準の再構築を終え、高表現力モデル + target/value 調整の有効域を探るフェーズ）**
+フェーズ: **Stage1後半（anchor / multi-cycle / rule-mix まで実装し、PPO の「更新設計そのもの」を見直すフェーズ）**
 
 - できている
   - runbook/report/driver 運用、phase 再利用、resume
@@ -25,11 +26,13 @@
   - reward scale バグの特定と修正、post-fix baseline の再取得
   - `exclude_post_riichi_discards` の導入と learner/batch 成果物化
   - 高表現力モデル（`hidden_dims=[512,256] + dual_towers`）の成立確認
+  - `policy_anchor` / `multi_cycle` / `rule_mix` / `mixed_ppo` の実装と完走確認
+  - 実行速度の大幅改善により `20 seeds x 20 cycles` 規模の検証が可能になった
 - 未解決
-  - 現行特徴量 + モデルに imitation だけでまだ伸びしろがあるか
-  - shaping の最適条件が post-fix / post-riichi-exclusion 条件でも有効か
-  - 高表現力モデルで、after 指標を改善しつつ PPO 後悪化をさらに縮める条件
-  - `same > 0 / improve < 0` の群平均構造が残っても、実用上どこまで問題か
+  - imitation 基準を長期的に安定して超える更新則
+  - rule データを actor 改善に結びつける学習信号設計
+  - `rule` 行動を PPO に入れるときの off-policy / target mismatch の扱い
+  - 現行 PPO で改善しない主因が「ハイパラ不足」なのか「更新目標の不整合」なのかの切り分け
 
 ---
 
@@ -37,8 +40,8 @@
 
 現在の主目的は次の2点。
 
-> 1. `exp_037 D` を高表現力 baseline 候補として固定し、データ量増加と shaping 再設定のどちらに伸びしろがあるかを判定する。  
-> 2. 現行特徴量 + モデルが imitation だけでどこまで伸びるかを確認し、PPO 改善余地の有無を切り分ける。
+> 1. `exp_050` / `exp_052` までで確認された「少し改善しても長期では沈む」挙動の原因を、更新設計レベルで切り分ける。  
+> 2. `rule` を教師候補として活かすなら、BC / separated learner / mixed PPO のどれが機能するのか、あるいはどれも足りないのかを明確にする。
 
 現行固定軸（診断基準点）:
 
@@ -52,7 +55,7 @@
 - `training.clip_epsilon=0.2`
 - `training.batch_size=512`
 - `training.gamma=0.99`
-- `training.gae_lambda=0.90`
+- `training.gae_lambda=0.85`
 - `training.exclude_post_riichi_discards.enabled=true`
 - `model.hidden_dims=[512,256]`
 - `model.policy_tower.enabled=true`
@@ -62,13 +65,18 @@
 - `reward.shaping.shanten_delta.scale=0.01`
 - `reward.shaping.shanten_delta.mode=both`
 - `reward.shaping.shanten_delta.schedule.type=linear_decay`
+- `training.policy_anchor.enabled=true`
+- `training.policy_anchor.type=kl`
+- `training.policy_anchor.coef=0.5`
+- `training.policy_anchor.reference=imitation_fixed`
+- `training.entropy_coef=0.0`
 
 評価の優先順:
 
-1. after 指標（`avg_rank`, `avg_score`, `win_rate`, `deal_in_rate`）
-2. `eval_before -> eval` の delta（悪化幅）
-3. learner 診断統計（`value_error/turn_diag/shanten_diag/ratio/clip_fraction`）
-4. imitation 改善量（特に `eval_before`）
+1. imitation 基準（`cycle0.eval_before`）に対して長期的に上回れるか
+2. after 指標（`avg_rank`, `avg_score`, `win_rate`, `deal_in_rate`）
+3. 各 cycle 内 `eval_before -> eval` 差分
+4. learner 診断統計（`ratio/clip_fraction/policy_anchor/mixed_ppo/shanten_diag`）
 
 ---
 
@@ -165,6 +173,26 @@
   - `coef=0.3` 単独は不採用
   - `gae_lambda=0.90 + coef=0.3`（D）が総合では最良候補
   - 現時点の主系列 baseline は `exp_037 D`
+- `exp_044`（turn_context / huber / advantage clip）
+  - `turn_context` は小幅改善、`huber` / `advantage clip` は決定打なし
+  - 「value の安定化だけで PPO 崩れを止める」のは不十分と判断
+- `exp_045`（long cycle 100, 1 seed）
+  - 長期学習では、初期 imitation より悪化する方向が強く、自然回復は確認できなかった
+  - 「更新を弱めればそのうち戻る」仮説はかなり後退
+- `exp_046-050`（policy anchor + entropy）
+  - `policy_anchor(kl, coef=0.5) + entropy=0.0` が最も有望
+  - ただし `20 seeds x 20 cycles` の `exp_050` では、各 cycle 内差分は一部改善しても imitation 基準は超え続けられなかった
+  - anchor は「壊れる速度を落とす」方向には効くが、長期改善の本質解ではない
+- `exp_051-052`（rule_mix + two-stage learner）
+  - `actor3 + rule1` 相当の rule_mix は anchor-only より少し良い
+  - ただし `exp_052`（20 seeds x 20 cycles）でも imitation 基準超えは安定せず、平均最良は早期 cycle にとどまった
+  - rule データを separated learner（baseline BC -> policy PPO）で入れるだけでは長期改善は作れない
+- `20260316` ad-hoc: `mixed_ppo`, `policy_ratio=0.75`, `1 seed x 10 cycles`
+  - 実装は意図どおり動作し、baseline BC を外して `policy + rule` を PPO に一本化できた
+  - ただし seed 42 では cycle 0 だけ改善し、その後は imitation 基準より悪化
+- `20260316` ad-hoc: `mixed_ppo`, `policy_ratio=0.0`, `1 seed x 10 cycles`
+  - `num_policy_samples=0`, `num_baseline_samples>0` で、rule-only PPO 学習が成立することを確認
+  - それでも cycle 0 の小改善後は長期悪化し、`rule` を今の PPO target にそのまま流すだけでは学習が進まないと確認
 
 ---
 
@@ -188,11 +216,16 @@
 - hidden size 拡大 + current shanten 同時導入を、そのまま採用すること
 - 大きめモデル条件で `lr` / `epochs` を単純に弱めれば解決するとみなすこと
 - advantage 逆転を「value だけの問題」とみなすこと
+- `policy_anchor` や `entropy` の微調整だけで長期改善が出るとみなすこと
+- `rule_mix + separated learner` をそのまま大規模に掘り続けること
+- `mixed_ppo(policy_ratio=0.75, baseline_sample_weight=1.0)` を探索なしで本命化すること
+- `policy_ratio=0.0` でも上がらない現状で、より複雑な混合条件にすぐ戻ること
 
 再検討条件:
 
 - reward 設計や target 定義を変更したとき
 - ルール拡張で学習分布が変わったとき
+- `rule` データの loss への入れ方を変更したとき（importance correction, auxiliary BC/KL, advantage-weighted imitation など）
 
 ---
 
@@ -210,6 +243,8 @@ run 成果物で確認可能:
   - `model_features.value_features.current_shanten.enabled`
 - learner 診断統計 `ppo_diag`
   - `advantage_*`, `return_*`, `old_value_*`, `value_error_*`, `ratio_*`, `clip_fraction`
+  - `policy_anchor`
+  - `mixed_ppo`
   - `shanten_diag`
     - `improve/same/worsen` ごとの `advantage/return/old_value/new_value/value_update_delta/value_error`
     - `available_samples/unavailable_samples/status`
@@ -236,9 +271,10 @@ run 成果物で確認可能:
 
 必須条件:
 
-1. 主比較条件で after 指標が `exp_037 D` を一貫して更新する
-2. `eval_before -> eval` の悪化幅が少なくとも現 baseline より縮む
-3. 追加1回の再現実験でも同傾向が出る
+1. imitation 基準（`cycle0.eval_before`）を cycle 後半でも平均的に上回る
+2. after 指標が `exp_050` / `exp_052` を一貫して更新する
+3. `eval_before -> eval` が改善していても、長期着地が悪化しない
+4. 追加再現実験でも同傾向が出る
 
 達成後の次段:
 
@@ -273,4 +309,4 @@ run 成果物で確認可能:
 
 ## 10. 一文要約
 
-**reward scale バグ修正と立直後打牌除外を経て、主系列 baseline は `exp_037 D`（高表現力モデル + `gae_lambda=0.90` + imitation value warmstart `coef=0.3`）に更新された。現在の論点は、現行特徴量/モデルに imitation だけでまだ伸びしろがあるか、そして post-fix 条件で shaping を再評価すると after 指標をさらに押し上げられるか、の2点である。**
+**anchor / rule_mix / mixed_ppo まで進めた結果、「更新を安定化するだけ」では imitation 基準を長期的に超えられないことが見えてきた。現在の本丸は、rule を優秀な教師候補とみなしつつ、それを actor 改善に結びつける更新設計（target / off-policy 扱い / 補助損失）をどう作るかである。**
