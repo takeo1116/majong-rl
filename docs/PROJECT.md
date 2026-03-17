@@ -1,6 +1,6 @@
 # PROJECT.md
 
-最終更新: 2026-03-16  
+最終更新: 2026-03-18  
 この文書の役割: プロジェクトの大目標・現在地・次アクションを短時間で復元する意思決定ハブ。
 
 ---
@@ -8,14 +8,14 @@
 ## 1. 北極星（不変）
 
 最終目標は、麻雀AIの学習基盤を段階的に拡張し、最終的に実戦ルールに近い環境で強い方策を学習できる状態に到達すること。  
-短期的には、**imitation 初期方策を安定して超える更新設計の確立**が最優先。  
-現時点では「PPO を壊さず回す」段階はかなり進み、焦点は **学習信号の質** に移っている。
+短期的には、**強い imitation 初期方策を壊さずに超える更新設計の確立**が最優先。  
+現時点では architecture と feature 生成の大きなバグ修正が完了し、焦点は **rule-only PPO の学習信号設計** に移っている。
 
 ---
 
-## 2. 現在地（2026-03-16）
+## 2. 現在地（2026-03-18）
 
-フェーズ: **Stage1後半（anchor / multi-cycle / rule-mix まで実装し、PPO の「更新設計そのもの」を見直すフェーズ）**
+フェーズ: **Stage1後半（bugfix 後 baseline を再構築し、新モデルを主系列として PPO の「更新設計そのもの」を見直すフェーズ）**
 
 - できている
   - runbook/report/driver 運用、phase 再利用、resume
@@ -28,11 +28,15 @@
   - 高表現力モデル（`hidden_dims=[512,256] + dual_towers`）の成立確認
   - `policy_anchor` / `multi_cycle` / `rule_mix` / `mixed_ppo` の実装と完走確認
   - 実行速度の大幅改善により `20 seeds x 20 cycles` 規模の検証が可能になった
+  - `policy_direct_hints + context_gate` 新モデルの実装と imitation 優位の確認
+  - `multi_chunk_imitation` の実装と `1000 x N chunks` 型の imitation ceiling 実験
+  - `observation_mode=full` で補助特徴が `player 0` 固定になっていた重大バグの特定と修正（CQ-0208）
+  - bugfix 後の imitation baseline 再取得
 - 未解決
-  - imitation 基準を長期的に安定して超える更新則
-  - rule データを actor 改善に結びつける学習信号設計
-  - `rule` 行動を PPO に入れるときの off-policy / target mismatch の扱い
-  - 現行 PPO で改善しない主因が「ハイパラ不足」なのか「更新目標の不整合」なのかの切り分け
+  - bugfix 後の強い imitation 基準を、PPO が安定して上回る更新則
+  - rule データの中でも「良い打牌 / 悪い打牌」を切り分けて actor 改善に使う学習信号設計
+  - `rule` 行動を PPO に入れるときの exact-action / advantage weighting / state distribution mismatch の切り分け
+  - 現行 rule-only PPO で悪化する主因が surrogate なのか weighting なのか分布なのかの切り分け
 
 ---
 
@@ -40,43 +44,56 @@
 
 現在の主目的は次の2点。
 
-> 1. `exp_050` / `exp_052` までで確認された「少し改善しても長期では沈む」挙動の原因を、更新設計レベルで切り分ける。  
-> 2. `rule` を教師候補として活かすなら、BC / separated learner / mixed PPO のどれが機能するのか、あるいはどれも足りないのかを明確にする。
+> 1. CQ-0208 修正後の新しい imitation baseline を基準に、`rule-only PPO` がなぜ安定して上積みできないのかを切り分ける。  
+> 2. `rule` を教師候補として使うなら、「rule を模倣する」段階から「rule の中でも良い打牌 / 悪い打牌を分ける」段階へどう移るかを明確にする。
 
-現行固定軸（診断基準点）:
+現行の主系列 baseline（2026-03-18 時点）:
 
 - `feature_encoder.shanten_hint=true`
+- `feature_encoder.discard_ukeire_hint=true`
+- `feature_encoder.current_shanten=true`
+- `feature_encoder.shape_hint=true`
+- `feature_encoder.turn_context=true`
 - `training.imitation_loss_mode=tie_aware_best_set`
 - `training.imitation_value_warmstart.enabled=true`
 - `training.imitation_value_warmstart.coef=0.3`
-- `training.lr=0.0001`
-- `training.epochs=2`
+- `model.policy_direct_hints.enabled=true`
+- `model.policy_direct_hints.sources=["shanten_hint","discard_ukeire_hint"]`
+- `model.policy_direct_hints.local_hidden_dim=16`
+- `model.policy_direct_hints.tile_embedding_dim=4`
+- `model.policy_direct_hints.context_gate.enabled=true`
+- `training.lr=5e-5`
+- `training.epochs=1`
 - `training.value_loss_coef=0.25`
-- `training.clip_epsilon=0.2`
+- `training.clip_epsilon=0.15`
 - `training.batch_size=512`
-- `training.gamma=0.99`
-- `training.gae_lambda=0.85`
+- `training.gamma=0.50`  # PPO sanity check の起点
+- `training.gae_lambda=0.0`
 - `training.exclude_post_riichi_discards.enabled=true`
 - `model.hidden_dims=[512,256]`
 - `model.policy_tower.enabled=true`
 - `model.value_tower.enabled=true`
 - `reward.point_delta_scale=0.0001`
 - `reward.shaping.shanten_delta.enabled=true`
-- `reward.shaping.shanten_delta.scale=0.01`
+- `reward.shaping.shanten_delta.scale=0.003`
 - `reward.shaping.shanten_delta.mode=both`
 - `reward.shaping.shanten_delta.schedule.type=linear_decay`
-- `training.policy_anchor.enabled=true`
-- `training.policy_anchor.type=kl`
-- `training.policy_anchor.coef=0.5`
-- `training.policy_anchor.reference=imitation_fixed`
+- `training.policy_anchor.enabled=false`
 - `training.entropy_coef=0.0`
+- imitation baseline:
+  - `selfplay.imitation_matches=1000 x 10 chunks`
+- PPO sanity check:
+  - imitation `1000 x 1`
+  - `training.rule_mix.policy_ratio=0.0`
+  - `training.multi_cycle.num_cycles=10`
+  - `training.multi_cycle.selfplay_matches_per_cycle=200`
 
 評価の優先順:
 
-1. imitation 基準（`cycle0.eval_before`）に対して長期的に上回れるか
+1. bugfix 後 imitation 基準に対して PPO が上積みできるか
 2. after 指標（`avg_rank`, `avg_score`, `win_rate`, `deal_in_rate`）
 3. 各 cycle 内 `eval_before -> eval` 差分
-4. learner 診断統計（`ratio/clip_fraction/policy_anchor/mixed_ppo/shanten_diag`）
+4. learner 診断統計（`teacher_agreement`, `ratio/clip_fraction`, `mixed_ppo`, `shanten_diag`, `turn_diag`）
 
 ---
 
@@ -193,6 +210,35 @@
 - `20260316` ad-hoc: `mixed_ppo`, `policy_ratio=0.0`, `1 seed x 10 cycles`
   - `num_policy_samples=0`, `num_baseline_samples>0` で、rule-only PPO 学習が成立することを確認
   - それでも cycle 0 の小改善後は長期悪化し、`rule` を今の PPO target にそのまま流すだけでは学習が進まないと確認
+- `exp_058`（pre-bugfix, imitation-only, `3 seeds x 10000 matches`）
+  - `policy_direct_hints + context_gate` 新モデルは旧モデルを一貫して上回った
+  - ただしこの時点の full 観測補助特徴にはまだ重大バグが残っていた
+- `exp_059`（pre-bugfix, long imitation ceiling, `1000 x 50 chunks`）
+  - pre-bugfix では新モデルが旧モデルを上回るが、`avg_score` の ceiling は `-7000` 近辺に見えた
+  - 後にこの解釈は CQ-0208 バグの影響を強く受けていたと判明
+- `CQ-0208`（2026-03-18）
+  - `observation_mode=full` で `shanten_hint / discard_ukeire_hint / current_shanten / shape_hint` が `player 0` 固定で計算されていた重大バグを修正
+  - bug report は [experiments/exp_059_bugfix/bug_report.md](/home/takeo1116/Git/majong-rl/experiments/exp_059_bugfix/bug_report.md)
+- bugfix 後 ad-hoc: 新モデル imitation-only, `1000 x 10 chunks`, `1 seed`
+  - `teacher_best_set_hit_rate = 1.0`
+  - `teacher_top1_match_rate = 0.7007`
+  - `avg_score = +383.25`
+  - bugfix が本丸であり、以前の低い ceiling 議論のかなりの部分をやり直す必要があると確認
+- `exp_060`（bugfix 後, short A/B, `1000 x 10 chunks`, `1 seed`）
+  - 旧モデルも `avg_score=-274` まで大きく回復
+  - それでも新モデルは `avg_score=+383.25`, `teacher_top1=0.7007` で旧モデルを上回った
+  - imitation における新モデル優位は bugfix 後も維持されると判断
+- 2026-03-18 ad-hoc: 新モデル + rule-only PPO sanity check
+  - imitation `1000 x 1` + PPO `200 x 10`
+  - `cycle 0-3` では改善するが、`cycle 4+` で明確に悪化
+  - `teacher_top1` は微増する一方、`best_set_hit` は低下し、数値爆発より objective mismatch が疑わしい
+- 2026-03-18 ad-hoc: `strict_top1` imitation + 同一 PPO sanity check
+  - `strict_top1` は imitation 直後の時点で `tie_aware_best_set` より大幅に悪い
+  - `exact action` 教師を真似るほど強くなるわけではなく、baseline tie-break をそのまま教師化するのは悪手と確認
+
+暫定判断:
+- **旧モデルは打ち切り、新モデルを主系列とする**
+- 現在の本丸は `rule-only PPO` がなぜ積めないかの切り分けであり、architecture 探索ではない
 
 ---
 
@@ -220,12 +266,16 @@
 - `rule_mix + separated learner` をそのまま大規模に掘り続けること
 - `mixed_ppo(policy_ratio=0.75, baseline_sample_weight=1.0)` を探索なしで本命化すること
 - `policy_ratio=0.0` でも上がらない現状で、より複雑な混合条件にすぐ戻ること
+- CQ-0208 修正前の `exp_058` / `exp_059` 数値を、そのまま ceiling 議論の根拠に使うこと
+- 旧モデルの再評価を続けること（主系列は新モデルへ移行済み）
+- `strict_top1` imitation を PPO の自然な前段とみなすこと
 
 再検討条件:
 
 - reward 設計や target 定義を変更したとき
 - ルール拡張で学習分布が変わったとき
 - `rule` データの loss への入れ方を変更したとき（importance correction, auxiliary BC/KL, advantage-weighted imitation など）
+- `policy_anchor` / `policy_ratio` / positive-advantage weighting など、rule-only PPO の drift 要因を切る control 実験を入れたとき
 
 ---
 
@@ -271,10 +321,11 @@ run 成果物で確認可能:
 
 必須条件:
 
-1. imitation 基準（`cycle0.eval_before`）を cycle 後半でも平均的に上回る
-2. after 指標が `exp_050` / `exp_052` を一貫して更新する
-3. `eval_before -> eval` が改善していても、長期着地が悪化しない
-4. 追加再現実験でも同傾向が出る
+1. bugfix 後の新モデル imitation 基準を cycle 後半でも平均的に上回る
+2. after 指標が bugfix 後 imitation-only baseline を一貫して更新する
+3. `eval_before -> eval` の短期改善が長期悪化に転じない
+4. `teacher_top1` だけでなく `best_set_hit` と主評価が同時に維持・改善する
+5. 追加再現実験でも同傾向が出る
 
 達成後の次段:
 
@@ -309,4 +360,4 @@ run 成果物で確認可能:
 
 ## 10. 一文要約
 
-**anchor / rule_mix / mixed_ppo まで進めた結果、「更新を安定化するだけ」では imitation 基準を長期的に超えられないことが見えてきた。現在の本丸は、rule を優秀な教師候補とみなしつつ、それを actor 改善に結びつける更新設計（target / off-policy 扱い / 補助損失）をどう作るかである。**
+**CQ-0208 bugfix により imitation ceiling は大きく更新され、新モデルが主系列になった。現在の本丸は、rule imitation で作った強い初期方策に対して、rule-only PPO がなぜ安定して上積みできないのかを切り分け、rule データの中でも良い打牌 / 悪い打牌を分けて actor 改善に使う更新設計を作ることである。**

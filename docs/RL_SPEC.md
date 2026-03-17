@@ -170,6 +170,8 @@ Observation、Feature 表現、Model は分離する。
 #### 7.3.1 FlatFeatureEncoder のオプション特徴量
 
 以下のオプションはすべて既定 `false` で、`true` 時のみ特徴量が追加される。
+
+**重要 (CQ-0208)**: `observation_mode=full` では、補助特徴（shanten_hint, discard_ukeire_hint, current_shanten, shape_hint）は `obs.current_player` の手牌から生成される。`hands[0]` 固定ではない。
 `false` 時は既存入力次元を維持する（完全後方互換）。
 
 **shanten_hint** (`feature_encoder.shanten_hint.enabled`)
@@ -271,6 +273,43 @@ model:
 実験方針注記:
 - tower 比較実験では `current_shanten=true` を全条件で固定し、差分を tower 構造だけにする
 - `exp_024 D` は旧診断世代（CQ-0155/0156 以前）のため今回の baseline に使わず、small model + `current_shanten=true` を新規取得する
+
+#### 7.4.3 policy direct hints branch (CQ-0203)
+
+`model.policy_direct_hints` で、牌別 hint を shared trunk から除外し、
+policy logits 直前に専用 branch として加算できる。
+
+- `enabled=false`（default）で完全後方互換
+- `sources` で直接分離する牌別特徴を指定
+  - `"shanten_hint"`: delta_shanten_sign[34]
+  - `"discard_ukeire_hint"`: discard_ukeire_norm[34]
+- 指定された source は shared trunk 入力から除外される
+- direct hint branch:
+  - 入力: `[B, 34, K]`（K = source 数）+ tile identity embedding
+  - shared local scorer: `Linear -> ReLU -> Linear(1)` で `delta_logits[B,34]`
+  - context gate（optional）: `sigmoid(linear(trunk_h))` で gate を出し `gate * delta_logits`
+  - final: `base_logits + gated_delta_logits`
+- value head は direct hint branch の影響を受けない（trunk 出力 + value_aux のみ）
+
+config 例:
+```yaml
+model:
+  policy_direct_hints:
+    enabled: false
+    sources: ["shanten_hint", "discard_ukeire_hint"]
+    local_hidden_dim: 16
+    tile_embedding_dim: 4
+    context_gate:
+      enabled: true
+```
+
+encoder 整合:
+- runner が sources と encoder 設定の整合を検証する
+- source が必要とする encoder feature が無効なら `ValueError`
+
+成果物追跡:
+- `summary.json.model_features.policy_direct_hints.{enabled, sources, local_hidden_dim, tile_embedding_dim, context_gate_enabled}`
+- `encoder metadata.feature_ranges` に各 optional feature block の `(start, end)` を記録
 
 ---
 
@@ -640,6 +679,26 @@ Learner は shard を読み込み、model を更新し、training metrics / chec
 ### 12.3 warm start
 
 現運用では、ルールベース打牌の軽い imitation を先に行い、その後 self-play + PPO に入る構成を標準とする。
+
+#### 12.3.1 multi-chunk imitation (CQ-0206)
+
+`training.multi_chunk_imitation` で imitation フェーズを chunk 分割実行できる。
+
+```yaml
+training:
+  multi_chunk_imitation:
+    enabled: false
+    num_chunks: 5
+    imitation_matches_per_chunk: 2000
+```
+
+- `enabled=false`（default）で従来の単発 imitation
+- `enabled=true` で `num_chunks` 回の「データ生成 → imitation 学習」を順次実行
+- model は chunk 間で引き継ぐ
+- 各 chunk のデータは `imitation/chunk_XX/` に分離保存
+- final の `checkpoint_imitation.pt` は最終 chunk 後の model を保存
+- `summary.json.phase_stats.imitation.chunks` に各 chunk の主要指標を記録
+- `batch_summary.json.runs[*].imitation_metrics.chunks` に転送
 
 ### 12.4 現在の既知課題
 
