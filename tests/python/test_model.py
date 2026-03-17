@@ -322,3 +322,134 @@ class TestTowerStructure:
         output_none = model(features, legal_mask)
         assert output_none.logits.shape == (4, 34)
         assert output_none.values["round_delta"].shape == (4, 1)
+
+
+class TestPolicyDirectHints:
+    """CQ-0203: policy direct hints branch テスト"""
+
+    def test_disabled_backward_compat(self):
+        """enabled=false で既存と同形状・同動作"""
+        model = MLPPolicyValueModel(input_dim=100, hidden_dims=[32])
+        features = torch.randn(2, 100)
+        mask = torch.ones(2, 34)
+        out = model(features, mask)
+        assert out.logits.shape == (2, 34)
+        assert out.values["round_delta"].shape == (2, 1)
+
+    def test_enabled_forward(self):
+        """enabled=true で forward が通る"""
+        # input_dim=100, shanten_hint at [80,114], ukeire at [114,148]
+        # → total 148 but model sees 148 as input_dim
+        # hint_ranges: 2 sources of 34 each = 68 extracted
+        # trunk gets 148 - 68 = 80
+        pdh_cfg = {
+            "enabled": True,
+            "sources": ["shanten_hint", "discard_ukeire_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 4,
+            "context_gate": {"enabled": True},
+        }
+        ranges = {
+            "shanten_hint": (80, 114),
+            "discard_ukeire_hint": (114, 148),
+        }
+        model = MLPPolicyValueModel(
+            input_dim=148,
+            hidden_dims=[32],
+            policy_direct_hints_config=pdh_cfg,
+            direct_hint_ranges=ranges,
+        )
+        features = torch.randn(2, 148)
+        mask = torch.ones(2, 34)
+        out = model(features, mask)
+        assert out.logits.shape == (2, 34)
+        assert out.values["round_delta"].shape == (2, 1)
+
+    def test_hint_changes_policy_not_value(self):
+        """direct hint を変えると policy は変化するが value は変化しない"""
+        pdh_cfg = {
+            "enabled": True,
+            "sources": ["shanten_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 4,
+            "context_gate": {"enabled": False},
+        }
+        ranges = {"shanten_hint": (80, 114)}
+        model = MLPPolicyValueModel(
+            input_dim=114,
+            hidden_dims=[32],
+            policy_direct_hints_config=pdh_cfg,
+            direct_hint_ranges=ranges,
+        )
+        model.eval()
+
+        base = torch.randn(1, 114)
+        mask = torch.ones(1, 34)
+
+        # hint を変えた版
+        modified = base.clone()
+        modified[0, 80:114] = torch.randn(34)
+
+        with torch.no_grad():
+            out1 = model(base, mask)
+            out2 = model(modified, mask)
+
+        # value は同じ（trunk 入力の global 部分 [0:80] は同一）
+        v1 = out1.values["round_delta"]
+        v2 = out2.values["round_delta"]
+        assert torch.allclose(v1, v2, atol=1e-6), "value は変化しないべき"
+
+        # policy logits は異なる
+        assert not torch.allclose(out1.logits, out2.logits, atol=1e-6), \
+            "hint を変えたら policy は変化するべき"
+
+    def test_context_gate_shapes(self):
+        """context gate 有効時の shape 確認"""
+        pdh_cfg = {
+            "enabled": True,
+            "sources": ["shanten_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 4,
+            "context_gate": {"enabled": True},
+        }
+        ranges = {"shanten_hint": (80, 114)}
+        model = MLPPolicyValueModel(
+            input_dim=114,
+            hidden_dims=[32],
+            policy_direct_hints_config=pdh_cfg,
+            direct_hint_ranges=ranges,
+        )
+        assert model._context_gate is not None
+        assert model._context_gate.in_features == 32
+        assert model._context_gate.out_features == 34
+
+    def test_split_features_correctness(self):
+        """_split_features が global と hint を正しく分離する"""
+        pdh_cfg = {
+            "enabled": True,
+            "sources": ["shanten_hint", "discard_ukeire_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 4,
+        }
+        ranges = {
+            "shanten_hint": (80, 114),
+            "discard_ukeire_hint": (114, 148),
+        }
+        model = MLPPolicyValueModel(
+            input_dim=148,
+            hidden_dims=[32],
+            policy_direct_hints_config=pdh_cfg,
+            direct_hint_ranges=ranges,
+        )
+        features = torch.arange(148, dtype=torch.float32).unsqueeze(0)
+        g, h = model._split_features(features)
+        # global: 0..79 (80 dims)
+        assert g.shape == (1, 80)
+        assert g[0, 0].item() == 0.0
+        assert g[0, 79].item() == 79.0
+        # hint: [1, 34, 2]
+        assert h.shape == (1, 34, 2)
+        # h[:,:,0] = shanten_hint (80..113)
+        assert h[0, 0, 0].item() == 80.0
+        # h[:,:,1] = discard_ukeire_hint (114..147)
+        assert h[0, 0, 1].item() == 114.0

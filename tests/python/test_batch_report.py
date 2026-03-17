@@ -1960,3 +1960,60 @@ class TestTeacherAgreementBatch:
             summary = json.load(f)
         # クラッシュしない
         assert summary["success_count"] == 2
+
+
+class TestMultiChunkImitationBatch:
+    """multi-chunk imitation の batch 転送テスト (CQ-0206)"""
+
+    @staticmethod
+    def _make_result(tmp_path, seed, imi_stats):
+        run_dir = tmp_path / f"run_{seed}"
+        run_dir.mkdir(exist_ok=True)
+        summary = {"phase_stats": {"imitation": imi_stats}}
+        with open(run_dir / "summary.json", "w") as f:
+            json.dump(summary, f)
+        return {
+            "seed": seed, "success": True,
+            "result": {"avg_rank": 2.5, "run_dir": str(run_dir)},
+        }
+
+    def test_chunks_transferred(self, tmp_path: Path):
+        """chunks が imitation_metrics に転送される"""
+        imi = {
+            "teacher_top1_match_rate": 0.5,
+            "teacher_best_set_hit_rate": 0.6,
+            "multi_chunk_imitation": {
+                "enabled": True, "num_chunks": 2,
+                "imitation_matches_per_chunk": 100,
+            },
+            "chunks": [
+                {"chunk_index": 0, "policy_loss": 0.1,
+                 "teacher_top1_match_rate": 0.4},
+                {"chunk_index": 1, "policy_loss": 0.05,
+                 "teacher_top1_match_rate": 0.5},
+            ],
+        }
+        results = [self._make_result(tmp_path, 42, imi)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        im = summary["runs"][0].get("imitation_metrics", {})
+        assert "multi_chunk_imitation" in im
+        assert im["multi_chunk_imitation"]["enabled"] is True
+        assert "chunks" in im
+        assert len(im["chunks"]) == 2
+
+    def test_no_chunks_ok(self, tmp_path: Path):
+        """chunks がない run でもクラッシュしない"""
+        imi = {
+            "teacher_top1_match_rate": 0.5,
+        }
+        results = [self._make_result(tmp_path, 42, imi)]
+        generate_batch_report(tmp_path, results)
+
+        with open(tmp_path / "batch_summary.json") as f:
+            summary = json.load(f)
+        im = summary["runs"][0].get("imitation_metrics", {})
+        assert "chunks" not in im
+        assert "multi_chunk_imitation" not in im

@@ -3582,3 +3582,158 @@ class TestTeacherAgreementE2E:
                 assert "action_match_rate_before" in ta
                 assert "action_match_rate_after" in ta
         assert found, "teacher_agreement が summary cycles に見つからない"
+
+
+@pytest.mark.smoke
+class TestPolicyDirectHintsIntegration:
+    """policy_direct_hints の runner 統合テスト (CQ-0203)"""
+
+    def test_direct_hints_on_run_succeeds(self, tmp_path: Path):
+        """direct hints 有効で run 完走し summary に記録される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["shanten_hint"] = {"enabled": True}
+        config.feature_encoder["discard_ukeire_hint"] = {"enabled": True}
+        config.model["policy_direct_hints"] = {
+            "enabled": True,
+            "sources": ["shanten_hint", "discard_ukeire_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 4,
+            "context_gate": {"enabled": True},
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        mf = summary.get("model_features", {})
+        pdh = mf.get("policy_direct_hints", {})
+        assert pdh.get("enabled") is True
+        assert pdh.get("sources") == ["shanten_hint", "discard_ukeire_hint"]
+        assert pdh.get("context_gate_enabled") is True
+
+    def test_encoder_mismatch_raises(self, tmp_path: Path):
+        """encoder 側で hint が無効なのに sources に含めるとエラー"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        # shanten_hint は有効にしない
+        config.model["policy_direct_hints"] = {
+            "enabled": True,
+            "sources": ["shanten_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 4,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        with pytest.raises(ValueError, match="shanten_hint"):
+            runner.run()
+
+    def test_disabled_backward_compat(self, tmp_path: Path):
+        """enabled=false で既存挙動維持"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        pdh = summary.get("model_features", {}).get("policy_direct_hints", {})
+        assert pdh.get("enabled") is False
+
+    def test_direct_hints_multi_process_eval(self, tmp_path: Path):
+        """CQ-0204/CQ-0205: direct hints + num_workers=2 の multi-process eval が
+        完走し、summary.json の phase_stats.eval に転送される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["shanten_hint"] = {"enabled": True}
+        config.feature_encoder["discard_ukeire_hint"] = {"enabled": True}
+        config.model["policy_direct_hints"] = {
+            "enabled": True,
+            "sources": ["shanten_hint", "discard_ukeire_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 4,
+            "context_gate": {"enabled": True},
+        }
+        config.evaluation["num_workers"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        mf = summary.get("model_features", {})
+        assert mf.get("policy_direct_hints", {}).get("enabled") is True
+        # summary.json の phase_stats.eval に eval 結果が転送されていること
+        eval_stats = summary.get("phase_stats", {}).get("eval", {})
+        assert eval_stats.get("avg_rank") is not None, \
+            "summary.phase_stats.eval.avg_rank が転送されていない"
+
+
+@pytest.mark.smoke
+class TestMultiChunkImitation:
+    """multi-chunk imitation テスト (CQ-0206)"""
+
+    def test_disabled_backward_compat(self, tmp_path: Path):
+        """enabled=false で従来 imitation が動く"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        imi = summary.get("phase_stats", {}).get("imitation", {})
+        assert "chunks" not in imi
+        assert "multi_chunk_imitation" not in imi
+
+    def test_multi_chunk_succeeds(self, tmp_path: Path):
+        """num_chunks=2, matches_per_chunk=2, num_workers=2 で完走する"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.training["multi_chunk_imitation"] = {
+            "enabled": True,
+            "num_chunks": 2,
+            "imitation_matches_per_chunk": 2,
+        }
+        config.imitation["num_workers"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        # checkpoint_imitation.pt が存在
+        assert (run_dir / "checkpoints" / "checkpoint_imitation.pt").exists()
+
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        imi = summary.get("phase_stats", {}).get("imitation", {})
+        # multi_chunk_imitation 設定が記録される
+        mci = imi.get("multi_chunk_imitation", {})
+        assert mci.get("enabled") is True
+        assert mci.get("num_chunks") == 2
+        # chunks 配列が 2 要素
+        chunks = imi.get("chunks", [])
+        assert len(chunks) == 2
+        for c in chunks:
+            assert "chunk_index" in c
+            assert "policy_loss" in c
+            assert "teacher_top1_match_rate" in c
+        # CQ-0207: parallel 経路確認 (num_workers=2)
+        assert imi.get("num_workers", 1) >= 2, "parallel imitation 経路を通っていない"
+        # CQ-0207: shard_count が chunk 配下を含む
+        assert imi.get("shard_count", 0) > 0, "shard_count が 0"
+        # CQ-0207: manifest の imitation_shards
+        manifest_path = run_dir / "artifacts_manifest.json"
+        if manifest_path.exists():
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            imi_shards = manifest.get("artifacts", {}).get("imitation_shards", {})
+            assert imi_shards.get("exists") is True
+            assert imi_shards.get("shard_count", 0) > 0

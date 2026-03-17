@@ -736,6 +736,175 @@ class TestDiscardUkeireLegalMask:
         assert result.shape == enc.metadata().output_shape
 
 
+class TestFullObsCurrentPlayer:
+    """CQ-0208: full 観測の補助特徴が current_player 基準であることを検証"""
+
+    @staticmethod
+    def _get_two_player_obs():
+        """異なる current_player の FullObservation を 2 つ取得する"""
+        from mahjong_rl import GameEngine, EnvironmentState, RunMode
+        from mahjong_rl._mahjong_core import make_full_observation
+        engine = GameEngine()
+        env = EnvironmentState()
+        env.run_mode = RunMode.Fast
+        engine.reset_match(env, 123)
+
+        obs0 = make_full_observation(env)
+        p0 = obs0.current_player
+
+        # step して別の current_player の局面を探す
+        for _ in range(200):
+            actions = engine.get_legal_actions(env)
+            if not actions:
+                break
+            engine.step(env, actions[0])
+            obs_next = make_full_observation(env)
+            if obs_next.current_player != p0:
+                return obs0, obs_next
+        pytest.skip("同一 seed で current_player の異なる局面が得られなかった")
+
+    def test_auxiliary_features_follow_current_player(self):
+        """shanten_hint が current_player の手牌に基づくことを確認"""
+        obs0, obs1 = self._get_two_player_obs()
+        enc = FlatFeatureEncoder(
+            observation_mode="full",
+            shanten_hint=True,
+            discard_ukeire_hint=True,
+            current_shanten_input=True,
+            shape_hint=True,
+        )
+        meta = enc.metadata()
+        fr = meta.feature_ranges
+
+        result0 = enc.encode(obs0)
+        result1 = enc.encode(obs1)
+
+        # 各補助特徴ブロックを取り出す
+        for key in ["shanten_hint", "discard_ukeire_hint", "current_shanten", "shape_hint"]:
+            s, e = fr[key]
+            block0 = result0[s:e]
+            block1 = result1[s:e]
+            # current_player が異なるので、手牌も異なる → 補助特徴も異なるはず
+            # (完全一致は偶然あり得るが、4 ブロック全部一致は極めて低確率)
+            if not np.array_equal(block0, block1):
+                return  # 少なくとも1ブロックが異なれば OK
+        pytest.fail("全補助特徴ブロックが一致: current_player が反映されていない可能性")
+
+    def test_shanten_hint_matches_current_player_hand(self):
+        """shanten_hint が hands[current_player] から計算された値と一致する"""
+        obs0, _ = self._get_two_player_obs()
+        enc = FlatFeatureEncoder(
+            observation_mode="full", shanten_hint=True)
+        meta = enc.metadata()
+        result = enc.encode(obs0)
+        s, e = meta.feature_ranges["shanten_hint"]
+        actual_hint = result[s:e]
+
+        # current_player の手牌カウントを手動計算
+        cp = obs0.current_player
+        hand_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        for tid in obs0.hands[cp]:
+            hand_counts[tid // 4] += 1.0
+        expected_hint = FlatFeatureEncoder._compute_shanten_hint(hand_counts.copy())
+        np.testing.assert_array_equal(actual_hint, expected_hint)
+
+    def test_current_shanten_matches_current_player_hand(self):
+        """current_shanten が hands[current_player] から計算された値と一致する"""
+        obs0, _ = self._get_two_player_obs()
+        enc = FlatFeatureEncoder(
+            observation_mode="full", current_shanten_input=True)
+        meta = enc.metadata()
+        result = enc.encode(obs0)
+        s, e = meta.feature_ranges["current_shanten"]
+        actual = result[s:e]
+
+        cp = obs0.current_player
+        hand_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        for tid in obs0.hands[cp]:
+            hand_counts[tid // 4] += 1.0
+        expected = FlatFeatureEncoder._compute_current_shanten(hand_counts)
+        np.testing.assert_array_almost_equal(actual, expected)
+
+    def test_shape_hint_matches_current_player_hand(self):
+        """shape_hint が hands[current_player] から計算された値と一致する"""
+        obs0, _ = self._get_two_player_obs()
+        enc = FlatFeatureEncoder(
+            observation_mode="full", shape_hint=True)
+        meta = enc.metadata()
+        result = enc.encode(obs0)
+        s, e = meta.feature_ranges["shape_hint"]
+        actual = result[s:e]
+
+        cp = obs0.current_player
+        hand_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        for tid in obs0.hands[cp]:
+            hand_counts[tid // 4] += 1.0
+        expected = FlatFeatureEncoder._compute_shape_hint(hand_counts)
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_discard_ukeire_matches_current_player_hand(self):
+        """discard_ukeire_hint が hands[current_player] から計算された値と一致する"""
+        obs0, _ = self._get_two_player_obs()
+        enc = FlatFeatureEncoder(
+            observation_mode="full", discard_ukeire_hint=True)
+        meta = enc.metadata()
+
+        # legal_mask を用意して encode に渡す
+        mask = np.ones(NUM_TILE_TYPES, dtype=np.float32)
+        result = enc.encode(obs0, legal_mask=mask)
+        s, e = meta.feature_ranges["discard_ukeire_hint"]
+        actual = result[s:e]
+
+        # current_player の手牌から期待値を手計算
+        cp = obs0.current_player
+        hand_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        for tid in obs0.hands[cp]:
+            hand_counts[tid // 4] += 1.0
+        expected = FlatFeatureEncoder._compute_discard_ukeire(
+            hand_counts.copy(), legal_mask=mask)
+        np.testing.assert_array_almost_equal(actual, expected, decimal=5)
+
+
+class TestFeatureRanges:
+    """feature_ranges テスト (CQ-0203)"""
+
+    def test_no_options_empty_ranges(self):
+        enc = FlatFeatureEncoder(observation_mode="partial")
+        meta = enc.metadata()
+        assert meta.feature_ranges == {}
+
+    def test_shanten_hint_range(self):
+        enc = FlatFeatureEncoder(observation_mode="partial", shanten_hint=True)
+        meta = enc.metadata()
+        assert "shanten_hint" in meta.feature_ranges
+        s, e = meta.feature_ranges["shanten_hint"]
+        assert e - s == 34
+        assert s == 353
+
+    def test_multiple_ranges(self):
+        enc = FlatFeatureEncoder(
+            observation_mode="partial",
+            shanten_hint=True,
+            discard_ukeire_hint=True,
+            current_shanten_input=True,
+        )
+        meta = enc.metadata()
+        assert "shanten_hint" in meta.feature_ranges
+        assert "discard_ukeire_hint" in meta.feature_ranges
+        assert "current_shanten" in meta.feature_ranges
+        # 順序: shanten(353-387), ukeire(387-421), current(421-422)
+        assert meta.feature_ranges["shanten_hint"] == (353, 387)
+        assert meta.feature_ranges["discard_ukeire_hint"] == (387, 421)
+        assert meta.feature_ranges["current_shanten"] == (421, 422)
+
+    def test_full_mode_ranges(self):
+        enc = FlatFeatureEncoder(
+            observation_mode="full", shanten_hint=True)
+        meta = enc.metadata()
+        s, e = meta.feature_ranges["shanten_hint"]
+        assert s == 455  # full base dim
+
+
 class TestCppBindingKeyContract:
     """C++ pybind11 戻り値の dict キー契約テスト"""
 

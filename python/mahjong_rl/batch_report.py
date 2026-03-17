@@ -91,7 +91,7 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
                     imi_top1 = imi_stats.get("teacher_top1_match_rate")
                     imi_best_set = imi_stats.get("teacher_best_set_hit_rate")
                     if imi_top1 is not None or imi_best_set is not None:
-                        entry["imitation_metrics"] = {
+                        imi_entry: dict = {
                             "teacher_top1_match_rate": imi_top1,
                             "teacher_best_set_hit_rate": imi_best_set,
                             "imitation_loss_mode": imi_stats.get("imitation_loss_mode"),
@@ -99,6 +99,14 @@ def generate_batch_report(batch_dir: Path, results: list[dict]) -> None:
                             "value_loss": imi_stats.get("value_loss"),
                             "imitation_value_warmstart": imi_stats.get("imitation_value_warmstart"),
                         }
+                        # CQ-0206: multi-chunk imitation
+                        mci_info = imi_stats.get("multi_chunk_imitation")
+                        if mci_info is not None:
+                            imi_entry["multi_chunk_imitation"] = mci_info
+                        chunks = imi_stats.get("chunks")
+                        if chunks is not None:
+                            imi_entry["chunks"] = chunks
+                        entry["imitation_metrics"] = imi_entry
                     # CQ-0151, CQ-0152: model_features
                     mf = run_summary.get("model_features")
                     if mf is not None:

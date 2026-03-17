@@ -122,21 +122,28 @@ class FlatFeatureEncoder(FeatureEncoder):
 
     def metadata(self) -> EncoderMetadata:
         if self._observation_mode == "full":
-            dim = self._PARTIAL_DIM + self._FULL_EXTRA_DIM
+            base_dim = self._PARTIAL_DIM + self._FULL_EXTRA_DIM
         elif self._observation_mode == "partial":
-            dim = self._PARTIAL_DIM
+            base_dim = self._PARTIAL_DIM
         else:
-            # "both" の場合は Full 側の次元を返す（大きい方）
-            dim = self._PARTIAL_DIM + self._FULL_EXTRA_DIM
+            base_dim = self._PARTIAL_DIM + self._FULL_EXTRA_DIM
+        dim = base_dim
+        # CQ-0203: feature_ranges を構築
+        ranges: dict[str, tuple[int, int]] = {}
         if self._shanten_hint:
+            ranges["shanten_hint"] = (dim, dim + self._SHANTEN_HINT_DIM)
             dim += self._SHANTEN_HINT_DIM
         if self._discard_ukeire_hint:
+            ranges["discard_ukeire_hint"] = (dim, dim + self._DISCARD_UKEIRE_DIM)
             dim += self._DISCARD_UKEIRE_DIM
         if self._current_shanten_input:
+            ranges["current_shanten"] = (dim, dim + self._CURRENT_SHANTEN_DIM)
             dim += self._CURRENT_SHANTEN_DIM
         if self._shape_hint:
+            ranges["shape_hint"] = (dim, dim + self._SHAPE_HINT_DIM)
             dim += self._SHAPE_HINT_DIM
         if self._turn_context:
+            ranges["turn_context"] = (dim, dim + self._TURN_CONTEXT_DIM)
             dim += self._TURN_CONTEXT_DIM
         return EncoderMetadata(
             output_shape=(dim,),
@@ -144,6 +151,7 @@ class FlatFeatureEncoder(FeatureEncoder):
             observation_mode=self._observation_mode,
             name="FlatFeatureEncoder",
             description="フラットな固定長数値ベクトル (MLP向け)",
+            feature_ranges=ranges,
         )
 
     def _encode_partial(self, obs: PartialObservation, *,
@@ -235,16 +243,17 @@ class FlatFeatureEncoder(FeatureEncoder):
         features: list[np.ndarray] = []
 
         # 全4家手牌
-        _need_p0 = (self._shanten_hint or self._discard_ukeire_hint
-                     or self._current_shanten_input or self._shape_hint)
-        hand_counts_p0 = None
+        _need_current = (self._shanten_hint or self._discard_ukeire_hint
+                         or self._current_shanten_input or self._shape_hint)
+        current_player = obs.current_player
+        hand_counts_current = None  # CQ-0208: current_player の手牌
         for p in range(NUM_PLAYERS):
             hand_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
             for tid in obs.hands[p]:
                 hand_counts[tid // 4] += 1.0
             features.append(hand_counts)
-            if p == 0 and _need_p0:
-                hand_counts_p0 = hand_counts.copy()
+            if p == current_player and _need_current:
+                hand_counts_current = hand_counts.copy()
 
         # 4家河
         for p in range(NUM_PLAYERS):
@@ -295,7 +304,7 @@ class FlatFeatureEncoder(FeatureEncoder):
         # シャンテン補助特徴 + 打牌候補受け入れ枚数 (CQ-0119, CQ-0168, CQ-0172)
         if self._shanten_hint or self._discard_ukeire_hint:
             hint, ukeire = self._compute_hint_and_ukeire(
-                hand_counts_p0, legal_mask)
+                hand_counts_current, legal_mask)
             if self._shanten_hint:
                 features.append(hint)
             if self._discard_ukeire_hint:
@@ -303,11 +312,11 @@ class FlatFeatureEncoder(FeatureEncoder):
 
         # policy 用 current_shanten (CQ-0169)
         if self._current_shanten_input:
-            features.append(self._compute_current_shanten(hand_counts_p0))
+            features.append(self._compute_current_shanten(hand_counts_current))
 
         # 手牌形状ヒント (CQ-0170)
         if self._shape_hint:
-            features.append(self._compute_shape_hint(hand_counts_p0))
+            features.append(self._compute_shape_hint(hand_counts_current))
 
         # turn/time 文脈特徴 (CQ-0175)
         if self._turn_context:

@@ -141,6 +141,52 @@ def _rebuild_encoder(encoder_config: dict, obs_mode: str):
     )
 
 
+def _resolve_direct_hint_ranges(
+    pdh_cfg: dict, feature_ranges: dict[str, tuple[int, int]] | None,
+) -> dict[str, tuple[int, int]] | None:
+    """CQ-0203/CQ-0204: policy_direct_hints の source → range を解決・検証する
+
+    main process / worker の両方でこのヘルパーを使い、validation を統一する。
+    source が feature_ranges に見つからない場合は ValueError を送出する。
+    """
+    if not pdh_cfg.get("enabled", False):
+        return None
+    fr = feature_ranges or {}
+    sources = pdh_cfg.get("sources", [])
+    result = {}
+    for src in sources:
+        if src not in fr:
+            raise ValueError(
+                f"policy_direct_hints.sources の '{src}' が "
+                f"encoder feature_ranges に見つかりません "
+                f"(worker 再構築時)")
+        result[src] = fr[src]
+    return result
+
+
+def _rebuild_model(model_config: dict, encoder_meta) -> "MLPPolicyValueModel":
+    """model_config + encoder metadata からモデルを再構築する (CQ-0203, CQ-0204)"""
+    import math
+    input_dim = math.prod(encoder_meta.output_shape)
+    _vf = model_config.get("value_features", {})
+    _cs = _vf.get("current_shanten", {})
+    _vaux_dim = 1 if _cs.get("enabled", False) else 0
+    _pt = model_config.get("policy_tower", {})
+    _vt = model_config.get("value_tower", {})
+    _pdh = model_config.get("policy_direct_hints", {})
+    _dhr = _resolve_direct_hint_ranges(_pdh, encoder_meta.feature_ranges)
+    return MLPPolicyValueModel(
+        input_dim=input_dim,
+        hidden_dims=model_config.get("hidden_dims", [256, 128]),
+        value_heads=model_config.get("value_heads", ["round_delta"]),
+        value_aux_dim=_vaux_dim,
+        policy_tower_config=_pt if _pt.get("enabled", False) else None,
+        value_tower_config=_vt if _vt.get("enabled", False) else None,
+        policy_direct_hints_config=_pdh if _pdh.get("enabled", False) else None,
+        direct_hint_ranges=_dhr,
+    )
+
+
 def _eval_worker_fn(
     worker_id: int,
     model_path: str,
@@ -181,25 +227,8 @@ def _eval_worker_fn(
 
         # モデル・エンコーダ再構築 (ファイルから state_dict を読み込み)
         encoder = _rebuild_encoder(encoder_config, obs_mode)
-
-        import math
         meta = encoder.metadata()
-        input_dim = math.prod(meta.output_shape)
-        # CQ-0151: value_aux_dim
-        _vf = model_config.get("value_features", {})
-        _cs = _vf.get("current_shanten", {})
-        _vaux_dim = 1 if _cs.get("enabled", False) else 0
-        # CQ-0157: tower config
-        _pt = model_config.get("policy_tower", {})
-        _vt = model_config.get("value_tower", {})
-        model = MLPPolicyValueModel(
-            input_dim=input_dim,
-            hidden_dims=model_config.get("hidden_dims", [256, 128]),
-            value_heads=model_config.get("value_heads", ["round_delta"]),
-            value_aux_dim=_vaux_dim,
-            policy_tower_config=_pt if _pt.get("enabled", False) else None,
-            value_tower_config=_vt if _vt.get("enabled", False) else None,
-        )
+        model = _rebuild_model(model_config, meta)
         state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict)
         model.eval()
@@ -212,8 +241,9 @@ def _eval_worker_fn(
             _reward_config.point_delta_scale = reward_config_dict.get(
                 "point_delta_scale", 1.0)
 
-        # CQ-0153: value current_shanten 有効時は evaluator にも渡す
-        _cs_enabled = _cs.get("enabled", False)
+        # CQ-0153, CQ-0204: value current_shanten 有効時は evaluator にも渡す
+        _vf_cfg = model_config.get("value_features", {})
+        _cs_enabled = _vf_cfg.get("current_shanten", {}).get("enabled", False)
         eval_runner = EvaluationRunner(
             model=model, encoder=encoder, observation_mode=obs_mode,
             value_shanten_enabled=_cs_enabled,
@@ -279,25 +309,9 @@ def _selfplay_worker_fn(
         # エンコーダ再構築
         encoder = _rebuild_encoder(encoder_config, obs_mode)
 
-        # モデル再構築
-        import math
+        # モデル再構築 (CQ-0203: _rebuild_model で統一)
         meta = encoder.metadata()
-        input_dim = math.prod(meta.output_shape)
-        # CQ-0151: value_aux_dim
-        _vf2 = model_config.get("value_features", {})
-        _cs2 = _vf2.get("current_shanten", {})
-        _vaux_dim2 = 1 if _cs2.get("enabled", False) else 0
-        # CQ-0157: tower config
-        _pt2 = model_config.get("policy_tower", {})
-        _vt2 = model_config.get("value_tower", {})
-        model = MLPPolicyValueModel(
-            input_dim=input_dim,
-            hidden_dims=model_config.get("hidden_dims", [256, 128]),
-            value_heads=model_config.get("value_heads", ["round_delta"]),
-            value_aux_dim=_vaux_dim2,
-            policy_tower_config=_pt2 if _pt2.get("enabled", False) else None,
-            value_tower_config=_vt2 if _vt2.get("enabled", False) else None,
-        )
+        model = _rebuild_model(model_config, meta)
         state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(state_dict)
         model.eval()
@@ -1063,87 +1077,34 @@ class Stage1Runner:
 
     def _run_imitation(self, run_dir: Path, model, encoder,
                        profiler=None) -> dict:
-        """imitation warm start フェーズ
+        """imitation warm start フェーズ (CQ-0206: multi-chunk 対応)
 
-        imitation.num_workers > 1 の場合は multi-process で教師データを生成する。
+        multi_chunk_imitation.enabled=true の場合は chunk 単位で
+        「データ生成 → 学習」を繰り返す。
         """
+        mci = self._config.training.get("multi_chunk_imitation", {})
+        if mci.get("enabled", False):
+            return self._run_imitation_multi_chunk(
+                run_dir, model, encoder, mci, profiler)
+        return self._run_imitation_single(run_dir, model, encoder, profiler)
+
+    def _run_imitation_single(self, run_dir: Path, model, encoder,
+                              profiler=None) -> dict:
+        """単発 imitation (従来互換)"""
         sp_cfg = self._config.selfplay
         imitation_dir = run_dir / "imitation"
         num_workers = self._config.imitation.get("num_workers", 1)
 
-        # baseline 教師データ生成
-        imi_config = dict(self._as_dict())
-        imi_sp = dict(sp_cfg)
-        imi_sp["save_baseline_actions"] = True
-        imi_sp["policy_ratio"] = 0.0  # 全席 baseline
-        imi_config["selfplay"] = imi_sp
-
         imi_matches = sp_cfg.get("imitation_matches",
                                  sp_cfg.get("num_matches", 10))
-
-        if num_workers > 1:
-            sp_stats = self._run_imitation_parallel(
-                imitation_dir, model, imi_config, imi_matches, num_workers)
-        else:
-            sp_device = resolve_device(
-                sp_cfg.get("inference_device", "auto"))
-            worker = SelfPlayWorker(
-                config=imi_config,
-                model=model,
-                encoder=encoder,
-                output_dir=imitation_dir,
-                inference_device=sp_device,
-                profiler=profiler,
-            )
-            sp_stats = worker.run(
-                num_matches=imi_matches,
-                seed_start=sp_cfg.get("imitation_seed_start",
-                                      sp_cfg.get("seed_start", 0)),
-            )
+        sp_stats = self._generate_imitation_data(
+            imitation_dir, model, encoder, imi_matches, num_workers, profiler)
 
         logger.info(f"  imitation data: {sp_stats['total_steps']} steps")
 
-        # imitation 学習
-        imi_train_config = dict(self._as_dict())
-        imi_train_config["training"] = dict(imi_train_config["training"])
-        imi_train_config["training"]["algorithm"] = "imitation"
-
-        training_device = resolve_device(
-            self._config.training.get("device", "auto"))
-        learner = Learner(
-            config=imi_train_config,
-            model=model,
-            run_dir=run_dir,
-            device=training_device,
-        )
-        imi_epochs = self._config.training.get("imitation_epochs",
-                                                self._config.training.get("epochs", 4))
-        imi_filter = self._config.training.get("imitation_filter", None)
-        metrics = learner.train(
-            imitation_dir,
-            num_epochs=imi_epochs,
-            filter_actor_type="baseline",
-            imitation_filter=imi_filter,
-            profiler=profiler,
-        )
-        learner.save_checkpoint(tag="imitation")
-        logger.info(f"  imitation loss: {metrics['policy_loss']:.4f}")
-        # 教師再現メトリクス (CQ-0125, CQ-0128)
-        top1 = metrics.get("teacher_top1_match_rate")
-        best_set = metrics.get("teacher_best_set_hit_rate")
-        if top1 is not None:
-            msg = f"  teacher_top1_match_rate: {top1:.4f}"
-            if best_set is not None:
-                msg += f", teacher_best_set_hit_rate: {best_set:.4f}"
-            logger.info(msg)
-        tbm_status = metrics.get("teacher_best_set_status")
-        if tbm_status is not None:
-            logger.info(f"  teacher_best_set_status: {tbm_status}")
-        # CQ-0132: loss mode ログ
-        loss_mode = metrics.get("imitation_loss_mode")
-        if loss_mode is not None:
-            logger.info(f"  imitation_loss_mode: {loss_mode}")
-        # データ生成統計を学習 metrics に付加
+        metrics, learner_obj = self._train_imitation(run_dir, model, imitation_dir, profiler)
+        learner_obj.save_checkpoint(tag="imitation")
+        self._log_imitation_metrics(metrics)
         metrics["data_generation"] = {
             "total_steps": sp_stats.get("total_steps", 0),
             "num_matches": sp_stats.get("num_matches", 0),
@@ -1152,11 +1113,160 @@ class Stage1Runner:
         }
         return metrics
 
+    def _run_imitation_multi_chunk(self, run_dir: Path, model, encoder,
+                                   mci: dict, profiler=None) -> dict:
+        """CQ-0206: multi-chunk imitation"""
+        num_chunks = mci.get("num_chunks", 1)
+        matches_per_chunk = mci.get("imitation_matches_per_chunk", 10)
+        if num_chunks < 1:
+            raise ValueError(f"multi_chunk_imitation.num_chunks は 1 以上: {num_chunks}")
+        if matches_per_chunk < 1:
+            raise ValueError(f"multi_chunk_imitation.imitation_matches_per_chunk は 1 以上: {matches_per_chunk}")
+
+        sp_cfg = self._config.selfplay
+        num_workers = self._config.imitation.get("num_workers", 1)
+        base_seed = sp_cfg.get("imitation_seed_start",
+                               sp_cfg.get("seed_start", 0))
+
+        chunk_results: list[dict] = []
+        final_metrics: dict = {}
+
+        for ci in range(num_chunks):
+            chunk_label = f"chunk_{ci:02d}"
+            logger.info(f"  [imitation {chunk_label}] データ生成開始 ({matches_per_chunk} matches)")
+            chunk_dir = run_dir / "imitation" / chunk_label
+
+            # seed を chunk ごとにずらす
+            chunk_seed_start = base_seed + ci * matches_per_chunk
+
+            sp_stats = self._generate_imitation_data(
+                chunk_dir, model, encoder, matches_per_chunk,
+                num_workers, profiler, seed_start=chunk_seed_start)
+
+            logger.info(f"  [{chunk_label}] data: {sp_stats['total_steps']} steps")
+
+            # imitation 学習
+            metrics, last_learner = self._train_imitation(
+                run_dir, model, chunk_dir, profiler)
+            self._log_imitation_metrics(metrics, prefix=f"  [{chunk_label}]")
+
+            chunk_results.append({
+                "chunk_index": ci,
+                "num_matches": sp_stats.get("num_matches", 0),
+                "total_steps": sp_stats.get("total_steps", 0),
+                "policy_loss": metrics.get("policy_loss"),
+                "teacher_top1_match_rate": metrics.get("teacher_top1_match_rate"),
+                "teacher_best_set_hit_rate": metrics.get("teacher_best_set_hit_rate"),
+                "value_loss": metrics.get("value_loss"),
+            })
+            final_metrics = metrics
+
+        # 最終 checkpoint 保存 (学習済み Learner から保存)
+        last_learner.save_checkpoint(tag="imitation")
+
+        # 最終 chunk の metrics をベースに multi-chunk 情報を付加
+        final_metrics["multi_chunk_imitation"] = {
+            "enabled": True,
+            "num_chunks": num_chunks,
+            "imitation_matches_per_chunk": matches_per_chunk,
+        }
+        final_metrics["chunks"] = chunk_results
+        final_metrics["data_generation"] = {
+            "total_steps": sum(c["total_steps"] for c in chunk_results),
+            "num_matches": sum(c["num_matches"] for c in chunk_results),
+            "num_workers": num_workers,
+        }
+        return final_metrics
+
+    def _generate_imitation_data(self, output_dir: Path, model, encoder,
+                                 num_matches: int, num_workers: int,
+                                 profiler=None, seed_start: int | None = None) -> dict:
+        """baseline 教師データ生成 (single/multi-process)"""
+        sp_cfg = self._config.selfplay
+        imi_config = dict(self._as_dict())
+        imi_sp = dict(sp_cfg)
+        imi_sp["save_baseline_actions"] = True
+        imi_sp["policy_ratio"] = 0.0
+        imi_config["selfplay"] = imi_sp
+
+        if seed_start is None:
+            seed_start = sp_cfg.get("imitation_seed_start",
+                                    sp_cfg.get("seed_start", 0))
+
+        if num_workers > 1:
+            return self._run_imitation_parallel(
+                output_dir, model, imi_config, num_matches, num_workers,
+                base_seed=seed_start)
+        sp_device = resolve_device(sp_cfg.get("inference_device", "auto"))
+        worker = SelfPlayWorker(
+            config=imi_config,
+            model=model,
+            encoder=encoder,
+            output_dir=output_dir,
+            inference_device=sp_device,
+            profiler=profiler,
+        )
+        return worker.run(num_matches=num_matches, seed_start=seed_start)
+
+    def _train_imitation(self, run_dir: Path, model,
+                         shard_dir: Path, profiler=None,
+                         ) -> tuple[dict, "Learner"]:
+        """imitation 学習 (共通 helper)
+
+        Returns:
+            (metrics, learner): 学習結果と学習済み Learner
+        """
+        training_device = resolve_device(
+            self._config.training.get("device", "auto"))
+        learner = Learner(
+            config=self._make_imitation_train_config(),
+            model=model,
+            run_dir=run_dir,
+            device=training_device,
+        )
+        imi_epochs = self._config.training.get("imitation_epochs",
+                                                self._config.training.get("epochs", 4))
+        imi_filter = self._config.training.get("imitation_filter", None)
+        metrics = learner.train(
+            shard_dir,
+            num_epochs=imi_epochs,
+            filter_actor_type="baseline",
+            imitation_filter=imi_filter,
+            profiler=profiler,
+        )
+        return metrics, learner
+
+    def _make_imitation_train_config(self) -> dict:
+        """imitation 用 training config を構築する"""
+        cfg = dict(self._as_dict())
+        cfg["training"] = dict(cfg["training"])
+        cfg["training"]["algorithm"] = "imitation"
+        return cfg
+
+    @staticmethod
+    def _log_imitation_metrics(metrics: dict, prefix: str = " ") -> None:
+        """imitation 学習結果をログ出力する"""
+        logger.info(f"{prefix} imitation loss: {metrics.get('policy_loss', 0):.4f}")
+        top1 = metrics.get("teacher_top1_match_rate")
+        best_set = metrics.get("teacher_best_set_hit_rate")
+        if top1 is not None:
+            msg = f"{prefix} teacher_top1_match_rate: {top1:.4f}"
+            if best_set is not None:
+                msg += f", teacher_best_set_hit_rate: {best_set:.4f}"
+            logger.info(msg)
+        tbm_status = metrics.get("teacher_best_set_status")
+        if tbm_status is not None:
+            logger.info(f"{prefix} teacher_best_set_status: {tbm_status}")
+        loss_mode = metrics.get("imitation_loss_mode")
+        if loss_mode is not None:
+            logger.info(f"{prefix} imitation_loss_mode: {loss_mode}")
+
     def _run_imitation_parallel(
         self, imitation_dir: Path, model, imi_config: dict,
         num_matches: int, num_workers: int,
+        base_seed: int | None = None,
     ) -> dict:
-        """multi-process imitation 教師データ生成
+        """multi-process imitation 教師データ生成 (CQ-0207: base_seed 引き渡し)
 
         _run_selfplay_parallel と同じパターンで worker を起動し、
         imitation/worker_<id>/shard_*.parquet に保存する。
@@ -1164,7 +1274,8 @@ class Stage1Runner:
         sp_cfg = self._config.selfplay
         imitation_dir.mkdir(parents=True, exist_ok=True)
         num_threads = sp_cfg.get("worker_num_threads", 1)
-        base_seed = self._global_seed or 0
+        if base_seed is None:
+            base_seed = self._global_seed or 0
         obs_mode = self._config.experiment.get("observation_mode", "full")
 
         # model を一時ファイルに保存
@@ -1777,7 +1888,7 @@ class Stage1Runner:
         )
 
     def _create_model(self, encoder):
-        """設定からモデルを生成する"""
+        """設定からモデルを生成する (CQ-0157, CQ-0203)"""
         model_cfg = self._config.model
         hidden_dims = model_cfg.get("hidden_dims", [256, 128])
         value_heads = model_cfg.get("value_heads", ["round_delta"])
@@ -1796,6 +1907,18 @@ class Stage1Runner:
         pt_cfg = model_cfg.get("policy_tower", {})
         vt_cfg = model_cfg.get("value_tower", {})
 
+        # CQ-0203, CQ-0204: policy_direct_hints config + encoder 整合検証
+        pdh_cfg = model_cfg.get("policy_direct_hints", {})
+        if pdh_cfg.get("enabled", False):
+            enc_cfg = self._config.feature_encoder
+            for src in pdh_cfg.get("sources", []):
+                if not _parse_encoder_flag(enc_cfg, src):
+                    raise ValueError(
+                        f"policy_direct_hints.sources に '{src}' があるが、"
+                        f"feature_encoder.{src} が無効です")
+        direct_hint_ranges = _resolve_direct_hint_ranges(
+            pdh_cfg, meta.feature_ranges)
+
         return MLPPolicyValueModel(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
@@ -1803,6 +1926,8 @@ class Stage1Runner:
             value_aux_dim=value_aux_dim,
             policy_tower_config=pt_cfg if pt_cfg.get("enabled", False) else None,
             value_tower_config=vt_cfg if vt_cfg.get("enabled", False) else None,
+            policy_direct_hints_config=pdh_cfg if pdh_cfg.get("enabled", False) else None,
+            direct_hint_ranges=direct_hint_ranges,
         )
 
     def _setup_file_logging(self, run_dir: Path) -> logging.FileHandler:
@@ -1880,11 +2005,15 @@ class Stage1Runner:
             if imi_dir.exists():
                 imi_flat = list(imi_dir.glob("shard_*.parquet"))
                 imi_nested = list(imi_dir.glob("worker_*/shard_*.parquet"))
-                imi_shard_count = len(set(imi_flat) | set(imi_nested))
+                # CQ-0207: multi-chunk imitation の chunk 配下も集計
+                imi_chunk_flat = list(imi_dir.glob("chunk_*/shard_*.parquet"))
+                imi_chunk_nested = list(imi_dir.glob("chunk_*/worker_*/shard_*.parquet"))
+                imi_shard_count = len(set(imi_flat) | set(imi_nested)
+                                      | set(imi_chunk_flat) | set(imi_chunk_nested))
             else:
                 imi_shard_count = 0
             dg = imi.get("data_generation", {})
-            phase_stats["imitation"] = {
+            imi_stats: dict = {
                 "total_steps": dg.get("total_steps", imi.get("total_steps", 0)),
                 "num_updates": imi.get("num_updates", 0),
                 "shard_count": imi_shard_count,
@@ -1902,6 +2031,14 @@ class Stage1Runner:
                 "value_loss": imi.get("value_loss"),
                 "imitation_value_warmstart": imi.get("imitation_value_warmstart"),
             }
+            # CQ-0206: multi-chunk imitation
+            mci_info = imi.get("multi_chunk_imitation")
+            if mci_info is not None:
+                imi_stats["multi_chunk_imitation"] = mci_info
+            chunks = imi.get("chunks")
+            if chunks is not None:
+                imi_stats["chunks"] = chunks
+            phase_stats["imitation"] = imi_stats
         if "train_metrics" in result:
             tm = result["train_metrics"]
             phase_stats["learner"] = {
@@ -2007,12 +2144,13 @@ class Stage1Runner:
             "input_dim": result.get("input_dim"),
         }
 
-        # CQ-0151, CQ-0152, CQ-0157: model_features を記録
+        # CQ-0151, CQ-0152, CQ-0157, CQ-0203: model_features を記録
         model_cfg = self._config.model
         vf_cfg = model_cfg.get("value_features", {})
         cs_cfg = vf_cfg.get("current_shanten", {})
         pt_cfg = model_cfg.get("policy_tower", {})
         vt_cfg = model_cfg.get("value_tower", {})
+        pdh_cfg = model_cfg.get("policy_direct_hints", {})
         summary["model_features"] = {
             "value_features": {
                 "current_shanten": {
@@ -2026,6 +2164,15 @@ class Stage1Runner:
             "value_tower": {
                 "enabled": vt_cfg.get("enabled", False),
                 "hidden_dim": vt_cfg.get("hidden_dim"),
+            },
+            # CQ-0203: policy_direct_hints
+            "policy_direct_hints": {
+                "enabled": pdh_cfg.get("enabled", False),
+                "sources": pdh_cfg.get("sources", []),
+                "local_hidden_dim": pdh_cfg.get("local_hidden_dim"),
+                "tile_embedding_dim": pdh_cfg.get("tile_embedding_dim"),
+                "context_gate_enabled": pdh_cfg.get(
+                    "context_gate", {}).get("enabled", False),
             },
         }
 
@@ -2072,12 +2219,15 @@ class Stage1Runner:
             "path": "checkpoints/checkpoint_imitation.pt",
         }
 
-        # imitation shard
+        # imitation shard (CQ-0207: chunk 配下も集計)
         imi_dir = run_dir / "imitation"
         if imi_dir.exists():
             imi_flat = list(imi_dir.glob("shard_*.parquet"))
             imi_nested = list(imi_dir.glob("worker_*/shard_*.parquet"))
-            imi_shard_count = len(set(imi_flat) | set(imi_nested))
+            imi_chunk_flat = list(imi_dir.glob("chunk_*/shard_*.parquet"))
+            imi_chunk_nested = list(imi_dir.glob("chunk_*/worker_*/shard_*.parquet"))
+            imi_shard_count = len(set(imi_flat) | set(imi_nested)
+                                  | set(imi_chunk_flat) | set(imi_chunk_nested))
         else:
             imi_shard_count = 0
         artifacts["imitation_shards"] = {

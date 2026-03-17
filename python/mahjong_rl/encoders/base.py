@@ -20,6 +20,9 @@ class EncoderMetadata:
     observation_mode: str  # "full", "partial", "both"
     name: str
     description: str = ""
+    # CQ-0203: optional feature block の index range
+    # key -> (start, end) で feature vector の slice を表す
+    feature_ranges: dict[str, tuple[int, int]] | None = None
 
 
 class FeatureEncoder(ABC):
