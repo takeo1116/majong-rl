@@ -1,20 +1,20 @@
 # Experiment Report: exp_041
 
 作成日: 2026-03-17  
-対象: [experiments/exp_041/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_041/runbook.md)  
+対象: `experiments/exp_041/runbook.md`  
 目的: `discard_ukeire_hint` を OFF にしたとき、`exp_040 B` で顕在化した実行時間悪化をどこまで解消できるか、また性能劣化なしで維持できるかを確認する
 
 ## 1. 実験概要
 
 比較条件:
 - A reference: `exp_040 B`
-  - batch: `runs/20260313_stage1_full_flat_mlp_imitation_then_ppo_batch_1927d470`
+  - batch: （ローカル run）
   - encoder:
     - `discard_ukeire_hint=true`
     - `current_shanten=true`
     - `shape_hint=true`
 - B new run: `discard_ukeire_hint=false`
-  - batch: `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_4aae4f28`
+  - batch: （ローカル run）
   - encoder:
     - `discard_ukeire_hint=false`
     - `current_shanten=true`

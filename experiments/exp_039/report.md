@@ -1,7 +1,7 @@
 # Experiment Report: exp_039
 
 作成日: 2026-03-13  
-対象: [experiments/exp_039/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_039/runbook.md)  
+対象: `experiments/exp_039/runbook.md`  
 目的: `exp_038 B` を基準に imitation データをさらに増やし、`eval_before` がまだ伸びるか、またその改善が PPO 後の最終性能にも波及するかを確認する
 
 ## 1. 実験概要
@@ -30,8 +30,8 @@
 - seeds: `42,43,44,45,46`
 
 batch:
-- A reference: `runs/20260313_stage1_full_flat_mlp_imitation_then_ppo_batch_4c6fdea1`
-- B: `runs/20260313_stage1_full_flat_mlp_imitation_then_ppo_batch_fd32f5ff`
+- A reference: （ローカル run）
+- B: （ローカル run）
 
 B は `success_count = 5/5`。
 

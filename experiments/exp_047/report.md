@@ -1,7 +1,7 @@
 # Experiment Report: exp_047
 
 作成日: 2026-03-15  
-対象: [experiments/exp_047/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_047/runbook.md)  
+対象: `experiments/exp_047/runbook.md`  
 目的: `policy_anchor (KL)` の係数 `0.3 / 0.5` を `3 cycle` で比較する
 
 ## 1. 実験概要
@@ -21,8 +21,8 @@
 
 | 条件 | batch_dir | success |
 |---|---|---:|
-| A (coef=0.3) | `runs/20260315_stage1_full_flat_mlp_imitation_then_ppo_batch_e24de01c` | 20/20 |
-| B (coef=0.5) | `runs/20260315_stage1_full_flat_mlp_imitation_then_ppo_batch_66bf4cf4` | 20/20 |
+| A (coef=0.3) | （ローカル run） | 20/20 |
+| B (coef=0.5) | （ローカル run） | 20/20 |
 
 driver完了: `completed=2, failed=0`
 

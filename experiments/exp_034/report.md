@@ -1,7 +1,7 @@
 # Experiment Report: exp_034
 
 作成日: 2026-03-12  
-対象: [experiments/exp_034/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_034/runbook.md)  
+対象: `experiments/exp_034/runbook.md`  
 目的: `exclude_post_riichi_discards=true` を維持したまま、`hidden_dims=[512,256] + dual_towers` によって PPO 後悪化と診断指標が改善するかを確認する
 
 ## 1. 実験概要
@@ -31,7 +31,7 @@
 - seeds: `42,43,44,45,46`
 
 batch:
-- A: `runs/20260312_stage1_full_flat_mlp_imitation_then_ppo_batch_4764bb2a`
+- A: （ローカル run）
 
 比較基準:
 - `exp_033` exclude post-riichi

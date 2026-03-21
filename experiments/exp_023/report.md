@@ -40,8 +40,8 @@
 
 | 条件 | batch_dir | success |
 |---|---|---:|
-| A | `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_8000b965` | 5/5 |
-| B | `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_c591d684` | 5/5 |
+| A | （ローカル run） | 5/5 |
+| B | （ローカル run） | 5/5 |
 
 両条件とも `shanten_diag.status=partial` で、`unavailable_samples` は各 run おおむね `800`。  
 初回打牌など unavailable を除外したうえで、`improve/same/worsen` の 3 群が成立している。

@@ -21,8 +21,8 @@ Source Runbook: `experiments/exp_004/runbook.md`
 
 ## 2. 対象 batch
 
-- A: `runs/20260306_stage1_full_flat_mlp_ppo_batch_fd8b3343`
-- E: `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_3585de77`
+- A: （ローカル run）
+- E: （ローカル run）
 
 両者とも `success_count=5/5`、`aggregate.eval_mode=rotation` を確認。
 

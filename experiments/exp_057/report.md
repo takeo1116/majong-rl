@@ -1,7 +1,7 @@
 # Experiment Report: exp_057
 
 作成日: 2026-03-17  
-対象: [experiments/exp_057/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_057/runbook.md)  
+対象: `experiments/exp_057/runbook.md`  
 目的: `imitation=0 + policy_ratio=0.0 + mixed_ppo + gae=0.0 + shanten_delta.scale=0.003` を固定し、`gamma=0.95 / 0.75 / 0.50` を **30 cycles** まで延長したときに、10 cycle では見えにくかった peak 位置と戻りがどう変わるかを確認する
 
 ## 1. 実験概要

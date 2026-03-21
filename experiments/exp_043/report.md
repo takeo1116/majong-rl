@@ -1,7 +1,7 @@
 # Experiment Report: exp_043
 
 作成日: 2026-03-14  
-対象: [experiments/exp_043/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_043/runbook.md)  
+対象: `experiments/exp_043/runbook.md`  
 目的: 高速化後に `7 conditions × 20 seeds` を一括実行し、PPO 更新強度と `discard_ukeire_hint` の有効性を評価する
 
 ## 1. 実験概要
@@ -25,13 +25,13 @@
 
 | 条件 | batch | success |
 |---|---|---:|
-| A | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_b41896eb` | 20/20 |
-| B | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_72cb3258` | 20/20 |
-| C | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_2a6a8fb6` | 20/20 |
-| D | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_51d93569` | 20/20 |
-| E | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_026f2472` | 20/20 |
-| F | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_c4ca47a3` | 20/20 |
-| G | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_6c3fd62d` | 20/20 |
+| A | （ローカル run） | 20/20 |
+| B | （ローカル run） | 20/20 |
+| C | （ローカル run） | 20/20 |
+| D | （ローカル run） | 20/20 |
+| E | （ローカル run） | 20/20 |
+| F | （ローカル run） | 20/20 |
+| G | （ローカル run） | 20/20 |
 
 全条件完走。
 

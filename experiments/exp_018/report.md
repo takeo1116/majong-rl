@@ -26,7 +26,7 @@
 
 | 条件 | run/batch | success |
 |---|---|---:|
-| REF | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_*` x5 | 5/5 |
+| REF | （ローカル run） x5 | 5/5 |
 | A | reuse run x5 | 5/5 |
 | B | reuse run x5 | 5/5 |
 | C | reuse run x5 | 5/5 |
@@ -161,23 +161,23 @@ run_map はローカル管理なので、比較に必要な対応をここへ転
 
 | seed | role | run_dir | source_run_dir | 備考 |
 |---|---|---|---|---|
-| 42 | REF | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_a09eacdf` |  | full run |
-| 42 | A | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_e0c47606` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_a09eacdf` | reuse |
-| 42 | B | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_4cc5c2ee` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_a09eacdf` | reuse |
-| 42 | C | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_20a0f568` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_a09eacdf` | reuse |
-| 43 | REF | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_c7d1346d` |  | full run |
-| 43 | A | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_5c509904` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_c7d1346d` | reuse |
-| 43 | B | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_9b852ca3` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_c7d1346d` | reuse |
-| 43 | C | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_3d10b302` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_c7d1346d` | reuse |
-| 44 | REF | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_4b9310c4` |  | full run |
-| 44 | A | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_42d93e6d` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_4b9310c4` | reuse |
-| 44 | B | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_19a17f0d` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_4b9310c4` | reuse |
-| 44 | C | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_ead02ad2` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_4b9310c4` | reuse |
-| 45 | REF | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_20a65200` |  | full run |
-| 45 | A | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_d3eaa5c0` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_20a65200` | reuse |
-| 45 | B | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_2ac46e2c` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_20a65200` | reuse |
-| 45 | C | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_eee58caf` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_20a65200` | reuse |
-| 46 | REF | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_197f145d` |  | full run |
-| 46 | A | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_9fb18e1f` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_197f145d` | reuse |
-| 46 | B | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_ccf73b2b` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_197f145d` | reuse |
-| 46 | C | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_2e57548b` | `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_197f145d` | reuse |
+| 42 | REF | （ローカル run） |  | full run |
+| 42 | A | （ローカル run） | （ローカル run） | reuse |
+| 42 | B | （ローカル run） | （ローカル run） | reuse |
+| 42 | C | （ローカル run） | （ローカル run） | reuse |
+| 43 | REF | （ローカル run） |  | full run |
+| 43 | A | （ローカル run） | （ローカル run） | reuse |
+| 43 | B | （ローカル run） | （ローカル run） | reuse |
+| 43 | C | （ローカル run） | （ローカル run） | reuse |
+| 44 | REF | （ローカル run） |  | full run |
+| 44 | A | （ローカル run） | （ローカル run） | reuse |
+| 44 | B | （ローカル run） | （ローカル run） | reuse |
+| 44 | C | （ローカル run） | （ローカル run） | reuse |
+| 45 | REF | （ローカル run） |  | full run |
+| 45 | A | （ローカル run） | （ローカル run） | reuse |
+| 45 | B | （ローカル run） | （ローカル run） | reuse |
+| 45 | C | （ローカル run） | （ローカル run） | reuse |
+| 46 | REF | （ローカル run） |  | full run |
+| 46 | A | （ローカル run） | （ローカル run） | reuse |
+| 46 | B | （ローカル run） | （ローカル run） | reuse |
+| 46 | C | （ローカル run） | （ローカル run） | reuse |

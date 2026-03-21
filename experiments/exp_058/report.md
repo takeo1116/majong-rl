@@ -1,7 +1,7 @@
 # Experiment Report: exp_058
 
 作成日: 2026-03-17  
-対象: [experiments/exp_058/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_058/runbook.md)  
+対象: `experiments/exp_058/runbook.md`  
 目的: `imitation-only` 条件で旧モデルと `policy_direct_hints + context_gate` 新モデルを `3 seeds` で直接比較し、architecture 変更そのものが teacher 模倣と対戦性能にどれだけ効くかを確認する
 
 ## 1. 実験概要
@@ -35,8 +35,8 @@
 - 失敗条件数: `0`
 
 参照:
-- 旧モデル: [batch_summary.json](/home/takeo1116/Git/majong-rl/runs/20260317_stage1_full_flat_mlp_imitation_then_ppo_batch_e78e83c7/batch_summary.json)
-- 新モデル: [batch_summary.json](/home/takeo1116/Git/majong-rl/runs/20260317_stage1_full_flat_mlp_imitation_then_ppo_batch_1926a7f2/batch_summary.json)
+- 旧モデル: （ローカル成果物）
+- 新モデル: （ローカル成果物）
 
 ## 3. seed ごとの結果
 

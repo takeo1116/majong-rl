@@ -19,10 +19,10 @@
   - D: `training.clip_epsilon=0.1`
 
 実行 batch_dir:
-- A: `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_37703f02`
-- B: `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_ea4b4789`
-- C: `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_a4992bbb`
-- D: `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_1356d5e3`
+- A: （ローカル run）
+- B: （ローカル run）
+- C: （ローカル run）
+- D: （ローカル run）
 
 全条件で `success_count=3/3`、`aggregate.eval_mode=rotation` を確認。
 

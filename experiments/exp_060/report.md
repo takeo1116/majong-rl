@@ -1,7 +1,7 @@
 # Experiment Report: exp_060
 
 作成日: 2026-03-18  
-対象: [runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_060/runbook.md)  
+対象: `experiments/exp_060/runbook.md`  
 目的: CQ-0208 修正後の `full` 観測補助特徴バグが解消された条件で、`imitation 1000 x 10 chunks` の短尺 A/B 比較を行い、旧モデルと `policy_direct_hints + context_gate` 新モデルの性能差を再確認する
 
 ## 1. 実験概要
@@ -36,8 +36,8 @@
 - 失敗条件数: `0`
 
 参照:
-- 旧モデル: [batch_summary.json](/home/takeo1116/Git/majong-rl/runs/20260318_stage1_full_flat_mlp_imitation_then_ppo_batch_f9614f75/batch_summary.json)
-- 新モデル: [batch_summary.json](/home/takeo1116/Git/majong-rl/runs/20260318_stage1_full_flat_mlp_imitation_then_ppo_batch_5cecde4e/batch_summary.json)
+- 旧モデル: （ローカル成果物）
+- 新モデル: （ローカル成果物）
 
 ## 3. 条件別結果
 

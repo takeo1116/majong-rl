@@ -1,7 +1,7 @@
 # Experiment Report: exp_059
 
 作成日: 2026-03-17  
-対象: [experiments/exp_059/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_059/runbook.md)  
+対象: `experiments/exp_059/runbook.md`  
 目的: `multi_chunk_imitation` を用いて `1000 matches x 50 chunks x 1 seed` の長い imitation-only 学習を行い、旧モデルと `policy_direct_hints + context_gate` 新モデルの ceiling と学習曲線を比較する
 
 ## 1. 実験概要
@@ -38,8 +38,8 @@
 - 失敗条件数: `0`
 
 参照:
-- 旧モデル: [batch_summary.json](/home/takeo1116/Git/majong-rl/runs/20260317_stage1_full_flat_mlp_imitation_then_ppo_batch_1318380a/batch_summary.json)
-- 新モデル: [batch_summary.json](/home/takeo1116/Git/majong-rl/runs/20260317_stage1_full_flat_mlp_imitation_then_ppo_batch_f171d367/batch_summary.json)
+- 旧モデル: （ローカル成果物）
+- 新モデル: （ローカル成果物）
 
 ## 3. 最終結果
 

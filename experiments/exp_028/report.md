@@ -39,8 +39,8 @@
 
 ## 2. 実行結果
 
-- A batch: `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_143b17c2`
-- B batch: `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_427f9506`
+- A batch: （ローカル run）
+- B batch: （ローカル run）
 - 両条件とも `success_count = 5/5`
 - `summary.json.success=true`
 - `shanten_diag` / `turn_diag` を全 run で確認

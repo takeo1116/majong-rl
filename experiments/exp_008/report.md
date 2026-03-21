@@ -28,8 +28,8 @@
   - `evaluation.inference_device=cpu`
 
 条件別 batch_dir:
-- A (`training.epochs=2`): `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_19478a92`
-- B (`training.epochs=4`): `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_0f1f5ec4`
+- A (`training.epochs=2`): （ローカル run）
+- B (`training.epochs=4`): （ローカル run）
 
 成功率:
 - A: `5/5`

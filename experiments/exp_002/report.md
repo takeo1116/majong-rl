@@ -19,13 +19,13 @@ Source Runbook: `experiments/exp_002/runbook.md`
 
 | eval workers | run_dir | 総時間(s) | eval_before(s) | eval(s) | 総時間 speedup (vs 1) | eval speedup (vs 1) |
 |---:|---|---:|---:|---:|---:|---:|
-| 1  | `runs/20260305_stage1_full_flat_mlp_ppo_64051b2a` | 327 | 150 | 143 | 1.00 | 1.00 |
-| 4  | `runs/20260305_stage1_full_flat_mlp_ppo_90900a47` | 132 | 48  | 47  | 2.48 | 3.04 |
-| 8  | `runs/20260305_stage1_full_flat_mlp_ppo_e9480fc3` | 99  | 31  | 33  | 3.30 | 4.33 |
-| 10 | `runs/20260305_stage1_full_flat_mlp_ppo_4300df92` | 82  | 26  | 23  | 3.99 | 6.22 |
-| 12 | `runs/20260305_stage1_full_flat_mlp_ppo_2d075785` | 85  | 26  | 24  | 3.85 | 5.96 |
-| 16 | `runs/20260305_stage1_full_flat_mlp_ppo_938db4bb` | 88  | 27  | 25  | 3.72 | 5.72 |
-| 20 | `runs/20260305_stage1_full_flat_mlp_ppo_0aefab28` | 81  | 24  | 22  | 4.04 | 6.50 |
+| 1  | （ローカル run） | 327 | 150 | 143 | 1.00 | 1.00 |
+| 4  | （ローカル run） | 132 | 48  | 47  | 2.48 | 3.04 |
+| 8  | （ローカル run） | 99  | 31  | 33  | 3.30 | 4.33 |
+| 10 | （ローカル run） | 82  | 26  | 23  | 3.99 | 6.22 |
+| 12 | （ローカル run） | 85  | 26  | 24  | 3.85 | 5.96 |
+| 16 | （ローカル run） | 88  | 27  | 25  | 3.72 | 5.72 |
+| 20 | （ローカル run） | 81  | 24  | 22  | 4.04 | 6.50 |
 
 ### 1.2 結論（実験A）
 
@@ -37,7 +37,7 @@ Source Runbook: `experiments/exp_002/runbook.md`
 
 ## 2. 実験B: PPO直学習の多seed比較
 
-batch_dir: `runs/20260305_stage1_full_flat_mlp_ppo_batch_4a6c25d1`  
+batch_dir: （ローカル run）  
 seed: 42,43,44,45,46  
 条件: `selfplay.num_workers=8`, `evaluation.num_workers=10`
 
@@ -67,7 +67,7 @@ seed: 42,43,44,45,46
 
 ## 3. 実験C: imitation → PPO の多seed比較
 
-batch_dir: `runs/20260305_stage1_full_flat_mlp_imitation_then_ppo_batch_336246a3`  
+batch_dir: （ローカル run）  
 seed: 42,43,44,45,46  
 条件: 実験Bと同一（configのみ `imitation_then_ppo`）
 

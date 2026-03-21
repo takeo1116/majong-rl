@@ -1,7 +1,7 @@
 # Experiment Report: exp_053
 
 作成日: 2026-03-16  
-対象: [experiments/exp_053/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_053/runbook.md)  
+対象: `experiments/exp_053/runbook.md`  
 目的: `imitation=0 + policy_ratio=0.0 + mixed_ppo` の簡約問題で、`lr / clip / batch / gae` を振って「最初は上がるがその後戻る」挙動の主因が update overshoot か target 設計かを切り分ける
 
 ## 1. 実験概要

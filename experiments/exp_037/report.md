@@ -1,7 +1,7 @@
 # Experiment Report: exp_037
 
 作成日: 2026-03-13  
-対象: [experiments/exp_037/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_037/runbook.md)  
+対象: `experiments/exp_037/runbook.md`  
 目的: `exp_035` を高表現力 baseline として、`gae_lambda` 短縮と imitation value warmstart 強化が PPO 安定性と after 指標を改善するかをコード変更なしで確認する
 
 ## 1. 実験概要
@@ -42,10 +42,10 @@
 - seeds: `42,43,44,45,46`
 
 batch:
-- A: `runs/20260312_stage1_full_flat_mlp_imitation_then_ppo_batch_39dc4ffb`
-- B: `runs/20260312_stage1_full_flat_mlp_imitation_then_ppo_batch_2775597e`
-- C: `runs/20260312_stage1_full_flat_mlp_imitation_then_ppo_batch_4b78a75b`
-- D: `runs/20260312_stage1_full_flat_mlp_imitation_then_ppo_batch_1d5383df`
+- A: （ローカル run）
+- B: （ローカル run）
+- C: （ローカル run）
+- D: （ローカル run）
 
 比較基準:
 - `exp_035`

@@ -22,11 +22,11 @@ Source Runbook: `experiments/exp_003/runbook.md`
 
 | 実験 | batch_dir | imitation_matches | imitation_epochs | policy_ratio | save_baseline_actions | selfplay_matches | eval_matches | epochs |
 |---|---|---:|---:|---:|---|---:|---:|---:|
-| A | runs/20260305_stage1_full_flat_mlp_ppo_batch_b1764667 | - | - | 1.0 | false | 200 | 50 | 4 |
-| B | runs/20260305_stage1_full_flat_mlp_imitation_then_ppo_batch_fc6e0e01 | 50 | 8 | 0.5 | true | 200 | 50 | 4 |
-| C | runs/20260305_stage1_full_flat_mlp_imitation_then_ppo_batch_5bae3b83 | 25 | 4 | 0.5 | true | 200 | 50 | 4 |
-| D | runs/20260305_stage1_full_flat_mlp_imitation_then_ppo_batch_292952f4 | 50 | 8 | 1.0 | false | 200 | 50 | 4 |
-| E | runs/20260305_stage1_full_flat_mlp_imitation_then_ppo_batch_8990ada5 | 25 | 4 | 1.0 | false | 200 | 50 | 4 |
+| A | （ローカル run） | - | - | 1.0 | false | 200 | 50 | 4 |
+| B | （ローカル run） | 50 | 8 | 0.5 | true | 200 | 50 | 4 |
+| C | （ローカル run） | 25 | 4 | 0.5 | true | 200 | 50 | 4 |
+| D | （ローカル run） | 50 | 8 | 1.0 | false | 200 | 50 | 4 |
+| E | （ローカル run） | 25 | 4 | 1.0 | false | 200 | 50 | 4 |
 
 共通:
 - seeds: 42-51 (10本)

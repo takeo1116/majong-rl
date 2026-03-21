@@ -1,7 +1,7 @@
 # Experiment Report: exp_036
 
 作成日: 2026-03-12  
-対象: [experiments/exp_036/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_036/runbook.md)  
+対象: `experiments/exp_036/runbook.md`  
 目的: 高表現力モデル + 立直後打牌除外条件で、`batch_size=1024` と `lr` の組み合わせ最適化を確認する
 
 ## 1. 実験概要
@@ -27,8 +27,8 @@
 - seeds: `42,43,44,45,46`
 
 batch:
-- A: `runs/20260312_stage1_full_flat_mlp_imitation_then_ppo_batch_1c05c2f0`
-- B: `runs/20260312_stage1_full_flat_mlp_imitation_then_ppo_batch_8dad59b4`
+- A: （ローカル run）
+- B: （ローカル run）
 
 比較基準:
 - `exp_035` (`batch_size=512`, `epochs=2`, `lr=1e-4`)

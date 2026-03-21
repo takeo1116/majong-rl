@@ -22,9 +22,9 @@
 
 | 条件 | run/batch | success |
 |---|---|---:|
-| A | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_80096099` | 5/5 |
-| B | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_32343a7d` | 5/5 |
-| C | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_36dd423d` | 5/5 |
+| A | （ローカル run） | 5/5 |
+| B | （ローカル run） | 5/5 |
+| C | （ローカル run） | 5/5 |
 
 注記:
 - 初回 driver 実行では override 記法の不整合で B 開始前に停止した。driver を修正後、全条件を再実行して本集計に使用した。
@@ -121,6 +121,6 @@ run_map はローカル管理なので、比較に必要な対応はここへ転
 
 | condition | batch_dir | 備考 |
 |---|---|---|
-| A | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_80096099` | baseline reward |
-| B | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_32343a7d` | shanten constant |
-| C | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_36dd423d` | shanten linear decay |
+| A | （ローカル run） | baseline reward |
+| B | （ローカル run） | shanten constant |
+| C | （ローカル run） | shanten linear decay |

@@ -29,7 +29,7 @@
   - `evaluation.inference_device=cpu`
 
 batch_dir:
-- `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_6892dd9e`
+- （ローカル run）
 
 成功率:
 - `5/5`（100%）
@@ -69,11 +69,11 @@ batch_dir:
 比較対象を以下で固定する。
 
 - **主比較**: Runbook5 条件C（同一設定、3 seeds, eval=20）  
-  - batch: `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_a4992bbb`
+  - batch: （ローカル run）
 - **補助比較**: Runbook5 条件A baseline（3 seeds, eval=20）  
-  - batch: `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_37703f02`
+  - batch: （ローカル run）
 - **参考**: Runbook4 E（5 seeds, eval=50）  
-  - batch: `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_3585de77`
+  - batch: （ローカル run）
 
 ### 3.1 Runbook5-C との比較
 

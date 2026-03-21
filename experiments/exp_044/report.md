@@ -1,7 +1,7 @@
 # Experiment Report: exp_044
 
 作成日: 2026-03-14  
-対象: [experiments/exp_044/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_044/runbook.md)  
+対象: `experiments/exp_044/runbook.md`  
 目的: `exp_043 E` 基準で `turn_context` / `huber` / `advantage clip` の寄与を切り分ける
 
 ## 1. 実験概要
@@ -23,11 +23,11 @@
 
 | 条件 | batch_dir | success |
 |---|---|---:|
-| A | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_b56116b6` | 20/20 |
-| B | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_887808df` | 20/20 |
-| C | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_63d664a3` | 20/20 |
-| D | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_c490c231` | 20/20 |
-| E | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_9cb2ced5` | 20/20 |
+| A | （ローカル run） | 20/20 |
+| B | （ローカル run） | 20/20 |
+| C | （ローカル run） | 20/20 |
+| D | （ローカル run） | 20/20 |
+| E | （ローカル run） | 20/20 |
 
 全条件完走（driver: `completed=5, failed=0`）。
 

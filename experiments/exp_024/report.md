@@ -55,11 +55,11 @@
 
 | 条件 | batch_dir | success |
 |---|---|---:|
-| A | `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_cd96aa97` | 5/5 |
-| B | `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_7faba3f9` | 5/5 |
-| C | `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_39b783c2` | 5/5 |
-| D | `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_481d40cd` | 5/5 |
-| E | `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_99e80807` | 5/5 |
+| A | （ローカル run） | 5/5 |
+| B | （ローカル run） | 5/5 |
+| C | （ローカル run） | 5/5 |
+| D | （ローカル run） | 5/5 |
+| E | （ローカル run） | 5/5 |
 
 全条件で `summary.json.success=true`、`aggregate.eval_mode=rotation` を確認。  
 joint imitation 有効条件では `summary.phase_stats.imitation.value_loss` と `summary.phase_stats.imitation.imitation_value_warmstart` を確認。  

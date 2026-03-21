@@ -28,7 +28,7 @@
 - seeds: `42,43,44,45,46`
 
 batch:
-- A: `runs/20260311_stage1_full_flat_mlp_imitation_then_ppo_batch_c69c6c51`
+- A: （ローカル run）
 
 `success_count = 5/5`。
 

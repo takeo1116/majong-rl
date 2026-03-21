@@ -1,17 +1,17 @@
 # Experiment Report: exp_040
 
 作成日: 2026-03-17  
-対象: [experiments/exp_040/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_040/runbook.md)  
+対象: `experiments/exp_040/runbook.md`  
 目的: `discard_ukeire_hint`, `current_shanten`, `shape_hint` を同時に有効化した feature pack が、`exp_039 B` 基準で性能と診断値を改善するかを確認する
 
 ## 1. 実験概要
 
 比較条件:
 - A reference: `exp_039 B`
-  - batch: `runs/20260313_stage1_full_flat_mlp_imitation_then_ppo_batch_fd32f5ff`
+  - batch: （ローカル run）
   - encoder: `shanten_hint=true`
 - B new feature pack ON
-  - batch: `runs/20260313_stage1_full_flat_mlp_imitation_then_ppo_batch_1927d470`
+  - batch: （ローカル run）
   - encoder:
     - `discard_ukeire_hint=true`
     - `current_shanten=true`

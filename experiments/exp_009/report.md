@@ -40,9 +40,9 @@
 
 | 条件 | value_loss_coef | batch_dir | success |
 |---|---:|---|---:|
-| A | 0.25 | `runs/20260307_stage1_full_flat_mlp_imitation_then_ppo_batch_213c6ffa` | 3/3 |
-| B | 0.5  | `runs/20260307_stage1_full_flat_mlp_imitation_then_ppo_batch_9a96c16c` | 3/3 |
-| C | 1.0  | `runs/20260307_stage1_full_flat_mlp_imitation_then_ppo_batch_c258f215` | 3/3 |
+| A | 0.25 | （ローカル run） | 3/3 |
+| B | 0.5  | （ローカル run） | 3/3 |
+| C | 1.0  | （ローカル run） | 3/3 |
 
 全条件で `aggregate.eval_mode=rotation` を確認。
 

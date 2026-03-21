@@ -1,7 +1,7 @@
 # Experiment Report: exp_050
 
 作成日: 2026-03-15  
-対象: [experiments/exp_050/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_050/runbook.md)  
+対象: `experiments/exp_050/runbook.md`  
 目的: `policy_anchor(kl, coef=0.5) + entropy=0.0` 条件を `20 seeds × 20 cycles` で再検証し、改善傾向を統計的に確認する
 
 ## 1. 実験概要
@@ -18,7 +18,7 @@
 
 ## 2. 実行結果
 
-- batch_dir: `runs/20260315_stage1_full_flat_mlp_imitation_then_ppo_batch_a271c3d0`
+- batch_dir: （ローカル run）
 - success: `20/20`
 - failure: `0`
 

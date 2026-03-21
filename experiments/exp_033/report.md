@@ -1,7 +1,7 @@
 # Experiment Report: exp_033
 
 作成日: 2026-03-12  
-対象: [experiments/exp_033/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_033/runbook.md)  
+対象: `experiments/exp_033/runbook.md`  
 目的: `training.exclude_post_riichi_discards.enabled=true` により、`same` 群の advantage 正偏りと PPO 後悪化が緩和するかを確認する
 
 ## 1. 実験概要
@@ -27,7 +27,7 @@
 - seeds: `42,43,44,45,46`
 
 batch:
-- A: `runs/20260312_stage1_full_flat_mlp_imitation_then_ppo_batch_54333742`
+- A: （ローカル run）
 
 比較基準:
 - `exp_031` post-fix baseline

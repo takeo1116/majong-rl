@@ -23,9 +23,9 @@
 
 | 条件 | mode | batch_dir | success |
 |---|---|---|---:|
-| A | baseline | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_07349dda` | 5/5（参照） |
-| B | both | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_d822aa82` | 5/5 |
-| C | improve_only | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_1a4910d2` | 5/5 |
+| A | baseline | （ローカル run） | 5/5（参照） |
+| B | both | （ローカル run） | 5/5 |
+| C | improve_only | （ローカル run） | 5/5 |
 
 注記:
 - `B` は実質的に `exp_021` の `scale=0.01, mode=both` と同条件であり、結果確認のため再実行された。
@@ -114,6 +114,6 @@ mean ± std（seed=5）
 
 | condition | mode | batch_dir | 備考 |
 |---|---|---|---|
-| A | baseline | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_07349dda` | `exp_021` A を参照流用 |
-| B | both | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_d822aa82` | `exp_021` C と同条件を再実行 |
-| C | improve_only | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_1a4910d2` | 新規条件 |
+| A | baseline | （ローカル run） | `exp_021` A を参照流用 |
+| B | both | （ローカル run） | `exp_021` C と同条件を再実行 |
+| C | improve_only | （ローカル run） | 新規条件 |

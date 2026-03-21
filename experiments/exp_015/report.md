@@ -23,8 +23,8 @@ imitation-only（exp_014）で見えた小幅改善が PPO 後にも残るかを
 
 | 条件 | shanten_hint | batch_dir | success |
 |---|---|---|---:|
-| A | off | `runs/20260307_stage1_full_flat_mlp_imitation_then_ppo_batch_9b66f4ab` | 5/5 |
-| B | on  | `runs/20260307_stage1_full_flat_mlp_imitation_then_ppo_batch_bca44946` | 5/5 |
+| A | off | （ローカル run） | 5/5 |
+| B | on  | （ローカル run） | 5/5 |
 
 両条件とも `aggregate.eval_mode=rotation`。  
 各 run で `eval_before/eval_rotation.json`, `eval/eval_rotation.json`, `eval/eval_diff.json` を確認。

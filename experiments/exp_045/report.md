@@ -1,7 +1,7 @@
 # Experiment Report: exp_045
 
 作成日: 2026-03-15  
-対象: [experiments/exp_045/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_045/runbook.md)  
+対象: `experiments/exp_045/runbook.md`  
 目的: 最良近傍条件で `100 cycle` を実行し、PPO が長期で回復するか/壊れ続けるかを確認
 
 ## 1. 実験概要
@@ -18,7 +18,7 @@
 
 | 項目 | 結果 |
 |---|---|
-| batch_dir | `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_a0305b22` |
+| batch_dir | （ローカル run） |
 | success/failure | `1 / 0` |
 | run success | `true` |
 | cycles | `100` |

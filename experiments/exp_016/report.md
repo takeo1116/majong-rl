@@ -23,8 +23,8 @@
 - B (on): `feature_encoder.shanten_hint={"enabled":true}`
 
 batch_dir:
-- A: `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_batch_72479d6f`
-- B: `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_batch_0fae8989`
+- A: （ローカル run）
+- B: （ローカル run）
 
 ## 2. 実行結果サマリ
 

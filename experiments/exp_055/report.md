@@ -1,7 +1,7 @@
 # Experiment Report: exp_055
 
 作成日: 2026-03-17  
-対象: [experiments/exp_055/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_055/runbook.md)  
+対象: `experiments/exp_055/runbook.md`  
 目的: `imitation=0 + policy_ratio=0.0 + mixed_ppo + gae=0.0` の簡約問題で、残っている plateau / 戻りが `gamma` 起因か `shanten shaping` 起因かを切り分ける
 
 ## 1. 実験概要

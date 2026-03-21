@@ -1,7 +1,7 @@
 # Experiment Report: exp_046
 
 作成日: 2026-03-15  
-対象: [experiments/exp_046/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_046/runbook.md)  
+対象: `experiments/exp_046/runbook.md`  
 目的: `policy_anchor (KL)` で PPO 後の悪化幅が縮むかを 20 seed で確認
 
 ## 1. 実験概要
@@ -21,7 +21,7 @@
 
 | 項目 | 結果 |
 |---|---|
-| batch_dir | `runs/20260315_stage1_full_flat_mlp_imitation_then_ppo_batch_5674ad5c` |
+| batch_dir | （ローカル run） |
 | success/failure | `20 / 0` |
 | driver | `completed=1, failed=0` |
 

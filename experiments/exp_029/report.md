@@ -42,10 +42,10 @@
 - seeds: `42,43,44,45,46`
 
 batch:
-- A: `runs/20260311_stage1_full_flat_mlp_imitation_then_ppo_batch_35a5049d`
-- B: `runs/20260311_stage1_full_flat_mlp_imitation_then_ppo_batch_d89d3933`
-- C: `runs/20260311_stage1_full_flat_mlp_imitation_then_ppo_batch_4fd392ec`
-- D: `runs/20260311_stage1_full_flat_mlp_imitation_then_ppo_batch_366fc6bf`
+- A: （ローカル run）
+- B: （ローカル run）
+- C: （ローカル run）
+- D: （ローカル run）
 
 全条件 `success_count = 5/5`。
 

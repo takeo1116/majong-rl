@@ -1,6 +1,6 @@
 # PROJECT.md
 
-最終更新: 2026-03-18  
+最終更新: 2026-03-20  
 この文書の役割: プロジェクトの大目標・現在地・次アクションを短時間で復元する意思決定ハブ。
 
 ---
@@ -13,7 +13,7 @@
 
 ---
 
-## 2. 現在地（2026-03-18）
+## 2. 現在地（2026-03-20）
 
 フェーズ: **Stage1後半（bugfix 後 baseline を再構築し、新モデルを主系列として PPO の「更新設計そのもの」を見直すフェーズ）**
 
@@ -36,7 +36,8 @@
   - bugfix 後の強い imitation 基準を、PPO が安定して上回る更新則
   - rule データの中でも「良い打牌 / 悪い打牌」を切り分けて actor 改善に使う学習信号設計
   - `rule` 行動を PPO に入れるときの exact-action / advantage weighting / state distribution mismatch の切り分け
-  - 現行 rule-only PPO で悪化する主因が surrogate なのか weighting なのか分布なのかの切り分け
+  - 現行 `rule-only + anchor` PPO で、なぜ early peak 後にじわじわ下がるのかの主因切り分け
+  - imitation と PPO で optimizer hyperparameter を分離する実装（CQ-0209）
 
 ---
 
@@ -44,10 +45,10 @@
 
 現在の主目的は次の2点。
 
-> 1. CQ-0208 修正後の新しい imitation baseline を基準に、`rule-only PPO` がなぜ安定して上積みできないのかを切り分ける。  
+> 1. CQ-0208 修正後の新しい imitation baseline を基準に、`rule-only + anchor` PPO がなぜ early peak 後に下がるのかを切り分ける。  
 > 2. `rule` を教師候補として使うなら、「rule を模倣する」段階から「rule の中でも良い打牌 / 悪い打牌を分ける」段階へどう移るかを明確にする。
 
-現行の主系列 baseline（2026-03-18 時点）:
+現行の主系列 baseline（2026-03-20 時点）:
 
 - `feature_encoder.shanten_hint=true`
 - `feature_encoder.discard_ukeire_hint=true`
@@ -67,7 +68,7 @@
 - `training.value_loss_coef=0.25`
 - `training.clip_epsilon=0.15`
 - `training.batch_size=512`
-- `training.gamma=0.50`  # PPO sanity check の起点
+- `training.gamma=0.50`
 - `training.gae_lambda=0.0`
 - `training.exclude_post_riichi_discards.enabled=true`
 - `model.hidden_dims=[512,256]`
@@ -78,19 +79,31 @@
 - `reward.shaping.shanten_delta.scale=0.003`
 - `reward.shaping.shanten_delta.mode=both`
 - `reward.shaping.shanten_delta.schedule.type=linear_decay`
-- `training.policy_anchor.enabled=false`
+- `training.rule_mix.enabled=true`
+- `training.rule_mix.policy_ratio=0.0`
+- `training.rule_mix.save_baseline_actions=true`
+- `training.rule_mix_learner.enabled=true`
+- `training.rule_mix_learner.ppo_mode=mixed`
+- `training.rule_mix_learner.baseline_sample_weight=1.0`
+- `training.policy_anchor.enabled=true`
+- `training.policy_anchor.type=kl`
+- `training.policy_anchor.reference=imitation_fixed`
+- `training.policy_anchor.coef=0.5`
 - `training.entropy_coef=0.0`
 - imitation baseline:
-  - `selfplay.imitation_matches=1000 x 10 chunks`
-- PPO sanity check:
-  - imitation `1000 x 1`
-  - `training.rule_mix.policy_ratio=0.0`
-  - `training.multi_cycle.num_cycles=10`
+  - `training.multi_chunk_imitation.enabled=true`
+  - `training.multi_chunk_imitation.num_chunks=3`
+  - `training.multi_chunk_imitation.imitation_matches_per_chunk=1000`
+  - total imitation matches = `3000`
+- PPO baseline:
+  - `training.multi_cycle.enabled=true`
+  - `training.multi_cycle.num_cycles=30`
   - `training.multi_cycle.selfplay_matches_per_cycle=200`
+  - `training.multi_cycle.eval_each_cycle=true`
 
 評価の優先順:
 
-1. bugfix 後 imitation 基準に対して PPO が上積みできるか
+1. bugfix 後 imitation 基準に対して PPO が上積みできるか、少なくとも維持できるか
 2. after 指標（`avg_rank`, `avg_score`, `win_rate`, `deal_in_rate`）
 3. 各 cycle 内 `eval_before -> eval` 差分
 4. learner 診断統計（`teacher_agreement`, `ratio/clip_fraction`, `mixed_ppo`, `shanten_diag`, `turn_diag`）
@@ -235,9 +248,32 @@
 - 2026-03-18 ad-hoc: `strict_top1` imitation + 同一 PPO sanity check
   - `strict_top1` は imitation 直後の時点で `tie_aware_best_set` より大幅に悪い
   - `exact action` 教師を真似るほど強くなるわけではなく、baseline tie-break をそのまま教師化するのは悪手と確認
+- `exp_061`（bugfix 後, 新モデル, `rule/actor x anchor on/off`）
+  - A `rule_only_no_anchor`
+  - B `rule_only_anchor`
+  - C `actor_no_anchor`
+  - D `actor_anchor`
+  を比較
+  - 最も強く出た差分は anchor の有無であり、policy drift が大きな主因候補と確認
+  - actor data を混ぜる効果も見えたが、anchor 下での `rule-only` / `actor` の優劣は未確定
+- `exp_062`（`rule-only + anchor` で `policy_anchor.coef` sweep）
+  - `0.25 / 0.50 / 0.75` を比較
+  - `0.25` は peak は高いが保持が弱い
+  - `0.75` は teacher らしさ保持は強いが score 最良にはならない
+  - **`0.50` が改善と保持の最良バランス**
+- `exp_063`（`rule-only + anchor(0.5)` で `clip_epsilon` sweep）
+  - `0.10 / 0.15 / 0.20` を比較
+  - `0.20` は final score / drawdown の両方で明確に悪く、採用しない
+  - `0.10` は保持寄り、`0.15` は改善寄り
+  - 当面は **`clip_epsilon=0.15` を固定**し、次の論点へ進む
+- 2026-03-19 時点の暫定基準
+  - **新モデル + `rule-only PPO + policy_anchor(coef=0.5) + clip_epsilon=0.15`**
+  - これを現行 rule-based PPO baseline とする
 
 暫定判断:
 - **旧モデルは打ち切り、新モデルを主系列とする**
+- **current PPO baseline は `rule-only + anchor(0.5) + clip(0.15)`**
+- 次の本丸は clip ではなく、`value_loss_coef` / `policy_ratio` / sample weighting / advantage quality 側
 - 現在の本丸は `rule-only PPO` がなぜ積めないかの切り分けであり、architecture 探索ではない
 
 ---

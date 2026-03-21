@@ -28,10 +28,10 @@
   - `evaluation.inference_device=cpu`
 
 条件別 batch_dir:
-- A (`training.epochs=2`): `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_1725e4e6`
-- B (`training.epochs=4`): `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_9ae344fd`
-- C (`training.epochs=8`): `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_fa89f533`
-- D (`training.epochs=4`, `training.entropy_coef=0.005`): `runs/20260306_stage1_full_flat_mlp_imitation_then_ppo_batch_80335d72`
+- A (`training.epochs=2`): （ローカル run）
+- B (`training.epochs=4`): （ローカル run）
+- C (`training.epochs=8`): （ローカル run）
+- D (`training.epochs=4`, `training.entropy_coef=0.005`): （ローカル run）
 
 全条件: `success_count=3/3`
 

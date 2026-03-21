@@ -29,7 +29,7 @@
 - seeds: `42,43,44,45,46`
 
 batch:
-- A: `runs/20260311_stage1_full_flat_mlp_imitation_then_ppo_batch_5d0451b7`
+- A: （ローカル run）
 
 比較基準:
 - `exp_031` post-fix baseline

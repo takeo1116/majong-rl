@@ -1,7 +1,7 @@
 # Experiment Report: exp_056
 
 作成日: 2026-03-17  
-対象: [experiments/exp_056/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_056/runbook.md)  
+対象: `experiments/exp_056/runbook.md`  
 目的: `imitation=0 + policy_ratio=0.0 + mixed_ppo + gae=0.0 + shanten_delta.scale=0.003` の簡約問題で、`gamma` を `0.75 / 0.50 / 0.25` まで大胆に下げたときに plateau / 戻りがどう変わるかを確認する
 
 ## 1. 実験概要

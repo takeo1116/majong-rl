@@ -9,11 +9,11 @@ Source Runbook: `experiments/exp_001/runbook.md`
 
 | 実験 | 目的 | run_dir | seed | 構成 |
 |---|---|---|---:|---|
-| 実験1 | PPO直学習（小）+ parallel eval の導線確認 | `runs/20260304_stage1_full_flat_mlp_ppo_cb8da312` | 42 | selfplay=1 worker, eval=4 workers |
-| 実験2 | PPO直学習（中）で傾向確認 | `runs/20260304_stage1_full_flat_mlp_ppo_7a8359c7` | 42 | selfplay=1 worker, eval=8 workers |
-| 実験3 | warm start（小）の導線確認 | `runs/20260304_stage1_full_flat_mlp_imitation_then_ppo_114957ed` | 42 | selfplay=1 worker, eval=4 workers |
-| 実験4 | warm start（中）比較 | `runs/20260304_stage1_full_flat_mlp_imitation_then_ppo_3efdf7f5` | 42 | selfplay=1 worker, eval=8 workers |
-| 実験5 | parallel self-play + parallel eval の効果確認 | `runs/20260305_stage1_full_flat_mlp_ppo_4064d1a7` | 42 | selfplay=8 workers, eval=8 workers |
+| 実験1 | PPO直学習（小）+ parallel eval の導線確認 | （ローカル run） | 42 | selfplay=1 worker, eval=4 workers |
+| 実験2 | PPO直学習（中）で傾向確認 | （ローカル run） | 42 | selfplay=1 worker, eval=8 workers |
+| 実験3 | warm start（小）の導線確認 | （ローカル run） | 42 | selfplay=1 worker, eval=4 workers |
+| 実験4 | warm start（中）比較 | （ローカル run） | 42 | selfplay=1 worker, eval=8 workers |
+| 実験5 | parallel self-play + parallel eval の効果確認 | （ローカル run） | 42 | selfplay=8 workers, eval=8 workers |
 
 全実験で device 指定は共通:  
 - `training.device=cuda`

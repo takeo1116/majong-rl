@@ -1,20 +1,20 @@
 # Experiment Report: exp_042
 
 作成日: 2026-03-14  
-対象: [experiments/exp_042/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_042/runbook.md)  
+対象: `experiments/exp_042/runbook.md`  
 目的: C++/encoder 高速化後に、`exp_041 B` と同条件で再実行し、速度改善と集計整合性を確認する
 
 ## 1. 実験概要
 
 比較軸:
 - A reference: `exp_041 B`（`discard_ukeire_hint=false`）
-  - batch: `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_4aae4f28`
+  - batch: （ローカル run）
 - B replay: `exp_042 B`（Aと同条件、コードのみ高速化後）
-  - batch: `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_24b99f7e`
+  - batch: （ローカル run）
 
 補助比較（手動実行）:
 - C manual: `discard_ukeire_hint=true`（高速化後）
-  - batch: `runs/20260314_stage1_full_flat_mlp_imitation_then_ppo_batch_91e4c04a`
+  - batch: （ローカル run）
 
 共通（主要）:
 - seeds: `42,43,44,45,46`
@@ -30,9 +30,9 @@
 
 | 条件 | batch | success |
 |---|---|---:|
-| A (`exp_041 B`) | `runs/..._batch_4aae4f28` | 5/5 |
-| B (`exp_042 B`) | `runs/..._batch_24b99f7e` | 5/5 |
-| C (manual, hint on) | `runs/..._batch_91e4c04a` | 5/5 |
+| A (`exp_041 B`) | （ローカル run） | 5/5 |
+| B (`exp_042 B`) | （ローカル run） | 5/5 |
+| C (manual, hint on) | （ローカル run） | 5/5 |
 
 注記:
 - `exp_042` は初回実行を中断し、`.venv` の `_mahjong_core` を再インストール後に再実行。

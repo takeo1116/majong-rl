@@ -1,7 +1,7 @@
 # Experiment Report: exp_049
 
 作成日: 2026-03-15  
-対象: [experiments/exp_049/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_049/runbook.md)  
+対象: `experiments/exp_049/runbook.md`  
 目的: `policy_anchor(kl, coef=0.5) + entropy=0.0` で `10 cycle` まで改善傾向が持続するかを確認する
 
 ## 1. 実験概要
@@ -19,7 +19,7 @@
 
 ## 2. 実行結果
 
-- batch_dir: `runs/20260315_stage1_full_flat_mlp_imitation_then_ppo_batch_d1ab0c29`
+- batch_dir: （ローカル run）
 - success: `5/5`
 - driver: `completed=1, failed=0`
 
@@ -77,7 +77,7 @@ aggregate.cycles（seed平均）
 
 ## 6. `exp_048 B`（3cycle）との比較
 
-参照: [experiments/exp_048/report.md](/home/takeo1116/Git/majong-rl/experiments/exp_048/report.md)
+参照: `experiments/exp_048/report.md`
 
 | 指標 | exp_048 B (3cycle, 5seed) | exp_049 A (10cycle, 5seed) |
 |---|---:|---:|

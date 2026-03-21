@@ -1,7 +1,7 @@
 # Experiment Report: exp_054
 
 作成日: 2026-03-16  
-対象: [experiments/exp_054/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_054/runbook.md)  
+対象: `experiments/exp_054/runbook.md`  
 目的: `imitation=0 + policy_ratio=0.0 + mixed_ppo` の簡約問題で、`gae_lambda=0.0 / 0.3 / 0.6` を追加探索し、`exp_053` の `0.70 / 0.85` と合わせて有効な horizon 帯を特定する
 
 ## 1. 実験概要

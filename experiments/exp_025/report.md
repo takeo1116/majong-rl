@@ -30,7 +30,7 @@
 
 ## 2. 実行結果
 
-- batch: `runs/20260310_stage1_full_flat_mlp_imitation_then_ppo_batch_f679feb7`
+- batch: （ローカル run）
 - `success_count = 5/5`
 - `summary.json.success=true`
 - `shanten_diag` / `turn_diag` とも全 run で確認

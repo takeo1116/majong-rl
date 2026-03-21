@@ -1,7 +1,7 @@
 # Experiment Report: exp_052
 
 作成日: 2026-03-16  
-対象: [experiments/exp_052/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_052/runbook.md)  
+対象: `experiments/exp_052/runbook.md`  
 目的: `rule_mix(policy_ratio=0.75) + two-stage learner + policy_anchor(kl, coef=0.5) + entropy=0.0` を `20 seeds x 20 cycles` で再検証し、長期学習で改善が持続するかを確認する
 
 ## 1. 実験概要
@@ -24,7 +24,7 @@
 
 ## 2. 実行結果
 
-- batch_dir: `runs/20260315_stage1_full_flat_mlp_imitation_then_ppo_batch_cf5a257f`
+- batch_dir: （ローカル run）
 - success: `20/20`
 - failure: `0`
 
@@ -100,7 +100,7 @@ seed平均の after 指標と、同cycle内 `eval_before -> eval` 差分。
 ## 6. `exp_050` / `exp_051` との比較
 
 参照:
-- [experiments/exp_050/report.md](/home/takeo1116/Git/majong-rl/experiments/exp_050/report.md)
+- `experiments/exp_050/report.md`
 - `exp_051` は 5 seeds x 10 cycles の pilot（report 未作成）
 
 | 条件 | seeds x cycles | imitation 基準 avg_rank | best after avg_rank | best after avg_score | final avg_rank | final avg_score |

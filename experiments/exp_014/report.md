@@ -25,8 +25,8 @@
 
 | 条件 | shanten_hint | batch_dir | success |
 |---|---|---|---:|
-| A | off | `runs/20260307_stage1_full_flat_mlp_imitation_then_ppo_batch_1ed6c43f` | 5/5 |
-| B | on  | `runs/20260307_stage1_full_flat_mlp_imitation_then_ppo_batch_797651d0` | 5/5 |
+| A | off | （ローカル run） | 5/5 |
+| B | on  | （ローカル run） | 5/5 |
 
 両条件とも `aggregate.eval_mode=rotation` を確認。
 

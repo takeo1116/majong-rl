@@ -1,7 +1,7 @@
 # Experiment Report: exp_048
 
 作成日: 2026-03-15  
-対象: [experiments/exp_048/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_048/runbook.md)  
+対象: `experiments/exp_048/runbook.md`  
 目的: `entropy_coef` を `0.001 / 0.0` に下げたときの傾向を、`5 seed × 3 cycle` で確認する
 
 ## 1. 実験概要
@@ -19,8 +19,8 @@
 
 | 条件 | batch_dir | success |
 |---|---|---:|
-| A | `runs/20260315_stage1_full_flat_mlp_imitation_then_ppo_batch_fd6b34e8` | 5/5 |
-| B | `runs/20260315_stage1_full_flat_mlp_imitation_then_ppo_batch_63b45c1e` | 5/5 |
+| A | （ローカル run） | 5/5 |
+| B | （ローカル run） | 5/5 |
 
 driver完了: `completed=2, failed=0`
 

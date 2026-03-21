@@ -5,14 +5,14 @@
 
 ## 1. 実行サマリ
 
-- Part1 A1（hint=off, strict）: `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_batch_0a08b8b3`
-- Part1 B1（hint=on, strict）: `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_batch_010d325e`
-- Part2 A2（hint=on, strict, tiny）: `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_2d594059`
-- Part2 B2（hint=on, tie-aware, tiny）: `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_41dba41e`
+- Part1 A1（hint=off, strict）: （ローカル run）
+- Part1 B1（hint=on, strict）: （ローカル run）
+- Part2 A2（hint=on, strict, tiny）: （ローカル run）
+- Part2 B2（hint=on, tie-aware, tiny）: （ローカル run）
 - Part3 A3: **Part1-B1 を再利用（再実行なし）**
-- Part3 B3（hint=on, tie-aware）: `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_batch_ee33120b`
-- Part4 A4（hint=on, strict, PPO）: `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_batch_6252f3d0`
-- Part4 B4（hint=on, tie-aware, PPO）: `runs/20260308_stage1_full_flat_mlp_imitation_then_ppo_batch_2aa13236`
+- Part3 B3（hint=on, tie-aware）: （ローカル run）
+- Part4 A4（hint=on, strict, PPO）: （ローカル run）
+- Part4 B4（hint=on, tie-aware, PPO）: （ローカル run）
 
 注記:
 - `exp_017_driver.py` は Part4-A4 後の検証で停止したため、Part4-B4 は手動実行。

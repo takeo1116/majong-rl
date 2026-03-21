@@ -1,7 +1,7 @@
 # Experiment Report: exp_038
 
 作成日: 2026-03-13  
-対象: [experiments/exp_038/runbook.md](/home/takeo1116/Git/majong-rl/experiments/exp_038/runbook.md)  
+対象: `experiments/exp_038/runbook.md`  
 目的: `exp_037 D` を高表現力 baseline として、(1) imitation データ増量で `eval_before` が伸びるか、(2) post-fix 条件で shaping 設定を再評価すると after 指標が改善するかを同時に確認する
 
 ## 1. 実験概要
@@ -32,11 +32,11 @@
 - seeds: `42,43,44,45,46`
 
 batch:
-- A reference: `runs/20260312_stage1_full_flat_mlp_imitation_then_ppo_batch_1d5383df`
-- B: `runs/20260313_stage1_full_flat_mlp_imitation_then_ppo_batch_4c6fdea1`
-- C: `runs/20260313_stage1_full_flat_mlp_imitation_then_ppo_batch_42b023c6`
-- D: `runs/20260313_stage1_full_flat_mlp_imitation_then_ppo_batch_509b2193`
-- E: `runs/20260313_stage1_full_flat_mlp_imitation_then_ppo_batch_ea92a3bb`
+- A reference: （ローカル run）
+- B: （ローカル run）
+- C: （ローカル run）
+- D: （ローカル run）
+- E: （ローカル run）
 
 全新規条件 `success_count = 5/5`。
 

@@ -24,11 +24,11 @@
 
 | 条件 | scale | batch_dir | success |
 |---|---:|---|---:|
-| A | - | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_07349dda` | 5/5 |
-| B | 0.005 | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_db72e880` | 5/5 |
-| C | 0.01 | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_7f6d81dd` | 5/5 |
-| D | 0.02 | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_6ab69317` | 5/5 |
-| E | 0.1 | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_e18aa35a` | 5/5 |
+| A | - | （ローカル run） | 5/5 |
+| B | 0.005 | （ローカル run） | 5/5 |
+| C | 0.01 | （ローカル run） | 5/5 |
+| D | 0.02 | （ローカル run） | 5/5 |
+| E | 0.1 | （ローカル run） | 5/5 |
 
 ## 3. 主評価
 
@@ -128,8 +128,8 @@ run_map はローカル管理なので、比較に必要な対応はここへ転
 
 | condition | scale | batch_dir |
 |---|---:|---|
-| A | - | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_07349dda` |
-| B | 0.005 | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_db72e880` |
-| C | 0.01 | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_7f6d81dd` |
-| D | 0.02 | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_6ab69317` |
-| E | 0.1 | `runs/20260309_stage1_full_flat_mlp_imitation_then_ppo_batch_e18aa35a` |
+| A | - | （ローカル run） |
+| B | 0.005 | （ローカル run） |
+| C | 0.01 | （ローカル run） |
+| D | 0.02 | （ローカル run） |
+| E | 0.1 | （ローカル run） |
