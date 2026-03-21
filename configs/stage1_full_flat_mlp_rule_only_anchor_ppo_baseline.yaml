@@ -1,0 +1,122 @@
+experiment:
+  name: "stage1_full_flat_mlp_rule_only_anchor_ppo_baseline"
+  stage: 1
+  observation_mode: "full"
+  phases: ["imitation", "selfplay", "learner", "eval"]
+  memo: "Stage1 baseline: new model + tie-aware imitation + rule-only mixed PPO + anchor"
+
+feature_encoder:
+  name: "FlatFeatureEncoder"
+  observation_mode: "full"
+  shanten_hint:
+    enabled: true
+  discard_ukeire_hint:
+    enabled: true
+  current_shanten:
+    enabled: true
+  shape_hint:
+    enabled: true
+  turn_context:
+    enabled: true
+
+model:
+  name: "MLPPolicyValueModel"
+  hidden_dims: [512, 256]
+  value_heads: ["round_delta"]
+  policy_tower:
+    enabled: true
+    hidden_dim: 128
+  value_tower:
+    enabled: true
+    hidden_dim: 128
+  value_features:
+    current_shanten:
+      enabled: true
+  policy_direct_hints:
+    enabled: true
+    sources: ["shanten_hint", "discard_ukeire_hint"]
+    local_hidden_dim: 16
+    tile_embedding_dim: 4
+    context_gate:
+      enabled: true
+
+reward:
+  type: "point_delta"
+  point_delta_scale: 0.0001
+  shaping:
+    shanten_delta:
+      enabled: true
+      scale: 0.003
+      mode: "both"
+      schedule:
+        type: "linear_decay"
+
+imitation:
+  num_workers: 10
+
+selfplay:
+  num_matches: 200
+  num_workers: 10
+  policy_ratio: 1.0
+  temperature: 1.0
+  max_samples_per_shard: 10000
+  save_baseline_actions: false
+  imitation_matches: 1000
+  imitation_seed_start: 0
+  inference_device: "cpu"
+
+training:
+  algorithm: "ppo"
+  device: "cuda"
+  lr: 0.00005
+  batch_size: 512
+  epochs: 1
+  imitation_epochs: 8
+  gamma: 0.50
+  gae_lambda: 0.0
+  clip_epsilon: 0.15
+  value_loss_coef: 0.25
+  entropy_coef: 0.0
+  max_grad_norm: 0.5
+  imitation_loss_mode: "tie_aware_best_set"
+  value_loss:
+    type: "mse"
+  advantage_stabilization:
+    clip: null
+  imitation_value_warmstart:
+    enabled: true
+    coef: 0.3
+  exclude_post_riichi_discards:
+    enabled: true
+  multi_chunk_imitation:
+    enabled: true
+    num_chunks: 3
+    imitation_matches_per_chunk: 1000
+  multi_cycle:
+    enabled: true
+    num_cycles: 30
+    selfplay_matches_per_cycle: 200
+    eval_each_cycle: true
+  rule_mix:
+    enabled: true
+    policy_ratio: 0.0
+    save_baseline_actions: true
+  rule_mix_learner:
+    enabled: true
+    ppo_mode: "mixed"
+    baseline_sample_weight: 1.0
+  policy_anchor:
+    enabled: true
+    type: "kl"
+    coef: 0.5
+    reference: "imitation_fixed"
+
+evaluation:
+  mode: "rotation"
+  rotation_seats: [0, 1, 2, 3]
+  num_matches: 100
+  num_workers: 10
+  seed_start: 100000
+  inference_device: "cpu"
+
+export: {}
