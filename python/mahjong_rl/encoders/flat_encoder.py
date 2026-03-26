@@ -81,13 +81,20 @@ class FlatFeatureEncoder(FeatureEncoder):
     _SHAPE_HINT_DIM = _CHI_KIND_SIZE + _SERIAL_PAIR_KIND_SIZE + _INSIDE_WAIT_KIND_SIZE  # 66
     # turn_context の次元 (CQ-0175): turn_progress(1) + bucket_one_hot(3) = 4
     _TURN_CONTEXT_DIM = 4
+    # CQ-0213: opponent 防御特徴
+    _OPPONENT_SHANTEN_DIM = 3    # 相対席3家 × shanten/8.0
+    _OPPONENT_TENPAI_DIM = 3     # 相対席3家 × 0/1
+    _DANGER_MASK_DIM = 34        # per-opponent, 34 牌種
 
     def __init__(self, observation_mode: str = "both",
                  shanten_hint: bool = False,
                  discard_ukeire_hint: bool = False,
                  current_shanten_input: bool = False,
                  shape_hint: bool = False,
-                 turn_context: bool = False):
+                 turn_context: bool = False,
+                 opponent_current_shanten: bool = False,
+                 opponent_tenpai_flag: bool = False,
+                 danger_mask: bool = False):
         """
         Args:
             observation_mode: "full", "partial", "both"
@@ -96,6 +103,9 @@ class FlatFeatureEncoder(FeatureEncoder):
             current_shanten_input: True で current_shanten を共通入力に追加 (CQ-0169)
             shape_hint: True で手牌形状ヒントを追加 (CQ-0170)
             turn_context: True で turn/time 文脈特徴を追加 (CQ-0175)
+            opponent_current_shanten: True で相手3家のシャンテンを追加 (CQ-0213, full-only)
+            opponent_tenpai_flag: True で相手3家のテンパイフラグを追加 (CQ-0213, full-only)
+            danger_mask: True で相手3家の danger_mask を追加 (CQ-0213, full-only)
         """
         self._observation_mode = observation_mode
         self._shanten_hint = shanten_hint
@@ -103,6 +113,10 @@ class FlatFeatureEncoder(FeatureEncoder):
         self._current_shanten_input = current_shanten_input
         self._shape_hint = shape_hint
         self._turn_context = turn_context
+        # CQ-0213: full-only features (Partial では自動 off)
+        self._opponent_current_shanten = opponent_current_shanten
+        self._opponent_tenpai_flag = opponent_tenpai_flag
+        self._danger_mask = danger_mask
 
     def encode(self, obs: Observation, *,
                legal_mask: np.ndarray | None = None) -> np.ndarray:
@@ -145,6 +159,21 @@ class FlatFeatureEncoder(FeatureEncoder):
         if self._turn_context:
             ranges["turn_context"] = (dim, dim + self._TURN_CONTEXT_DIM)
             dim += self._TURN_CONTEXT_DIM
+        # CQ-0213: full-only features — Partial mode では含めない
+        _is_full = self._observation_mode != "partial"
+        if self._opponent_current_shanten and _is_full:
+            ranges["opponent_current_shanten"] = (dim, dim + self._OPPONENT_SHANTEN_DIM)
+            dim += self._OPPONENT_SHANTEN_DIM
+        if self._opponent_tenpai_flag and _is_full:
+            ranges["opponent_tenpai_flag"] = (dim, dim + self._OPPONENT_TENPAI_DIM)
+            dim += self._OPPONENT_TENPAI_DIM
+        if self._danger_mask and _is_full:
+            # 相対席順: +1=下家, +2=対面, +3=上家
+            for i, name in enumerate(("danger_mask_shimo",
+                                      "danger_mask_toimen",
+                                      "danger_mask_kamicha")):
+                ranges[name] = (dim, dim + self._DANGER_MASK_DIM)
+                dim += self._DANGER_MASK_DIM
         return EncoderMetadata(
             output_shape=(dim,),
             dtype=np.dtype(np.float32),
@@ -322,7 +351,65 @@ class FlatFeatureEncoder(FeatureEncoder):
         if self._turn_context:
             features.append(self._compute_turn_context(obs.turn_number))
 
+        # CQ-0213: opponent 防御特徴 (full-only)
+        if self._opponent_current_shanten or self._opponent_tenpai_flag or self._danger_mask:
+            from mahjong_rl.baseline.shanten import compute_shanten
+            cp = obs.current_player
+            # 相対席順: shimo(+1=下家), toimen(+2=対面), kamicha(+3=上家)
+            rel_seats = [(cp + offset) % NUM_PLAYERS for offset in (1, 2, 3)]
+            opp_hand_counts = []
+            opp_shantens = []  # 1回だけ計算して再利用
+            for seat in rel_seats:
+                hc = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+                for tid in obs.hands[seat]:
+                    hc[tid // 4] += 1.0
+                opp_hand_counts.append(hc)
+                opp_shantens.append(compute_shanten(hc))
+
+            if self._opponent_current_shanten:
+                opp_sh = np.array(
+                    [sh / 8.0 for sh in opp_shantens],
+                    dtype=np.float32)
+                features.append(opp_sh)
+
+            if self._opponent_tenpai_flag:
+                opp_tp = np.array(
+                    [1.0 if sh == 0 else 0.0 for sh in opp_shantens],
+                    dtype=np.float32)
+                features.append(opp_tp)
+
+            if self._danger_mask:
+                for hc, sh in zip(opp_hand_counts, opp_shantens):
+                    features.append(self._compute_danger_mask(hc, known_shanten=sh))
+
         return np.concatenate(features)
+
+    @staticmethod
+    def _compute_danger_mask(opp_hand_counts: np.ndarray, *,
+                             known_shanten: int | None = None) -> np.ndarray:
+        """相手がテンパイ時に待ち牌を danger=1 にする (CQ-0213)
+
+        テンパイでなければ全 0。テンパイなら各牌種について
+        加えてシャンテン -1 なら danger=1。
+
+        Args:
+            opp_hand_counts: 相手の手牌カウント (float32)
+            known_shanten: 既に計算済みのシャンテン数 (再計算回避用)
+        """
+        from mahjong_rl.baseline.shanten import compute_shanten
+        mask = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        sh = known_shanten if known_shanten is not None else compute_shanten(opp_hand_counts)
+        if sh != 0:
+            return mask
+        # テンパイ: 待ち牌を探す
+        for t in range(NUM_TILE_TYPES):
+            if opp_hand_counts[t] >= 4:
+                continue
+            opp_hand_counts[t] += 1
+            if compute_shanten(opp_hand_counts) < 0:
+                mask[t] = 1.0
+            opp_hand_counts[t] -= 1
+        return mask
 
     @staticmethod
     def _compute_hint_and_ukeire(

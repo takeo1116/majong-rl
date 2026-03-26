@@ -182,7 +182,11 @@ def load_partials(partials_dir: Path) -> list[PartialEvalMetrics]:
     Returns:
         PartialEvalMetrics のリスト (worker_id 順でソート)
     """
-    paths = sorted(partials_dir.glob("worker_*.json"))
+    # CQ-0219: sidecar JSON を除外して partial metrics のみ読み込む
+    paths = sorted(
+        p for p in partials_dir.glob("worker_*.json")
+        if "_sidecar" not in p.name
+    )
     return [PartialEvalMetrics.load(p) for p in paths]
 
 
@@ -305,6 +309,11 @@ class EvaluationRunner:
         self._features_buf = torch.zeros(1, input_dim, dtype=torch.float32, device=self._device)
         self._mask_buf = torch.zeros(1, 34, dtype=torch.float32, device=self._device)
         self._value_aux_buf = torch.zeros(1, 1, dtype=torch.float32, device=self._device)
+        self._match_callback = None  # CQ-0215
+
+    def set_match_callback(self, callback):
+        """CQ-0215: match 開始直前に呼ばれる callback を設定する"""
+        self._match_callback = callback
 
     def evaluate_partial(
         self,
@@ -334,6 +343,9 @@ class EvaluationRunner:
         for seat in policy_seats:
             for i in range(num_matches):
                 seed = match_seeds[i] if match_seeds else seed_start + i
+                # CQ-0215, CQ-0218: per-match heartbeat with seat
+                if self._match_callback is not None:
+                    self._match_callback(i, seed, seat)
                 result = self._play_one_match(seed, policy_seat=seat)
                 sum_rank += result["rank"]
                 sum_score += result["score"]

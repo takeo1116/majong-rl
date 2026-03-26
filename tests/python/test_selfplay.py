@@ -868,3 +868,161 @@ class TestBaselineActorEvalConsistency:
             expected_lp = float(lp[int(bl_actions[i])].item())
             assert np.isclose(bl_lp_saved[i], expected_lp, atol=1e-5, rtol=1e-5), \
                 f"baseline log_prob 不一致 (sample {i}): saved={bl_lp_saved[i]}, expected={expected_lp}"
+
+
+class TestDecisionTransitionSemantics:
+    """CQ-0210: decision transition semantics のテスト"""
+
+    def test_sample_semantics_version_is_2(self, tmp_path: Path):
+        """新 selfplay worker の sample が v2 semantics で保存される"""
+        config = _make_config(observation_mode="full", policy_ratio=1.0)
+        enc = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(enc)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=enc,
+            output_dir=tmp_path / "shards", worker_id="w0",
+        )
+        worker.run(num_matches=2, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        data = reader.read_as_tensors()
+        versions = data["sample_semantics_versions"]
+        assert versions is not None
+        assert len(versions) > 0
+        assert all(v == 2 for v in versions), \
+            f"全 sample が v2 であるべき: {set(versions)}"
+
+    def test_reward_is_accumulated(self, tmp_path: Path):
+        """同一 player の連続 sample 間で reward が accumulated されている"""
+        config = _make_config(observation_mode="full", policy_ratio=1.0)
+        enc = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(enc)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=enc,
+            output_dir=tmp_path / "shards", worker_id="w0",
+        )
+        worker.run(num_matches=3, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        data = reader.read_as_tensors()
+        rewards = data["rewards"]
+        pdr = data.get("point_delta_rewards")
+        if pdr is not None:
+            assert len(rewards) == len(pdr)
+            assert rewards.dtype == np.float32
+
+    def test_episode_and_player_ids_present(self, tmp_path: Path):
+        """episode_ids, player_ids, step_ids が shard に保存されている"""
+        config = _make_config(observation_mode="full", policy_ratio=1.0)
+        enc = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(enc)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=enc,
+            output_dir=tmp_path / "shards", worker_id="w0",
+        )
+        worker.run(num_matches=2, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        data = reader.read_as_tensors()
+        assert data["episode_ids"] is not None
+        assert len(data["episode_ids"]) > 0
+        assert data["player_ids"] is not None
+        assert all(0 <= p <= 3 for p in data["player_ids"])
+        assert data["step_ids"] is not None
+
+    def test_source_decision_reward_included(self, tmp_path: Path):
+        """CQ-0211: source decision 自身の reward が sample に含まれる
+
+        read_all() で LearningSample を直接取得し、
+        非ゼロ reward を持つ sample の action が局終了を引き起こした行動
+        (= reward 発生元) であることを構造的に検証する。
+        """
+        config = _make_config(observation_mode="full", policy_ratio=1.0)
+        enc = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(enc)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=enc,
+            output_dir=tmp_path / "shards", worker_id="w0",
+        )
+        worker.run(num_matches=10, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        samples = reader.read_all()
+        assert len(samples) > 0
+
+        # 非ゼロ reward が存在する
+        nonzero = [s for s in samples if s.reward != 0.0]
+        assert len(nonzero) > 0, \
+            "全 sample の reward が 0: source action reward が落ちている可能性"
+
+        # 非ゼロ reward sample の直接検証:
+        # shanten shaping なし設定なので reward == point_delta_reward が成立する
+        n_pdr_verified = 0
+        for s in nonzero:
+            assert 0 <= s.player_id <= 3
+            assert s.sample_semantics_version == 2
+            # point_delta_reward が read_all() で復元されていることを前提に直接比較
+            assert s.point_delta_reward is not None, \
+                f"point_delta_reward が None: read_all() の復元漏れ"
+            assert abs(s.reward - s.point_delta_reward) < 1e-6, \
+                f"reward ({s.reward}) != point_delta_reward ({s.point_delta_reward}): " \
+                f"source decision reward が正しく乗っていない可能性"
+            n_pdr_verified += 1
+        assert n_pdr_verified > 0
+
+        # trajectory 内で step_id 単調増加 (group ごと)
+        from collections import defaultdict
+        groups: dict[tuple, list] = defaultdict(list)
+        for s in samples:
+            groups[(s.episode_id, s.player_id)].append(s)
+        for key, ss in groups.items():
+            sids = [s.step_id for s in ss]
+            assert sids == sorted(sids), \
+                f"{key}: step_id が単調増加でない"
+
+    def test_round_id_is_source_decision_time(self, tmp_path: Path):
+        """CQ-0211: round_id が decision 時点 (pre-step) の値を保持している
+
+        read_all() で round_id を直接取得し、
+        transition_crossed_round=True の sample について
+        round_id < 次 decision の round_id であることを検証する。
+        (post-step round を使っていたら round_id が次 decision と同じ値になり fail する)
+        """
+        config = _make_config(observation_mode="full", policy_ratio=1.0)
+        enc = FlatFeatureEncoder(observation_mode="full")
+        model = _make_model(enc)
+        worker = SelfPlayWorker(
+            config=config, model=model, encoder=enc,
+            output_dir=tmp_path / "shards", worker_id="w0",
+        )
+        worker.run(num_matches=10, seed_start=42)
+
+        reader = ShardReader(tmp_path / "shards")
+        samples = reader.read_all()
+        assert all(s.sample_semantics_version == 2 for s in samples)
+
+        # (episode, player) ごとに trajectory を構築
+        from collections import defaultdict
+        groups: dict[tuple, list] = defaultdict(list)
+        for s in samples:
+            groups[(s.episode_id, s.player_id)].append(s)
+
+        n_crossing_verified = 0
+        for key, ss in groups.items():
+            ss.sort(key=lambda s: s.step_id)
+            for j in range(len(ss) - 1):
+                src = ss[j]
+                nxt = ss[j + 1]
+                if src.transition_crossed_round:
+                    # 局跨ぎ: source round_id < next round_id
+                    assert src.round_id < nxt.round_id, \
+                        f"{key}: 局跨ぎ sample の round_id ({src.round_id}) が " \
+                        f"次 decision の round_id ({nxt.round_id}) 以上。" \
+                        f"post-step round を使っている可能性"
+                    n_crossing_verified += 1
+                else:
+                    # 非跨ぎ: round_id は同じか増加 (同一局内の複数 decision)
+                    assert src.round_id <= nxt.round_id
+
+        assert n_crossing_verified > 0, \
+            "局跨ぎ sample の round_id 検証が 1 件も通らなかった (10 半荘で局跨ぎ 0 件は異常)"

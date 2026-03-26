@@ -185,6 +185,22 @@ class Learner:
 
         n_before_filter = len(observations)
 
+        # CQ-0210: legacy shard fail-fast
+        raw_semantics_versions = data.get("sample_semantics_versions")
+        if raw_semantics_versions is not None and len(raw_semantics_versions) > 0:
+            min_ver = int(raw_semantics_versions.min())
+            if min_ver < 2:
+                raise ValueError(
+                    f"legacy shard (sample_semantics_version={min_ver}) を検出。"
+                    f" CQ-0210 以降の decision transition semantics (v2) が必要です。"
+                    f" 旧 shard で学習を実行すると GAE/return が不正になるため"
+                    f" fail-fast します。新しい self-play でデータを再生成してください。")
+
+        # CQ-0210: trajectory metadata
+        raw_episode_ids = data.get("episode_ids")
+        raw_player_ids = data.get("player_ids")
+        raw_step_ids = data.get("step_ids")
+
         # CQ-0145: shanten_deltas
         raw_shanten_deltas = data.get("shanten_deltas")
 
@@ -228,6 +244,12 @@ class Learner:
                 if raw_actor_types is not None:
                     keep_np = keep.cpu().numpy() if isinstance(keep, torch.Tensor) else keep
                     raw_actor_types = raw_actor_types[keep_np]
+                # CQ-0210: trajectory metadata も同期
+                if raw_episode_ids is not None:
+                    kn = keep.cpu().numpy() if isinstance(keep, torch.Tensor) else keep
+                    raw_episode_ids = raw_episode_ids[kn]
+                    raw_player_ids = raw_player_ids[kn]
+                    raw_step_ids = raw_step_ids[kn]
 
         # CQ-0164: 立直後打牌除外
         post_riichi_exclusion_stats = None
@@ -268,6 +290,11 @@ class Learner:
             # CQ-0194: actor_types も同期
             if raw_actor_types is not None:
                 raw_actor_types = raw_actor_types[exclude_np]
+            # CQ-0210: trajectory metadata も同期
+            if raw_episode_ids is not None:
+                raw_episode_ids = raw_episode_ids[exclude_np]
+                raw_player_ids = raw_player_ids[exclude_np]
+                raw_step_ids = raw_step_ids[exclude_np]
 
         n = len(observations)
         if n == 0:
@@ -312,7 +339,10 @@ class Learner:
                 teacher_best_masks=teacher_best_masks_t,
                 rewards=rewards, old_values=old_values,
                 terminateds=terminateds,
-                value_aux_features=current_shantens_t)
+                value_aux_features=current_shantens_t,
+                episode_ids=raw_episode_ids,
+                player_ids=raw_player_ids,
+                step_ids=raw_step_ids)
             metrics["teacher_best_set_status"] = teacher_best_set_status
             if tbm_shard_info:
                 metrics["teacher_best_mask_shard_info"] = tbm_shard_info
@@ -344,7 +374,10 @@ class Learner:
                 is_post_riichi_discards=raw_is_post_riichi_discards,
                 sample_weights=sample_weights,
                 actor_types=raw_actor_types,
-                teacher_best_masks=raw_teacher_best_masks)
+                teacher_best_masks=raw_teacher_best_masks,
+                episode_ids=raw_episode_ids,
+                player_ids=raw_player_ids,
+                step_ids=raw_step_ids)
         profiler.stop("model_forward")
 
         metrics["mode"] = self._mode
@@ -481,12 +514,21 @@ class Learner:
         sample_weights: torch.Tensor | None = None,
         actor_types: np.ndarray | None = None,
         teacher_best_masks: np.ndarray | None = None,
+        episode_ids: np.ndarray | None = None,
+        player_ids: np.ndarray | None = None,
+        step_ids: np.ndarray | None = None,
     ) -> dict:
         """PPO 学習"""
         # CQ-0183: anchor 参照モデルの遅延ロード (PPO 実行時のみ)
         self._load_anchor_ref_model()
 
-        advantages, returns = self._compute_gae(rewards, old_values, terminateds)
+        # CQ-0210: grouped GAE (decision transition semantics)
+        if episode_ids is not None and player_ids is not None and step_ids is not None:
+            advantages, returns = self._compute_grouped_gae(
+                rewards, old_values, terminateds,
+                episode_ids, player_ids, step_ids)
+        else:
+            advantages, returns = self._compute_gae(rewards, old_values, terminateds)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # CQ-0176: advantage clip 安定化
@@ -704,7 +746,10 @@ class Learner:
                         gamma=self._gamma,
                         point_delta_rewards=point_delta_rewards,
                         shanten_delta_rewards=shanten_delta_rewards,
-                        is_post_riichi_discards=is_post_riichi_discards))
+                        is_post_riichi_discards=is_post_riichi_discards,
+                        episode_ids=episode_ids,
+                        player_ids=player_ids,
+                        step_ids=step_ids))
 
             # CQ-0156: 巡目バケット別診断
             if turn_numbers is not None:
@@ -727,6 +772,9 @@ class Learner:
         old_values: torch.Tensor | None = None,
         terminateds: torch.Tensor | None = None,
         value_aux_features: torch.Tensor | None = None,
+        episode_ids: np.ndarray | None = None,
+        player_ids: np.ndarray | None = None,
+        step_ids: np.ndarray | None = None,
     ) -> dict:
         """模倣学習 (CQ-0130: loss mode 切替, CQ-0150: joint value warm start)
 
@@ -740,9 +788,15 @@ class Learner:
                 "but none were found in shard data")
 
         # CQ-0150: joint value warm start — returns 計算
+        # CQ-0210: grouped GAE を使用
         returns = None
         if self._imi_value_enabled and rewards is not None and old_values is not None and terminateds is not None:
-            _, returns = self._compute_gae(rewards, old_values, terminateds)
+            if episode_ids is not None and player_ids is not None and step_ids is not None:
+                _, returns = self._compute_grouped_gae(
+                    rewards, old_values, terminateds,
+                    episode_ids, player_ids, step_ids)
+            else:
+                _, returns = self._compute_gae(rewards, old_values, terminateds)
 
         all_policy_losses = []
         all_value_losses = []
@@ -934,6 +988,9 @@ class Learner:
         point_delta_rewards: np.ndarray | None = None,
         shanten_delta_rewards: np.ndarray | None = None,
         is_post_riichi_discards: np.ndarray | None = None,
+        episode_ids: np.ndarray | None = None,
+        player_ids: np.ndarray | None = None,
+        step_ids: np.ndarray | None = None,
     ) -> dict:
         """shanten 変化別の advantage/return/value_error 診断統計 (CQ-0145, CQ-0146, CQ-0160, CQ-0163)
 
@@ -941,6 +998,7 @@ class Learner:
         NaN の shanten_delta は unavailable として除外し、same 群に混入させない。
         CQ-0160: reward/point_delta_reward/shanten_delta_reward/delta_t を追加。
         CQ-0163: is_post_riichi_discards による立直後打牌統計を追加。
+        CQ-0210: delta_t を grouped next value で計算。
         """
         adv_np = advantages.cpu().numpy().astype(np.float64)
         ret_np = returns.cpu().numpy().astype(np.float64)
@@ -954,18 +1012,38 @@ class Learner:
         pdr_np = point_delta_rewards.astype(np.float64) if point_delta_rewards is not None else None
         sdr_np = shanten_delta_rewards.astype(np.float64) if shanten_delta_rewards is not None else None
 
-        # CQ-0160: delta_t = reward_t + gamma * next_value_t - old_value_t
+        # CQ-0160, CQ-0210: delta_t = reward_t + gamma * next_value_t - old_value_t
+        # CQ-0210: grouped next value を使用
         delta_t_np = None
         if reward_np is not None and terminateds is not None:
             t_cpu = terminateds.cpu().numpy()
             n = len(reward_np)
             delta_t_np = np.zeros(n, dtype=np.float64)
-            for t in range(n):
-                if t == n - 1 or t_cpu[t]:
-                    next_val = 0.0
-                else:
-                    next_val = old_val_np[t + 1]
-                delta_t_np[t] = reward_np[t] + gamma * next_val - old_val_np[t]
+            if episode_ids is not None and player_ids is not None and step_ids is not None:
+                # grouped delta_t: same-player next decision の value を使う
+                from collections import defaultdict
+                groups: dict[tuple, list[int]] = defaultdict(list)
+                for i in range(n):
+                    key = (str(episode_ids[i]), int(player_ids[i]))
+                    groups[key].append(i)
+                for key, indices in groups.items():
+                    indices.sort(key=lambda i: int(step_ids[i]))
+                    m = len(indices)
+                    for j in range(m):
+                        idx = indices[j]
+                        if j == m - 1 or t_cpu[idx]:
+                            next_val = 0.0
+                        else:
+                            next_val = old_val_np[indices[j + 1]]
+                        delta_t_np[idx] = reward_np[idx] + gamma * next_val - old_val_np[idx]
+            else:
+                # flat fallback
+                for t in range(n):
+                    if t == n - 1 or t_cpu[t]:
+                        next_val = 0.0
+                    else:
+                        next_val = old_val_np[t + 1]
+                    delta_t_np[t] = reward_np[t] + gamma * next_val - old_val_np[t]
 
         # CQ-0146: NaN は unavailable として除外
         available_mask = ~np.isnan(sd)
@@ -1126,13 +1204,65 @@ class Learner:
             result[name] = entry
         return result
 
+    def _compute_grouped_gae(
+        self,
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        terminateds: torch.Tensor,
+        episode_ids: np.ndarray,
+        player_ids: np.ndarray,
+        step_ids: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """CQ-0210: (episode_id, player_id) ごとに GAE を計算する
+
+        同一 (episode_id, player_id) の decision trajectory 上で GAE を計算し、
+        元の index に scatter する。別プレイヤーの value で bootstrap しない。
+        """
+        r_cpu = rewards.cpu().numpy()
+        v_cpu = values.cpu().numpy()
+        t_cpu = terminateds.cpu().numpy()
+        n = len(r_cpu)
+        adv_out = np.zeros(n, dtype=np.float64)
+
+        # group key = (episode_id, player_id)
+        from collections import defaultdict
+        groups: dict[tuple, list[int]] = defaultdict(list)
+        for i in range(n):
+            key = (str(episode_ids[i]), int(player_ids[i]))
+            groups[key].append(i)
+
+        gamma = self._gamma
+        lam = self._gae_lambda
+
+        for key, indices in groups.items():
+            # step_id 昇順でソート
+            indices.sort(key=lambda i: int(step_ids[i]))
+            m = len(indices)
+            last_gae = 0.0
+            for j in reversed(range(m)):
+                idx = indices[j]
+                if j == m - 1 or t_cpu[idx]:
+                    next_value = 0.0
+                else:
+                    next_idx = indices[j + 1]
+                    next_value = v_cpu[next_idx]
+                delta = r_cpu[idx] + gamma * next_value - v_cpu[idx]
+                if t_cpu[idx]:
+                    last_gae = 0.0
+                last_gae = delta + gamma * lam * last_gae
+                adv_out[idx] = last_gae
+
+        advantages = torch.from_numpy(adv_out).float()
+        returns = advantages + values.cpu().float()
+        return advantages.to(self._device), returns.to(self._device)
+
     def _compute_gae(
         self,
         rewards: torch.Tensor,
         values: torch.Tensor,
         terminateds: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """GAE (Generalized Advantage Estimation) を計算する
+        """GAE (Generalized Advantage Estimation) を計算する (legacy flat 版)
 
         逐次計算のため CPU 上で行い、結果を self._device に移す。
         """

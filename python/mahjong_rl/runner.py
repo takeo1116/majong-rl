@@ -138,16 +138,27 @@ def _rebuild_encoder(encoder_config: dict, obs_mode: str):
         current_shanten_input=_parse_encoder_flag(encoder_config, "current_shanten"),
         shape_hint=_parse_encoder_flag(encoder_config, "shape_hint"),
         turn_context=_parse_encoder_flag(encoder_config, "turn_context"),
+        opponent_current_shanten=_parse_encoder_flag(encoder_config, "opponent_current_shanten"),
+        opponent_tenpai_flag=_parse_encoder_flag(encoder_config, "opponent_tenpai_flag"),
+        danger_mask=_parse_encoder_flag(encoder_config, "danger_mask"),
     )
+
+
+# CQ-0213: full-only source 一覧（Partial mode では auto-off する）
+_FULL_ONLY_SOURCES = frozenset({
+    "danger_mask_kamicha", "danger_mask_toimen", "danger_mask_shimo",
+    "opponent_current_shanten", "opponent_tenpai_flag",
+})
 
 
 def _resolve_direct_hint_ranges(
     pdh_cfg: dict, feature_ranges: dict[str, tuple[int, int]] | None,
 ) -> dict[str, tuple[int, int]] | None:
-    """CQ-0203/CQ-0204: policy_direct_hints の source → range を解決・検証する
+    """CQ-0203/CQ-0204/CQ-0213: policy_direct_hints の source → range を解決・検証する
 
     main process / worker の両方でこのヘルパーを使い、validation を統一する。
-    source が feature_ranges に見つからない場合は ValueError を送出する。
+    full-only source が feature_ranges にない場合（Partial mode）は自動スキップする。
+    それ以外の source が見つからない場合は ValueError を送出する。
     """
     if not pdh_cfg.get("enabled", False):
         return None
@@ -156,6 +167,8 @@ def _resolve_direct_hint_ranges(
     result = {}
     for src in sources:
         if src not in fr:
+            if src in _FULL_ONLY_SOURCES:
+                continue  # Partial mode auto-off
             raise ValueError(
                 f"policy_direct_hints.sources の '{src}' が "
                 f"encoder feature_ranges に見つかりません "
@@ -185,6 +198,49 @@ def _rebuild_model(model_config: dict, encoder_meta) -> "MLPPolicyValueModel":
         policy_direct_hints_config=_pdh if _pdh.get("enabled", False) else None,
         direct_hint_ranges=_dhr,
     )
+
+
+class WorkerSidecar:
+    """CQ-0212: worker crash triage 用 sidecar ファイル
+
+    worker 起動時にメタデータを書き出し、match ごとに heartbeat を更新する。
+    native abort でも親 runner が sidecar を読んでどの match で落ちたかを特定できる。
+    """
+
+    def __init__(self, output_dir: str | Path, worker_id: int, phase: str,
+                 base_seed: int, worker_seed: int, **extra):
+        self._path = Path(output_dir) / f"worker_{worker_id}_sidecar.json"
+        self._data = {
+            "worker_id": worker_id,
+            "phase": phase,
+            "base_seed": base_seed,
+            "worker_seed": worker_seed,
+            "started_at": _utc_now_str(),
+            "status": "running",
+            **extra,
+        }
+        self._flush()
+
+    def heartbeat(self, match_index: int, match_seed: int, **extra):
+        """match 開始直前に呼ぶ"""
+        self._data["current_match_index"] = match_index
+        self._data["current_match_seed"] = match_seed
+        self._data["heartbeat_at"] = _utc_now_str()
+        self._data.update(extra)
+        self._flush()
+
+    def finish(self):
+        self._data["status"] = "completed"
+        self._data["finished_at"] = _utc_now_str()
+        self._flush()
+
+    def _flush(self):
+        import json as _json
+        try:
+            with open(self._path, "w") as f:
+                _json.dump(self._data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass  # sidecar 書き込み失敗は worker を止めない
 
 
 def _eval_worker_fn(
@@ -225,6 +281,15 @@ def _eval_worker_fn(
         worker_seed = derive_worker_seed(base_seed, worker_id)
         match_seeds = [derive_match_seed(worker_seed, i) for i in range(num_matches)]
 
+        # CQ-0212: crash triage sidecar
+        sidecar = WorkerSidecar(
+            partials_dir, worker_id, phase="eval",
+            base_seed=base_seed, worker_seed=worker_seed,
+            policy_seats=policy_seats,
+            num_matches=num_matches,
+            match_seed_range=[match_seeds[0], match_seeds[-1]] if match_seeds else [],
+        )
+
         # モデル・エンコーダ再構築 (ファイルから state_dict を読み込み)
         encoder = _rebuild_encoder(encoder_config, obs_mode)
         meta = encoder.metadata()
@@ -249,6 +314,10 @@ def _eval_worker_fn(
             value_shanten_enabled=_cs_enabled,
             reward_config=_reward_config)
 
+        # CQ-0215, CQ-0218: per-match heartbeat with policy seat
+        eval_runner.set_match_callback(
+            lambda mi, ms, seat: sidecar.heartbeat(
+                mi, ms, current_policy_seat=seat))
         partial = eval_runner.evaluate_partial(
             num_matches=num_matches,
             policy_seats=policy_seats,
@@ -263,6 +332,7 @@ def _eval_worker_fn(
             "torch_num_threads": torch.get_num_threads(),
         }
         save_partial(partial, Path(partials_dir), worker_id=worker_id)
+        sidecar.finish()
     except Exception as e:
         if error_queue is not None:
             error_queue.put({
@@ -306,6 +376,14 @@ def _selfplay_worker_fn(
         for key, val in env_vars.items():
             os.environ[key] = val
 
+        # CQ-0212: crash triage sidecar
+        sidecar = WorkerSidecar(
+            output_dir, worker_id, phase="selfplay",
+            base_seed=base_seed, worker_seed=worker_seed,
+            num_matches=num_matches,
+            match_seed_range=[match_seeds[0], match_seeds[-1]] if match_seeds else [],
+        )
+
         # エンコーダ再構築
         encoder = _rebuild_encoder(encoder_config, obs_mode)
 
@@ -324,10 +402,14 @@ def _selfplay_worker_fn(
             worker_id=f"worker_{worker_id}",
             inference_device=torch.device("cpu"),
         )
+        # CQ-0215: per-match heartbeat
+        worker.set_match_callback(
+            lambda mi, ms: sidecar.heartbeat(mi, ms))
         sp_stats = worker.run(
             num_matches=num_matches,
             match_seeds=match_seeds,
         )
+        sidecar.finish()
 
         # stats を JSON で保存
         sp_stats["base_seed"] = base_seed
@@ -1224,8 +1306,12 @@ class Stage1Runner:
             run_dir=run_dir,
             device=training_device,
         )
-        imi_epochs = self._config.training.get("imitation_epochs",
-                                                self._config.training.get("epochs", 4))
+        # CQ-0216: imitation_optimizer.epochs → imitation_epochs → epochs の優先順
+        imi_opt = self._config.training.get("imitation_optimizer", {})
+        imi_epochs = imi_opt.get(
+            "epochs",
+            self._config.training.get("imitation_epochs",
+                                       self._config.training.get("epochs", 4)))
         imi_filter = self._config.training.get("imitation_filter", None)
         metrics = learner.train(
             shard_dir,
@@ -1237,10 +1323,21 @@ class Stage1Runner:
         return metrics, learner
 
     def _make_imitation_train_config(self) -> dict:
-        """imitation 用 training config を構築する"""
+        """imitation 用 training config を構築する (CQ-0209)
+
+        training.imitation_optimizer が指定されていれば、
+        imitation phase の optimizer 設定だけを上書きする。
+        未指定なら従来どおり training.* を使う。
+        """
         cfg = dict(self._as_dict())
         cfg["training"] = dict(cfg["training"])
         cfg["training"]["algorithm"] = "imitation"
+        # CQ-0209: imitation 専用 optimizer 設定で上書き
+        imi_opt = cfg["training"].get("imitation_optimizer", {})
+        if imi_opt:
+            for key in ("lr", "batch_size", "epochs", "max_grad_norm"):
+                if key in imi_opt:
+                    cfg["training"][key] = imi_opt[key]
         return cfg
 
     @staticmethod
@@ -1869,7 +1966,7 @@ class Stage1Runner:
         return [base + (1 if i < remainder else 0) for i in range(num_workers)]
 
     def _create_encoder(self):
-        """設定からエンコーダを生成する (CQ-0119, CQ-0171)"""
+        """設定からエンコーダを生成する (CQ-0119, CQ-0171, CQ-0217)"""
         enc_cfg = self._config.feature_encoder
         name = enc_cfg.get("name", "FlatFeatureEncoder")
         obs_mode = enc_cfg.get(
@@ -1885,6 +1982,9 @@ class Stage1Runner:
             current_shanten_input=_parse_encoder_flag(enc_cfg, "current_shanten"),
             shape_hint=_parse_encoder_flag(enc_cfg, "shape_hint"),
             turn_context=_parse_encoder_flag(enc_cfg, "turn_context"),
+            opponent_current_shanten=_parse_encoder_flag(enc_cfg, "opponent_current_shanten"),
+            opponent_tenpai_flag=_parse_encoder_flag(enc_cfg, "opponent_tenpai_flag"),
+            danger_mask=_parse_encoder_flag(enc_cfg, "danger_mask"),
         )
 
     def _create_model(self, encoder):
@@ -1907,15 +2007,24 @@ class Stage1Runner:
         pt_cfg = model_cfg.get("policy_tower", {})
         vt_cfg = model_cfg.get("value_tower", {})
 
-        # CQ-0203, CQ-0204: policy_direct_hints config + encoder 整合検証
+        # CQ-0203, CQ-0204, CQ-0214, CQ-0217: policy_direct_hints 整合検証
         pdh_cfg = model_cfg.get("policy_direct_hints", {})
         if pdh_cfg.get("enabled", False):
             enc_cfg = self._config.feature_encoder
+            obs_mode = enc_cfg.get(
+                "observation_mode",
+                self._config.experiment.get("observation_mode", "full"))
+            is_partial = (obs_mode == "partial")
+            fr = meta.feature_ranges or {}
             for src in pdh_cfg.get("sources", []):
-                if not _parse_encoder_flag(enc_cfg, src):
+                if src not in fr:
+                    if src in _FULL_ONLY_SOURCES and is_partial:
+                        continue  # Partial mode auto-off
+                    # Full mode で fr にない = 対応する encoder feature が off
                     raise ValueError(
                         f"policy_direct_hints.sources に '{src}' があるが、"
-                        f"feature_encoder.{src} が無効です")
+                        f"encoder feature_ranges に見つかりません。"
+                        f"対応する feature_encoder flag を有効にしてください")
         direct_hint_ranges = _resolve_direct_hint_ranges(
             pdh_cfg, meta.feature_ranges)
 
@@ -2031,6 +2140,10 @@ class Stage1Runner:
                 "value_loss": imi.get("value_loss"),
                 "imitation_value_warmstart": imi.get("imitation_value_warmstart"),
             }
+            # CQ-0209: imitation_optimizer 追跡
+            imi_opt = self._config.training.get("imitation_optimizer", {})
+            if imi_opt:
+                imi_stats["imitation_optimizer"] = dict(imi_opt)
             # CQ-0206: multi-chunk imitation
             mci_info = imi.get("multi_chunk_imitation")
             if mci_info is not None:
@@ -2141,6 +2254,9 @@ class Stage1Runner:
             "current_shanten": _parse_encoder_flag(enc_cfg, "current_shanten"),
             "shape_hint": _parse_encoder_flag(enc_cfg, "shape_hint"),
             "turn_context": _parse_encoder_flag(enc_cfg, "turn_context"),
+            "opponent_current_shanten": _parse_encoder_flag(enc_cfg, "opponent_current_shanten"),
+            "opponent_tenpai_flag": _parse_encoder_flag(enc_cfg, "opponent_tenpai_flag"),
+            "danger_mask": _parse_encoder_flag(enc_cfg, "danger_mask"),
             "input_dim": result.get("input_dim"),
         }
 
@@ -2579,6 +2695,9 @@ class Stage1Runner:
             "current_shanten": _parse_encoder_flag(enc_cfg, "current_shanten"),
             "shape_hint": _parse_encoder_flag(enc_cfg, "shape_hint"),
             "turn_context": _parse_encoder_flag(enc_cfg, "turn_context"),
+            "opponent_current_shanten": _parse_encoder_flag(enc_cfg, "opponent_current_shanten"),
+            "opponent_tenpai_flag": _parse_encoder_flag(enc_cfg, "opponent_tenpai_flag"),
+            "danger_mask": _parse_encoder_flag(enc_cfg, "danger_mask"),
         }
         _flag_str = ", ".join(f"{k}={'on' if v else 'off'}" for k, v in _flags.items())
         lines.append(f"- encoder: {enc_cfg.get('name', '?')} "

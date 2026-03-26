@@ -1004,3 +1004,120 @@ class TestTurnContext:
         )
         # 353 + 34 + 34 + 1 + 66 + 4 = 492
         assert enc.metadata().output_shape == (492,)
+
+
+class TestOpponentFeatures:
+    """CQ-0213: opponent 防御特徴テスト"""
+
+    def test_full_adds_opponent_features(self, full_obs):
+        """full mode で opponent 特徴が正しい次元で追加される"""
+        enc = FlatFeatureEncoder(
+            observation_mode="full",
+            opponent_current_shanten=True,
+            opponent_tenpai_flag=True,
+            danger_mask=True,
+        )
+        meta = enc.metadata()
+        result = enc.encode(full_obs)
+        assert result.shape == meta.output_shape
+        # 455 + 3 + 3 + 34*3 = 563
+        assert meta.output_shape == (563,)
+
+    def test_full_feature_ranges(self, full_obs):
+        """feature_ranges に新 feature が登録される"""
+        enc = FlatFeatureEncoder(
+            observation_mode="full",
+            opponent_current_shanten=True,
+            opponent_tenpai_flag=True,
+            danger_mask=True,
+        )
+        fr = enc.metadata().feature_ranges
+        assert "opponent_current_shanten" in fr
+        assert "opponent_tenpai_flag" in fr
+        assert "danger_mask_kamicha" in fr
+        assert "danger_mask_toimen" in fr
+        assert "danger_mask_shimo" in fr
+
+    def test_partial_auto_off(self):
+        """partial mode で opponent 特徴が自動的に無効化される"""
+        enc = FlatFeatureEncoder(
+            observation_mode="partial",
+            opponent_current_shanten=True,
+            opponent_tenpai_flag=True,
+            danger_mask=True,
+        )
+        meta = enc.metadata()
+        # partial base = 353, opponent features は含まれない
+        assert meta.output_shape == (353,)
+        fr = meta.feature_ranges
+        assert "opponent_current_shanten" not in fr
+        assert "danger_mask_kamicha" not in fr
+
+    def test_opponent_shanten_values(self, full_obs):
+        """opponent_current_shanten が [0,1] 範囲"""
+        enc = FlatFeatureEncoder(
+            observation_mode="full",
+            opponent_current_shanten=True,
+        )
+        meta = enc.metadata()
+        result = enc.encode(full_obs)
+        s, e = meta.feature_ranges["opponent_current_shanten"]
+        opp_sh = result[s:e]
+        assert opp_sh.shape == (3,)
+        assert np.all(opp_sh >= 0.0)
+        assert np.all(opp_sh <= 1.0)
+
+    def test_tenpai_flag_binary(self, full_obs):
+        """opponent_tenpai_flag が 0/1"""
+        enc = FlatFeatureEncoder(
+            observation_mode="full",
+            opponent_tenpai_flag=True,
+        )
+        meta = enc.metadata()
+        result = enc.encode(full_obs)
+        s, e = meta.feature_ranges["opponent_tenpai_flag"]
+        tp = result[s:e]
+        for v in tp:
+            assert v in (0.0, 1.0)
+
+    def test_danger_mask_binary(self, full_obs):
+        """danger_mask が 0/1"""
+        enc = FlatFeatureEncoder(
+            observation_mode="full",
+            danger_mask=True,
+        )
+        meta = enc.metadata()
+        result = enc.encode(full_obs)
+        for name in ("danger_mask_kamicha", "danger_mask_toimen", "danger_mask_shimo"):
+            s, e = meta.feature_ranges[name]
+            dm = result[s:e]
+            assert dm.shape == (34,)
+            for v in dm:
+                assert v in (0.0, 1.0)
+
+    def test_off_preserves_dim(self):
+        """opponent features off で既存次元維持"""
+        enc = FlatFeatureEncoder(observation_mode="full")
+        assert enc.metadata().output_shape == (455,)
+
+    def test_danger_mask_seat_order(self, full_obs):
+        """CQ-0214: danger_mask の seat 順が shimo(+1), toimen(+2), kamicha(+3)"""
+        enc = FlatFeatureEncoder(observation_mode="full", danger_mask=True)
+        fr = enc.metadata().feature_ranges
+        # feature_ranges のキー順を検証
+        keys = [k for k in fr if k.startswith("danger_mask_")]
+        assert keys == ["danger_mask_shimo", "danger_mask_toimen", "danger_mask_kamicha"]
+
+    def test_danger_mask_source_in_direct_hints(self, full_obs):
+        """CQ-0214: danger_mask_* を policy_direct_hints.sources に指定可能"""
+        enc = FlatFeatureEncoder(
+            observation_mode="full",
+            danger_mask=True,
+            shanten_hint=True,
+        )
+        fr = enc.metadata().feature_ranges
+        # danger_mask_* が feature_ranges に存在すれば direct hint source として使える
+        for name in ("danger_mask_shimo", "danger_mask_toimen", "danger_mask_kamicha"):
+            assert name in fr
+            s, e = fr[name]
+            assert e - s == 34

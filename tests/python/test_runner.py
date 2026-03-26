@@ -3737,3 +3737,119 @@ class TestMultiChunkImitation:
             imi_shards = manifest.get("artifacts", {}).get("imitation_shards", {})
             assert imi_shards.get("exists") is True
             assert imi_shards.get("shard_count", 0) > 0
+
+
+@pytest.mark.smoke
+class TestImitationOptimizer:
+    """CQ-0209: imitation optimizer 分離テスト"""
+
+    def test_imitation_optimizer_override(self, tmp_path: Path):
+        """imitation_optimizer.lr が imitation phase にのみ適用される"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.experiment["phases"] = ["imitation", "selfplay", "learner", "eval"]
+        config.training["lr"] = 1e-4  # PPO 用
+        config.training["imitation_optimizer"] = {
+            "lr": 1e-2,  # imitation 専用
+            "batch_size": 64,
+        }
+        config.selfplay["imitation_matches"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        imi = summary.get("phase_stats", {}).get("imitation", {})
+        imi_opt = imi.get("imitation_optimizer", {})
+        assert imi_opt.get("lr") == 1e-2
+        assert imi_opt.get("batch_size") == 64
+
+    def test_no_imitation_optimizer_backward_compat(self, tmp_path: Path):
+        """imitation_optimizer 未指定で既存挙動維持"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+
+@pytest.mark.smoke
+class TestWorkerSidecar:
+    """CQ-0212: worker crash triage sidecar テスト"""
+
+    def test_sidecar_created_on_run(self, tmp_path: Path):
+        """run 完走後に selfplay worker sidecar ファイルが存在する"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.selfplay["num_workers"] = 2
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+        run_dir = Path(result["run_dir"])
+        sidecars = list(run_dir.rglob("*_sidecar.json"))
+        assert len(sidecars) > 0, "sidecar ファイルが見つからない"
+        with open(sidecars[0]) as f:
+            data = json.load(f)
+        assert data["status"] == "completed"
+        assert "base_seed" in data
+        assert "worker_id" in data
+        assert data["phase"] == "selfplay"
+
+
+@pytest.mark.smoke
+class TestDangerMaskDirectHint:
+    """CQ-0217: danger_mask direct hint の配線テスト"""
+
+    def test_full_danger_mask_direct_hint_runs(self, tmp_path: Path):
+        """Full + danger_mask + direct_hints で model 初期化が通る"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["danger_mask"] = {"enabled": True}
+        config.feature_encoder["shanten_hint"] = {"enabled": True}
+        config.model["policy_direct_hints"] = {
+            "enabled": True,
+            "sources": ["danger_mask_shimo", "shanten_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 2,
+            "context_gate": {"enabled": True},
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+
+    def test_full_danger_mask_off_raises(self, tmp_path: Path):
+        """Full + danger_mask=false + sources=['danger_mask_shimo'] で validation error"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.feature_encoder["shanten_hint"] = {"enabled": True}
+        config.model["policy_direct_hints"] = {
+            "enabled": True,
+            "sources": ["danger_mask_shimo", "shanten_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 2,
+        }
+        # danger_mask は未設定 (default false)
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        with pytest.raises(ValueError, match="feature_ranges"):
+            runner.run()
+
+    def test_partial_auto_off(self, tmp_path: Path):
+        """Partial + danger_mask + sources=['danger_mask_shimo'] で auto-off"""
+        config = _make_minimal_config()
+        config.experiment["global_seed"] = 42
+        config.experiment["observation_mode"] = "partial"
+        config.feature_encoder["observation_mode"] = "partial"
+        config.feature_encoder["danger_mask"] = {"enabled": True}
+        config.feature_encoder["shanten_hint"] = {"enabled": True}
+        config.model["policy_direct_hints"] = {
+            "enabled": True,
+            "sources": ["danger_mask_shimo", "shanten_hint"],
+            "local_hidden_dim": 8,
+            "tile_embedding_dim": 2,
+        }
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result

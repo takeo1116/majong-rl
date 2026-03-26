@@ -21,15 +21,20 @@ _REQUIRED_NONNEG_FIELDS = ("model_version", "generation", "round_id", "step_id")
 
 @dataclass
 class LearningSample:
-    """1ステップの学習サンプル"""
-    observation: np.ndarray       # エンコード済み特徴量 (flat float32)
-    legal_mask: np.ndarray        # (34,) float32
+    """1 decision transition の学習サンプル (CQ-0210/0211)
+
+    v2 semantics では、1 sample は「あるプレイヤーの decision」から
+    「同プレイヤーの次 decision または match end」までの遷移を表す。
+    reward / point_delta_reward / shanten_delta_reward は遷移中の累積値。
+    """
+    observation: np.ndarray       # エンコード済み特徴量 (flat float32, decision 時点)
+    legal_mask: np.ndarray        # (34,) float32 (decision 時点)
     action: int                   # 選択された TileType (0-33)
-    reward: float                 # 即時報酬
+    reward: float                 # 累積報酬 (decision → next same-player decision / match end)
     log_prob: float               # 行動選択時の log_prob
-    value: float                  # 推論時の value 推定
-    terminated: bool              # 半荘終了フラグ
-    round_over: bool              # 局終了フラグ
+    value: float                  # 推論時の value 推定 (decision 時点)
+    terminated: bool              # この遷移が match end で閉じたか
+    round_over: bool              # この遷移中に局境界を跨いだか (= transition_crossed_round)
     # メタデータ
     experiment_id: str = ""
     run_id: str = ""
@@ -39,9 +44,9 @@ class LearningSample:
     generation: int = 0
     timestamp: float = 0.0
     episode_id: str = ""
-    round_id: int = 0
-    step_id: int = 0
-    player_id: int = 0
+    round_id: int = 0             # decision 時点の局番号 (pre-step)
+    step_id: int = 0              # decision 発生順カウンタ (open 時採番)
+    player_id: int = 0            # 行動主体の席番号 (0-3)
     actor_type: str = "policy"  # "policy" or "baseline"
     teacher_best_mask: np.ndarray | None = None  # (34,) float32, 教師最良候補集合 (CQ-0125)
     shanten_delta: float | None = None  # shanten 変化量 (CQ-0145)
@@ -50,6 +55,9 @@ class LearningSample:
     point_delta_reward: float | None = None  # 点数差分報酬成分 (CQ-0160)
     shanten_delta_reward: float | None = None  # シャンテン差分報酬成分 (CQ-0160)
     is_post_riichi_discard: bool | None = None  # 立直後打牌フラグ (CQ-0163)
+    # CQ-0210: decision transition semantics
+    transition_crossed_round: bool | None = None  # 遷移が局境界を跨いだか
+    sample_semantics_version: int = 1  # 1=legacy immediate, 2=decision transition
 
 
 def validate_metadata(sample: LearningSample) -> None:
@@ -223,6 +231,16 @@ class ShardWriter:
                 for s in self._buffer
             ]
 
+        # CQ-0210: transition_crossed_round / sample_semantics_version
+        if any(s.transition_crossed_round is not None for s in self._buffer):
+            data["transition_crossed_round"] = [
+                int(s.transition_crossed_round) if s.transition_crossed_round is not None else -1
+                for s in self._buffer
+            ]
+        data["sample_semantics_version"] = [
+            s.sample_semantics_version for s in self._buffer
+        ]
+
         self._backend.write(data, path)
         self._buffer.clear()
         self._shard_counter += 1
@@ -283,8 +301,27 @@ class ShardReader:
                     step_id=table.column("step_id")[i].as_py(),
                     player_id=table.column("player_id")[i].as_py(),
                     actor_type=self._read_column_safe(table, "actor_type", i, "policy"),
+                    # CQ-0160: reward components
+                    point_delta_reward=self._read_column_safe(
+                        table, "point_delta_reward", i, None),
+                    shanten_delta_reward=self._read_column_safe(
+                        table, "shanten_delta_reward", i, None),
+                    # CQ-0210: optional transition metadata
+                    transition_crossed_round=self._read_tcr(table, i),
+                    sample_semantics_version=self._read_column_safe(
+                        table, "sample_semantics_version", i, 1),
                 ))
         return samples
+
+    @staticmethod
+    def _read_tcr(table, index: int):
+        """transition_crossed_round を bool | None に変換して読む"""
+        if "transition_crossed_round" not in table.column_names:
+            return None
+        v = table.column("transition_crossed_round")[index].as_py()
+        if v < 0:
+            return None
+        return bool(v)
 
     @staticmethod
     def _read_column_safe(table: pa.Table, column: str, index: int, default):
@@ -331,6 +368,13 @@ class ShardReader:
         # CQ-0163: is_post_riichi_discard
         all_is_post_riichi_discards: list[int] = []
         has_is_post_riichi_discard = False
+        # CQ-0210: trajectory metadata
+        all_episode_ids: list[str] = []
+        all_player_ids: list[int] = []
+        all_step_ids: list[int] = []
+        all_transition_crossed_rounds: list[int] = []
+        has_transition_crossed_round = False
+        all_sample_semantics_versions: list[int] = []
 
         for path in self._find_shards():
             table = self._backend.read(path)
@@ -410,6 +454,31 @@ class ShardReader:
             else:
                 all_is_post_riichi_discards.extend([-1] * n)
 
+            # CQ-0210: trajectory metadata
+            if "episode_id" in table.column_names:
+                all_episode_ids.extend(table.column("episode_id").to_pylist())
+            else:
+                all_episode_ids.extend([""] * n)
+            if "player_id" in table.column_names:
+                all_player_ids.extend(table.column("player_id").to_pylist())
+            else:
+                all_player_ids.extend([-1] * n)
+            if "step_id" in table.column_names:
+                all_step_ids.extend(table.column("step_id").to_pylist())
+            else:
+                all_step_ids.extend([-1] * n)
+            if "transition_crossed_round" in table.column_names:
+                has_transition_crossed_round = True
+                all_transition_crossed_rounds.extend(
+                    table.column("transition_crossed_round").to_pylist())
+            else:
+                all_transition_crossed_rounds.extend([-1] * n)
+            if "sample_semantics_version" in table.column_names:
+                all_sample_semantics_versions.extend(
+                    table.column("sample_semantics_version").to_pylist())
+            else:
+                all_sample_semantics_versions.extend([1] * n)  # legacy = v1
+
         if not all_obs:
             return {
                 "observations": np.zeros((0, 0), dtype=np.float32),
@@ -429,6 +498,11 @@ class ShardReader:
                 "point_delta_rewards": None,
                 "shanten_delta_rewards": None,
                 "is_post_riichi_discards": None,
+                "episode_ids": np.array([], dtype=object),
+                "player_ids": np.zeros(0, dtype=np.int32),
+                "step_ids": np.zeros(0, dtype=np.int32),
+                "transition_crossed_rounds": None,
+                "sample_semantics_versions": np.zeros(0, dtype=np.int32),
             }
 
         result = {
@@ -492,6 +566,18 @@ class ShardReader:
         else:
             result["is_post_riichi_discards"] = None
 
+        # CQ-0210: trajectory metadata
+        result["episode_ids"] = np.array(all_episode_ids, dtype=object)
+        result["player_ids"] = np.array(all_player_ids, dtype=np.int32)
+        result["step_ids"] = np.array(all_step_ids, dtype=np.int32)
+        if has_transition_crossed_round and all(v >= 0 for v in all_transition_crossed_rounds):
+            result["transition_crossed_rounds"] = np.array(
+                all_transition_crossed_rounds, dtype=np.bool_)
+        else:
+            result["transition_crossed_rounds"] = None
+        result["sample_semantics_versions"] = np.array(
+            all_sample_semantics_versions, dtype=np.int32)
+
         if filter_actor_type is not None:
             actor_mask = result["actor_types"] == filter_actor_type
             raw_tbm = result.pop("_raw_teacher_best_masks")
@@ -504,6 +590,7 @@ class ShardReader:
             pdr = result.pop("point_delta_rewards")
             sdr = result.pop("shanten_delta_rewards")
             iprd = result.pop("is_post_riichi_discards")
+            tcr = result.pop("transition_crossed_rounds")
             result = {k: v[actor_mask] for k, v in result.items()}
             # CQ-0191: filter 後の行で teacher_best_masks を判定
             filtered_tbm = [raw_tbm[i] for i, m in enumerate(actor_mask) if m]
@@ -519,6 +606,7 @@ class ShardReader:
             result["point_delta_rewards"] = pdr[actor_mask] if pdr is not None else None
             result["shanten_delta_rewards"] = sdr[actor_mask] if sdr is not None else None
             result["is_post_riichi_discards"] = iprd[actor_mask] if iprd is not None else None
+            result["transition_crossed_rounds"] = tcr[actor_mask] if tcr is not None else None
         else:
             # non-filter: raw list を最終化 (CQ-0191)
             raw_tbm = result.pop("_raw_teacher_best_masks")

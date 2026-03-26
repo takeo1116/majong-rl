@@ -109,6 +109,10 @@ class SelfPlayWorker:
         self._model_version = 0
         self._generation = 0
 
+    def set_match_callback(self, callback):
+        """CQ-0215: match 開始直前に呼ばれる callback を設定する"""
+        self._match_callback = callback
+
     def run(self, num_matches: int, seed_start: int = 0,
             match_seeds: list[int] | None = None) -> dict:
         """指定数の半荘を生成し、shard に書き出す
@@ -141,6 +145,11 @@ class SelfPlayWorker:
             seed = match_seeds[match_idx] if match_seeds is not None else seed_start + match_idx
             episode_id = f"ep_{seed}"
             progress = match_idx / num_matches if num_matches > 0 else 0.0
+
+            # CQ-0215: per-match heartbeat callback
+            cb = getattr(self, "_match_callback", None)
+            if cb is not None:
+                cb(match_idx, seed)
 
             stats = self._play_one_match(
                 seed=seed,
@@ -183,7 +192,11 @@ class SelfPlayWorker:
 
     def _play_one_match(self, seed: int, episode_id: str, run_id: str,
                         progress: float = 0.0) -> dict:
-        """1 半荘を実行しサンプルを収集する"""
+        """1 半荘を実行しサンプルを収集する (CQ-0210: decision transition semantics)
+
+        各プレイヤーの pending decision を保持し、same-player の次 decision
+        到来時または match end 時に累積報酬を確定して flush する。
+        """
         env = Stage1Env(observation_mode=self._observation_mode,
                        reward_config=self._reward_policy_config)
         torch.manual_seed(seed)
@@ -197,9 +210,58 @@ class SelfPlayWorker:
         seat_is_policy = self._assign_seats(seed)
 
         steps = 0
-        sample_step = 0  # ポリシーサンプルの意思決定順序カウンタ
+        sample_step = 0  # decision 発生順カウンタ (open 時採番)
         round_count = 0
         prev_round_number = info["round_number"]
+
+        # CQ-0210: pending transition を 4 席分持つ
+        # pending[p] = None | dict (decision metadata + accumulators)
+        pending: dict[int, dict | None] = {0: None, 1: None, 2: None, 3: None}
+
+        def _flush_pending(p: int, is_terminal: bool) -> None:
+            """pending[p] を確定して shard に書き出す"""
+            nonlocal sample_step
+            pd = pending[p]
+            if pd is None:
+                return
+            # CQ-0139: reward composition 統計
+            self._accumulate_reward_stats(
+                pd["point_delta_reward_accum"],
+                pd["shanten_delta_reward_accum"],
+                pd["reward_accum"])
+            sample = LearningSample(
+                observation=pd["observation"],
+                legal_mask=pd["legal_mask"],
+                action=pd["action"],
+                reward=pd["reward_accum"],
+                log_prob=pd["log_prob"],
+                value=pd["value"],
+                terminated=is_terminal,
+                round_over=pd["transition_crossed_round"],
+                experiment_id=self._experiment_id,
+                run_id=run_id,
+                worker_id=self._worker_id,
+                shard_id="",
+                model_version=self._model_version,
+                generation=self._generation,
+                timestamp=time.time(),
+                episode_id=episode_id,
+                round_id=pd["round_id"],
+                step_id=pd["step_id"],
+                player_id=p,
+                actor_type=pd["actor_type"],
+                teacher_best_mask=pd["teacher_best_mask"],
+                shanten_delta=pd["shanten_delta"],
+                current_shanten=pd["current_shanten"],
+                turn_number=pd["turn_number"],
+                point_delta_reward=pd["point_delta_reward_accum"],
+                shanten_delta_reward=pd["shanten_delta_reward_accum"],
+                is_post_riichi_discard=pd["is_post_riichi"],
+                transition_crossed_round=pd["transition_crossed_round"],
+                sample_semantics_version=2,
+            )
+            self._writer.add(sample)
+            pending[p] = None
 
         max_steps = 10000
         while steps < max_steps:
@@ -212,7 +274,7 @@ class SelfPlayWorker:
             # CQ-0163: 立直後打牌フラグ（打牌前の状態で判定）
             is_post_riichi = env.env_state.round_state.players[current].is_riichi
 
-            # CQ-0151: current_shanten 計算（shanten_delta とは独立に計算可能）
+            # CQ-0151: current_shanten 計算
             current_shanten_val = None
             hand = None
             if self._value_shanten_enabled or self._shanten_tracker is not None:
@@ -223,28 +285,22 @@ class SelfPlayWorker:
                         counts[tid // 4] += 1
                     current_shanten_val = compute_shanten(counts)
 
-            teacher_best_mask = None  # CQ-0125: baseline 席のみ非 None
+            teacher_best_mask = None
             if seat_is_policy[current]:
-                # ポリシー席: action 選択前の観測を保存用にエンコード
                 pre_features = self._encoder.encode(obs, legal_mask=mask)
                 pre_features_flat = pre_features.flatten() if pre_features.ndim > 1 else pre_features
                 tile_type, log_prob, value = self._policy_step(
                     pre_features_flat, mask, current_shanten=current_shanten_val)
             else:
-                # ベースライン席: ルールベースで選択
                 tile_type, teacher_best_mask = self._baseline_step(env, mask)
                 log_prob = 0.0
                 value = 0.0
-                # baseline 保存が有効なら観測をエンコード
                 if self._save_baseline_actions:
                     pre_features = self._encoder.encode(obs, legal_mask=mask)
                     pre_features_flat = pre_features.flatten() if pre_features.ndim > 1 else pre_features
-                    # CQ-0192, CQ-0194: mixed PPO 用に actor model の log_prob/value を計算
-                    # policy 経路と同一の入力定義 (value_aux, temperature) を使用
                     if self._baseline_actor_eval:
                         self._features_buf[0].copy_(torch.from_numpy(pre_features_flat))
                         self._mask_buf[0].copy_(torch.from_numpy(mask))
-                        # value_aux: policy 経路と同一 (CQ-0194)
                         value_aux = None
                         if self._value_shanten_enabled and current_shanten_val is not None:
                             self._value_aux_buf[0, 0] = current_shanten_val / 8.0
@@ -252,14 +308,12 @@ class SelfPlayWorker:
                         with torch.no_grad():
                             out = self._model(self._features_buf, self._mask_buf,
                                               value_aux_features=value_aux)
-                        # log_prob: temperature 付き分布で算出 (CQ-0194)
                         logits = out.logits[0]
                         logits_masked = logits + (1 - self._mask_buf[0]) * (-1e9)
                         if self._temperature != 1.0:
                             logits_masked = logits_masked / self._temperature
                         lp = torch.log_softmax(logits_masked, dim=-1)
                         log_prob = float(lp[tile_type].item())
-                        # value
                         for v_tensor in out.values.values():
                             value = float(v_tensor.item())
                             break
@@ -268,18 +322,50 @@ class SelfPlayWorker:
 
             # CQ-0139, CQ-0140: shanten delta reward 計算 (env.step の前)
             shanten_delta_reward = 0.0
-            shanten_delta_raw = None  # CQ-0145, CQ-0148: mode/scale/schedule 非依存の raw delta
+            shanten_delta_raw = None
             if self._shanten_tracker is not None:
-                # hand は上で既に取得済み（_shanten_tracker is not None なら必ず取得されている）
                 shaping_reward, shanten_delta_raw = self._shanten_tracker.compute_reward(
                     current, hand, tile_type)
                 shanten_delta_reward = shaping_reward * self._shanten_schedule.get_scale_factor(progress)
 
-            obs, rewards, terminated, truncated, info = env.step(tile_type)
+            # --- CQ-0211: source metadata は decision 時点 (pre-step) の値を使う ---
+            source_round_id = prev_round_number  # pre-step の局番号
 
-            # CQ-0139: reward composition
-            point_delta_reward = float(rewards[current])
-            total_reward = point_delta_reward + shanten_delta_reward
+            # --- CQ-0210/0211: current の前回 pending を flush ---
+            should_save_current = seat_is_policy[current] or (
+                self._save_baseline_actions and not seat_is_policy[current])
+            if should_save_current and pending[current] is not None:
+                _flush_pending(current, is_terminal=False)
+
+            # --- CQ-0211: 今回の decision を新しい pending として open (env.step 前) ---
+            # env.step 前に open することで、自身の action が生む reward が
+            # 必ず source decision sample に加算される
+            if should_save_current:
+                actor_type = "policy" if seat_is_policy[current] else "baseline"
+                pending[current] = {
+                    "observation": pre_features_flat,
+                    "legal_mask": mask.astype(np.float32),
+                    "action": tile_type,
+                    "log_prob": float(log_prob),
+                    "value": float(value),
+                    "actor_type": actor_type,
+                    "teacher_best_mask": teacher_best_mask if actor_type == "baseline" else None,
+                    "shanten_delta": shanten_delta_raw,
+                    "current_shanten": current_shanten_val,
+                    "turn_number": turn_number_val,
+                    "is_post_riichi": is_post_riichi,
+                    "round_id": source_round_id,  # CQ-0211: decision 時点の局番号
+                    "step_id": sample_step,
+                    # accumulators (初期値 0)
+                    "reward_accum": 0.0,
+                    "point_delta_reward_accum": 0.0,
+                    "shanten_delta_reward_accum": 0.0,
+                    "transition_crossed_round": False,
+                }
+                sample_step += 1
+
+            # --- env.step ---
+            obs, rewards, terminated, truncated, info = env.step(tile_type)
 
             # 局境界判定
             round_number = info["round_number"]
@@ -288,17 +374,17 @@ class SelfPlayWorker:
                 round_count += 1
             prev_round_number = round_number
 
-            # 局終了イベント記録 (CQ-0105, CQ-0108)
+            # 局終了イベント記録
             for evt in info.get("round_end_events", []):
                 wps = evt["winner_players"]
-                lp = evt["loser_player"]
+                lp_evt = evt["loser_player"]
                 policy_wps = [w for w in wps if seat_is_policy[w]]
                 self._round_results.append({
                     "event_type": evt["event_type"],
                     "winner_players": wps,
-                    "loser_player": lp,
+                    "loser_player": lp_evt,
                     "is_policy_win": len(policy_wps) > 0,
-                    "is_policy_deal_in": (lp >= 0 and seat_is_policy[lp]),
+                    "is_policy_deal_in": (lp_evt >= 0 and seat_is_policy[lp_evt]),
                     "is_draw": evt["event_type"] == "ryukyoku",
                     "policy_winner_players": policy_wps,
                     "round_id": evt["round_id"],
@@ -307,49 +393,25 @@ class SelfPlayWorker:
                     "seed": seed,
                 })
 
-            # サンプル収集
-            should_save = seat_is_policy[current] or (
-                self._save_baseline_actions and not seat_is_policy[current])
-            if should_save:
-                # CQ-0139: reward composition 統計を累積
-                self._accumulate_reward_stats(
-                    point_delta_reward, shanten_delta_reward, total_reward)
+            # --- CQ-0210/0211: 4人全員の pending に reward を加算 ---
+            # pending[current] は上で open 済みなので、自身の action reward も含まれる
+            for p in range(4):
+                if pending[p] is not None:
+                    pending[p]["point_delta_reward_accum"] += float(rewards[p])
+                    pending[p]["reward_accum"] += float(rewards[p])
+                    if round_over:
+                        pending[p]["transition_crossed_round"] = True
 
-                actor_type = "policy" if seat_is_policy[current] else "baseline"
-                sample = LearningSample(
-                    observation=pre_features_flat,
-                    legal_mask=mask.astype(np.float32),
-                    action=tile_type,
-                    reward=total_reward,
-                    log_prob=float(log_prob),
-                    value=float(value),
-                    terminated=terminated,
-                    round_over=round_over,
-                    experiment_id=self._experiment_id,
-                    run_id=run_id,
-                    worker_id=self._worker_id,
-                    shard_id="",
-                    model_version=self._model_version,
-                    generation=self._generation,
-                    timestamp=time.time(),
-                    episode_id=episode_id,
-                    round_id=round_number,
-                    step_id=sample_step,
-                    player_id=current,
-                    actor_type=actor_type,
-                    teacher_best_mask=teacher_best_mask if actor_type == "baseline" else None,
-                    shanten_delta=shanten_delta_raw,  # CQ-0145: schedule 適用前の raw delta
-                    current_shanten=current_shanten_val,  # CQ-0151: value head 用
-                    turn_number=turn_number_val,  # CQ-0156: 巡目診断用
-                    point_delta_reward=point_delta_reward,  # CQ-0160: 点数差分報酬成分
-                    shanten_delta_reward=shanten_delta_reward,  # CQ-0160: シャンテン差分報酬成分
-                    is_post_riichi_discard=is_post_riichi,  # CQ-0163: 立直後打牌フラグ
-                )
-                self._writer.add(sample)
-                sample_step += 1
+            # action owner にだけ shanten_delta_reward を加算
+            if pending[current] is not None:
+                pending[current]["shanten_delta_reward_accum"] += shanten_delta_reward
+                pending[current]["reward_accum"] += shanten_delta_reward
 
             steps += 1
             if terminated:
+                # match end: 残り全 pending を terminal flush
+                for p in range(4):
+                    _flush_pending(p, is_terminal=True)
                 break
 
         return {"steps": steps, "rounds": round_count}

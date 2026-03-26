@@ -2008,3 +2008,142 @@ class TestTeacherAgreement:
         assert 0.0 <= ta["best_set_hit_rate_before"] <= 1.0
         assert ta["best_set_hit_rate_after"] is not None
         assert 0.0 <= ta["best_set_hit_rate_after"] <= 1.0
+
+
+class TestGroupedGAE:
+    """CQ-0210: grouped GAE の単体テスト"""
+
+    def test_grouped_gae_hand_calculation(self, tmp_path: Path):
+        """interleaved sample order に対して grouped GAE が手計算と一致する"""
+        obs_dim = 10
+        gamma = 0.99
+        lam = 0.95
+
+        # 2 episode × 2 player の interleaved samples
+        # ep0-p0: steps [0, 2, 4]  rewards [1, 2, 3]  values [0.5, 0.6, 0.7]
+        # ep0-p1: steps [1, 3, 5]  rewards [10, 20, 30] values [5, 6, 7]
+        # ep0-p0 sample 2 terminated=True
+        # ep0-p1 sample 5 terminated=True
+        samples_spec = [
+            # (episode_id, player_id, step_id, reward, value, terminated)
+            ("ep0", 0, 0, 1.0, 0.5, False),
+            ("ep0", 1, 1, 10.0, 5.0, False),
+            ("ep0", 0, 2, 2.0, 0.6, False),
+            ("ep0", 1, 3, 20.0, 6.0, False),
+            ("ep0", 0, 4, 3.0, 0.7, True),
+            ("ep0", 1, 5, 30.0, 7.0, True),
+        ]
+        n = len(samples_spec)
+
+        # write v2 shard
+        shard_dir = tmp_path / "shards"
+        writer = ShardWriter(shard_dir, max_samples=10000)
+        for ep_id, pid, sid, rew, val, term in samples_spec:
+            writer.add(LearningSample(
+                observation=np.zeros(obs_dim, dtype=np.float32),
+                legal_mask=np.ones(34, dtype=np.float32),
+                action=0, reward=rew, log_prob=-0.5, value=val,
+                terminated=term, round_over=False,
+                experiment_id="test", run_id="r", worker_id="w",
+                episode_id=ep_id, round_id=0, step_id=sid, player_id=pid,
+                sample_semantics_version=2,
+            ))
+        writer.close()
+
+        config = _make_config()
+        config["training"]["epochs"] = 1
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[8])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+
+        # 直接 _compute_grouped_gae を呼んで手計算と比較
+        rewards_t = torch.tensor([s[3] for s in samples_spec], dtype=torch.float32)
+        values_t = torch.tensor([s[4] for s in samples_spec], dtype=torch.float32)
+        terms_t = torch.tensor([s[5] for s in samples_spec])
+        ep_ids = np.array([s[0] for s in samples_spec], dtype=object)
+        p_ids = np.array([s[1] for s in samples_spec], dtype=np.int32)
+        s_ids = np.array([s[2] for s in samples_spec], dtype=np.int32)
+
+        adv, ret = learner._compute_grouped_gae(
+            rewards_t, values_t, terms_t, ep_ids, p_ids, s_ids)
+
+        # 手計算: ep0-p0 trajectory [idx 0, 2, 4]
+        # idx4: terminated, delta = 3.0 + 0 - 0.7 = 2.3, gae = 2.3
+        # idx2: delta = 2.0 + 0.99*0.7 - 0.6 = 2.093, gae = 2.093 + 0.99*0.95*2.3
+        # idx0: delta = 1.0 + 0.99*0.6 - 0.5 = 1.094, gae = 1.094 + 0.99*0.95*gae[idx2]
+        d4 = 3.0 + 0.0 - 0.7  # 2.3
+        g4 = d4
+        d2 = 2.0 + gamma * 0.7 - 0.6  # 2.093
+        g2 = d2 + gamma * lam * g4
+        d0 = 1.0 + gamma * 0.6 - 0.5  # 1.094
+        g0 = d0 + gamma * lam * g2
+
+        adv_np = adv.cpu().numpy()
+        assert abs(adv_np[0] - g0) < 1e-4, f"idx0: {adv_np[0]} != {g0}"
+        assert abs(adv_np[2] - g2) < 1e-4, f"idx2: {adv_np[2]} != {g2}"
+        assert abs(adv_np[4] - g4) < 1e-4, f"idx4: {adv_np[4]} != {g4}"
+
+        # 手計算: ep0-p1 trajectory [idx 1, 3, 5]
+        d5 = 30.0 + 0.0 - 7.0  # 23
+        g5 = d5
+        d3 = 20.0 + gamma * 7.0 - 6.0  # 20.93
+        g3 = d3 + gamma * lam * g5
+        d1 = 10.0 + gamma * 6.0 - 5.0  # 10.94
+        g1 = d1 + gamma * lam * g3
+
+        assert abs(adv_np[1] - g1) < 1e-4, f"idx1: {adv_np[1]} != {g1}"
+        assert abs(adv_np[3] - g3) < 1e-4, f"idx3: {adv_np[3]} != {g3}"
+        assert abs(adv_np[5] - g5) < 1e-4, f"idx5: {adv_np[5]} != {g5}"
+
+        # flat GAE とは一致しないことも確認
+        adv_flat, _ = learner._compute_gae(rewards_t, values_t, terms_t)
+        assert not np.allclose(adv_np, adv_flat.cpu().numpy(), atol=1e-3), \
+            "grouped GAE should differ from flat GAE for interleaved data"
+
+    def test_legacy_shard_rejected(self, tmp_path: Path):
+        """legacy shard (v1) が training path で fail-fast される"""
+        obs_dim = 10
+        shard_dir = tmp_path / "shards"
+        writer = ShardWriter(shard_dir, max_samples=10000)
+        for i in range(20):
+            writer.add(LearningSample(
+                observation=np.zeros(obs_dim, dtype=np.float32),
+                legal_mask=np.ones(34, dtype=np.float32),
+                action=0, reward=0.0, log_prob=-0.5, value=0.0,
+                terminated=(i == 19), round_over=False,
+                experiment_id="test", run_id="r", worker_id="w",
+                episode_id="ep0", step_id=i, player_id=0,
+                sample_semantics_version=1,  # legacy
+            ))
+        writer.close()
+
+        config = _make_config()
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[8])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        with pytest.raises(ValueError, match="legacy shard"):
+            learner.train(shard_dir)
+
+    def test_v2_shard_accepted(self, tmp_path: Path):
+        """v2 shard は正常に学習が通る"""
+        obs_dim = 10
+        shard_dir = tmp_path / "shards"
+        writer = ShardWriter(shard_dir, max_samples=10000)
+        for i in range(40):
+            writer.add(LearningSample(
+                observation=np.random.randn(obs_dim).astype(np.float32),
+                legal_mask=(np.random.rand(34) > 0.3).astype(np.float32),
+                action=np.random.randint(0, 34), reward=np.random.randn() * 0.01,
+                log_prob=-np.random.rand(), value=np.random.randn() * 0.1,
+                terminated=(i == 39), round_over=False,
+                experiment_id="test", run_id="r", worker_id="w",
+                episode_id="ep0", step_id=i, player_id=i % 4,
+                sample_semantics_version=2,
+            ))
+        writer.close()
+
+        config = _make_config()
+        config["training"]["epochs"] = 1
+        model = MLPPolicyValueModel(input_dim=obs_dim, hidden_dims=[8])
+        learner = Learner(config=config, model=model, run_dir=tmp_path / "run")
+        metrics = learner.train(shard_dir)
+        assert "ppo_diag" in metrics
+        assert metrics["total_steps"] == 40

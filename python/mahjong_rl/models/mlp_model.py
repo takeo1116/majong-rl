@@ -52,8 +52,14 @@ class MLPPolicyValueModel(DiscardPolicyModel):
 
         trunk_input_dim = input_dim
         if self._direct_hints_enabled:
-            sources = pdh.get("sources", [])
+            # CQ-0217: resolved ranges のキーに絞る (Partial auto-off 対応)
+            sources = [s for s in pdh.get("sources", [])
+                       if s in self._direct_hint_ranges]
             self._direct_hint_sources = list(sources)
+            if not self._direct_hint_sources:
+                # 全 source が auto-off された場合、direct branch を無効化
+                self._direct_hints_enabled = False
+        if self._direct_hints_enabled:
             # trunk 入力から direct hint 次元を除外
             excluded_dim = sum(
                 (e - s) for s, e in
