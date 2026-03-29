@@ -526,4 +526,237 @@ TEST(YakuTest, ToString) {
     EXPECT_EQ(yaku::to_string(YakuType::Riichi), "立直");
     EXPECT_EQ(yaku::to_string(YakuType::Tanyao), "断么九");
     EXPECT_EQ(yaku::to_string(YakuType::Pinfu), "平和");
+    EXPECT_EQ(yaku::to_string(YakuType::Toitoi), "対々和");
+    EXPECT_EQ(yaku::to_string(YakuType::Ikkitsuukan), "一気通貫");
+    EXPECT_EQ(yaku::to_string(YakuType::SanshokuDoujun), "三色同順");
+}
+
+// ==================== CQ-0220: 対々和 ====================
+
+TEST(YakuTest, Toitoi_Closed) {
+    // 全刻子 (門前): 1m1m1m 5p5p5p 9s9s9s 東東東 白白 → 対々和 2翻
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Koutsu, tile_type::M1, false},
+        {MentsuKind::Koutsu, tile_type::P5, false},
+        {MentsuKind::Koutsu, tile_type::S9, false},
+        {MentsuKind::Koutsu, tile_type::TON, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    bool found = false;
+    for (const auto& y : eval.yakus) {
+        if (y.type == YakuType::Toitoi && y.han == 2) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(YakuTest, Toitoi_Open) {
+    // 副露あり: ポン3組 → 対々和 2翻 (副露でも2翻)
+    auto decomp = make_decomp(tile_type::M5, {
+        {MentsuKind::Koutsu, tile_type::M1, true},   // ポン
+        {MentsuKind::Koutsu, tile_type::P5, true},   // ポン
+        {MentsuKind::Koutsu, tile_type::S9, true},   // ポン
+        {MentsuKind::Koutsu, tile_type::TON, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::M5, false, false);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    bool found = false;
+    for (const auto& y : eval.yakus) {
+        if (y.type == YakuType::Toitoi && y.han == 2) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(YakuTest, Toitoi_NotWhenShuntsu) {
+    // 順子が1つでもあれば不成立
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Koutsu, tile_type::M1, false},
+        {MentsuKind::Koutsu, tile_type::P5, false},
+        {MentsuKind::Koutsu, tile_type::S9, false},
+        {MentsuKind::Shuntsu, tile_type::M2, false},  // 順子
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    for (const auto& y : eval.yakus) {
+        EXPECT_NE(y.type, YakuType::Toitoi);
+    }
+}
+
+TEST(YakuTest, Toitoi_WithKantsu) {
+    // 槓子も刻子扱い → 対々和成立
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Koutsu, tile_type::M1, false},
+        {MentsuKind::Kantsu, tile_type::P5, false},
+        {MentsuKind::Koutsu, tile_type::S9, false},
+        {MentsuKind::Kantsu, tile_type::TON, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    bool found = false;
+    for (const auto& y : eval.yakus) {
+        if (y.type == YakuType::Toitoi) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+}
+
+// ==================== CQ-0220: 一気通貫 ====================
+
+TEST(YakuTest, Ikkitsuukan_Closed) {
+    // 門前: 萬子 123+456+789 → 2翻
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Shuntsu, tile_type::M1, false},  // 123m
+        {MentsuKind::Shuntsu, tile_type::M4, false},  // 456m
+        {MentsuKind::Shuntsu, tile_type::M7, false},  // 789m
+        {MentsuKind::Koutsu, tile_type::P5, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    bool found = false;
+    for (const auto& y : eval.yakus) {
+        if (y.type == YakuType::Ikkitsuukan && y.han == 2) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(YakuTest, Ikkitsuukan_Open) {
+    // 食い下がり: 萬子 123(チー)+456+789 → 1翻
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Shuntsu, tile_type::M1, true},   // チー
+        {MentsuKind::Shuntsu, tile_type::M4, false},
+        {MentsuKind::Shuntsu, tile_type::M7, false},
+        {MentsuKind::Koutsu, tile_type::P5, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, false);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    bool found = false;
+    for (const auto& y : eval.yakus) {
+        if (y.type == YakuType::Ikkitsuukan && y.han == 1) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(YakuTest, Ikkitsuukan_NotWhenIncomplete) {
+    // 123m + 456m のみ (789m がない) → 不成立
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Shuntsu, tile_type::M1, false},
+        {MentsuKind::Shuntsu, tile_type::M4, false},
+        {MentsuKind::Shuntsu, tile_type::P1, false},
+        {MentsuKind::Koutsu, tile_type::S5, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    for (const auto& y : eval.yakus) {
+        EXPECT_NE(y.type, YakuType::Ikkitsuukan);
+    }
+}
+
+TEST(YakuTest, Ikkitsuukan_DifferentSuits) {
+    // 123m + 456p + 789s → 異なるスートなので不成立
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Shuntsu, tile_type::M1, false},
+        {MentsuKind::Shuntsu, tile_type::P4, false},
+        {MentsuKind::Shuntsu, tile_type::S7, false},
+        {MentsuKind::Koutsu, tile_type::TON, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    for (const auto& y : eval.yakus) {
+        EXPECT_NE(y.type, YakuType::Ikkitsuukan);
+    }
+}
+
+// ==================== CQ-0220: 三色同順 ====================
+
+TEST(YakuTest, SanshokuDoujun_Closed) {
+    // 門前: 123m + 123p + 123s → 2翻
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Shuntsu, tile_type::M1, false},  // 123m
+        {MentsuKind::Shuntsu, tile_type::P1, false},  // 123p
+        {MentsuKind::Shuntsu, tile_type::S1, false},  // 123s
+        {MentsuKind::Koutsu, tile_type::TON, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    bool found = false;
+    for (const auto& y : eval.yakus) {
+        if (y.type == YakuType::SanshokuDoujun && y.han == 2) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(YakuTest, SanshokuDoujun_Open) {
+    // 食い下がり: 123m(チー) + 123p + 123s → 1翻
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Shuntsu, tile_type::M1, true},   // チー
+        {MentsuKind::Shuntsu, tile_type::P1, false},
+        {MentsuKind::Shuntsu, tile_type::S1, false},
+        {MentsuKind::Koutsu, tile_type::TON, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, false);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    bool found = false;
+    for (const auto& y : eval.yakus) {
+        if (y.type == YakuType::SanshokuDoujun && y.han == 1) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST(YakuTest, SanshokuDoujun_NotWhenDifferentNumbers) {
+    // 123m + 234p + 345s → 数字が違うので不成立
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Shuntsu, tile_type::M1, false},
+        {MentsuKind::Shuntsu, tile_type::P2, false},
+        {MentsuKind::Shuntsu, tile_type::S3, false},
+        {MentsuKind::Koutsu, tile_type::TON, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    for (const auto& y : eval.yakus) {
+        EXPECT_NE(y.type, YakuType::SanshokuDoujun);
+    }
+}
+
+TEST(YakuTest, SanshokuDoujun_NotWhenTwoSuits) {
+    // 123m + 123p (索子なし) → 不成立
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Shuntsu, tile_type::M1, false},
+        {MentsuKind::Shuntsu, tile_type::P1, false},
+        {MentsuKind::Shuntsu, tile_type::M4, false},
+        {MentsuKind::Koutsu, tile_type::TON, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    for (const auto& y : eval.yakus) {
+        EXPECT_NE(y.type, YakuType::SanshokuDoujun);
+    }
+}
+
+TEST(YakuTest, SanshokuDoujun_789) {
+    // 789m + 789p + 789s → 三色同順
+    auto decomp = make_decomp(tile_type::HAKU, {
+        {MentsuKind::Shuntsu, tile_type::M7, false},
+        {MentsuKind::Shuntsu, tile_type::P7, false},
+        {MentsuKind::Shuntsu, tile_type::S7, false},
+        {MentsuKind::Koutsu, tile_type::TON, false},
+    });
+    auto ctx = make_basic_ctx(tile_type::HAKU, false, true);
+    ctx.jikaze = tile_type::NAN;
+    auto eval = yaku::evaluate_yaku(decomp, WaitType::Tanki, ctx);
+    bool found = false;
+    for (const auto& y : eval.yakus) {
+        if (y.type == YakuType::SanshokuDoujun) { found = true; break; }
+    }
+    EXPECT_TRUE(found);
 }

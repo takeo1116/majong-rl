@@ -1,4 +1,5 @@
 #include "engine/hand_utils.h"
+#include "rules/agari.h"
 #include <numeric>
 
 namespace mahjong {
@@ -78,6 +79,27 @@ bool is_tenpai(const std::array<int, kNumTileTypes>& counts) {
             return true;
         }
         temp[t]--;
+    }
+    return false;
+}
+
+bool is_tenpai_with_melds(
+    const std::array<int, kNumTileTypes>& concealed_counts,
+    const std::vector<Meld>& melds)
+{
+    if (melds.empty()) {
+        return is_tenpai(concealed_counts);
+    }
+    // 副露あり: 1牌加えて enumerate_decompositions で和了形が見つかるか
+    auto temp = concealed_counts;
+    for (int t = 0; t < kNumTileTypes; ++t) {
+        if (temp[t] >= 4) continue;
+        temp[t]++;
+        auto decomps = agari::enumerate_decompositions(temp, melds);
+        temp[t]--;
+        if (!decomps.empty()) {
+            return true;
+        }
     }
     return false;
 }

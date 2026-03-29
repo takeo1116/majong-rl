@@ -181,6 +181,27 @@ Stage02a では policy を概念上分ける。
 - `Skip` も candidate の 1 つとして比較する
 - 同一 response decision 内では `h_call` を 1 回だけ計算し、candidate 間で再利用する
 
+長期的には、Stage02 系を今後の標準アーキテクチャとみなし、decision family を次の 2 系統へ整理する。
+
+- `DISCARD`
+- `OPTIONAL_ACTION`
+
+ここでいう `OPTIONAL_ACTION` は、「その場で legal なら、実行するか `Skip` するかを比較できる行動」の総称である。  
+現在の `CallPolicy` はその最初の具体化であり、将来の
+
+- `Chi`
+- `Pon`
+- `Daiminkan`
+- `Riichi`
+- `Ankan`
+- `Kakan`
+- `Ron`
+- `Tsumo`
+- `Kyuushu`
+
+は、原則として別 head を増やすのではなく、**optional candidate の語彙と metadata を拡張して同じ経路へ載せる**方針を優先する。  
+実装名として当面 `call` が残っていてもよいが、設計上は `forward_optional` 相当の一般化を目標にする。
+
 ### 7.3 特徴量方針
 
 Stage02a v1 では次を採る。
@@ -217,14 +238,13 @@ Stage02a では、固定 34-way discard 決め打ちから離れて、**decision
 最低限ほしい情報:
 
 - `decision_type`
-  - `discard`
-  - `call`
-  - 将来 `riichi`, `win` などを追加可能
+  - 現実装では `discard`, `call` などを持ちうる
+  - 長期的には `discard`, `optional_action` の 2 family へ寄せる
 - selected action / selected candidate
 - legal candidates
 - actor 視点 reward / return / advantage
 
-この設計は、将来の `RiichiPolicy` / `WinPolicy` 追加にも耐えることを目指す。
+この設計は、将来の `Riichi` / `Kan` / `Win` を別 pipeline として増やすのではなく、optional candidate の拡張として吸収できることを目指す。
 
 ---
 
@@ -245,15 +265,17 @@ Stage02a では、固定 34-way discard 決め打ちから離れて、**decision
 
 ### 9.2 sample-level future labels
 
-各 sample には、将来的に次を付けられる構造を選ぶ。
+各 decision sample に actor 視点の terminal label を付ける。
+全 sample が 1 つの label を持つ (total terminal label)。
 
-- `round_terminal_label`
-  - `win`
-  - `ron_loss`
-  - `tsumo_loss`
-  - `ryukyoku_tenpai`
-  - `ryukyoku_noten`
-  - `abortive_draw`
+- `round_terminal_label` — actor 視点の局結果
+  - `win` — この actor が和了した
+  - `ron_loss` — この actor が放銃した
+  - `ron_bystander` — ron 和了局の第三者 (winner でも放銃者でもない)
+  - `tsumo_loss` — 他家がツモ和了した
+  - `ryukyoku_tenpai` — 流局テンパイ (副露考慮判定)
+  - `ryukyoku_noten` — 流局ノーテン (副露考慮判定)
+  - `abortive_draw` — 途中流局 (九種九牌等)
 - `eventual_win_yaku_ids`
 - `eventual_total_han`
 - `eventual_fu`
@@ -295,6 +317,36 @@ Stage02a の推奨順序:
 
 ---
 
-## 12. 一文要約
+## 12. Stage02a: CallUnlock (CQ-0220〜CQ-0222)
+
+### 12.1 追加役 (CQ-0220)
+
+Stage2a で追加された役:
+
+| 役 | 門前翻 | 食い下がり | 備考 |
+|---|---|---|---|
+| 対々和 | 2 | 2 | 全刻子/槓子。門前/副露問わず同翻 |
+| 一気通貫 | 2 | 1 | 同一スートで 123+456+789 |
+| 三色同順 | 2 | 1 | 3スートで同数字の順子 |
+
+### 12.2 Response Candidate API (CQ-0221)
+
+- `extract_response_candidates(legal_actions, current_player)` で response phase の候補を列挙
+- `ResponseCandidate`: action, action_type, tile_type, target_rel_seat, consumed_tile_ids
+- `Skip` は通常 candidate と同列（末尾に配置）
+- Stage2a 学習対象: `Chi / Pon / Daiminkan / Skip`
+
+### 12.3 Stage2Env (CQ-0222)
+
+- `Stage1Env` とは別の環境ラッパー
+- `decision_type`: `"discard"` / `"response"` を区別
+- `step_discard(tile_type)`: 打牌決定
+- `step_response(candidate_index)`: 応答決定
+- 自動処理: Ron, TsumoWin, Riichi, Ankan, Kakan, Kyuushu
+- candidates が Skip のみなら自動スキップ
+
+---
+
+## 13. 一文要約
 
 **Stage01 で PPO 基盤は成立したため、今後の RL 仕様の中心課題は discard-only 前提を壊して Stage02a の call decision を自然に扱えるようにすることにある。**

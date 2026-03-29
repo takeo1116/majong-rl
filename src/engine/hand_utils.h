@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tile.h"
+#include "core/meld.h"
 #include <array>
 #include <vector>
 
@@ -20,6 +21,11 @@ bool is_agari(const std::array<int, kNumTileTypes>& counts);
 
 // テンパイチェック: 何らかの牌を加えると和了形になるか
 bool is_tenpai(const std::array<int, kNumTileTypes>& counts);
+
+// テンパイチェック (副露考慮): 閉じた手牌 + 副露で聴牌しているか
+bool is_tenpai_with_melds(
+    const std::array<int, kNumTileTypes>& concealed_counts,
+    const std::vector<Meld>& melds);
 
 // 待ち牌一覧を返す
 std::vector<TileType> get_waits(const std::array<int, kNumTileTypes>& counts);

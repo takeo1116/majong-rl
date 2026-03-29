@@ -113,6 +113,11 @@ class FlatFeatureEncoder(FeatureEncoder):
         self._current_shanten_input = current_shanten_input
         self._shape_hint = shape_hint
         self._turn_context = turn_context
+        # CQ-0246: scratch buffers for encode (re-zeroed each call)
+        self._scratch_hand = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        self._scratch_discard = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        self._scratch_meld = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        self._scratch_dora = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
         # CQ-0213: full-only features (Partial では自動 off)
         self._opponent_current_shanten = opponent_current_shanten
         self._opponent_tenpai_flag = opponent_tenpai_flag
@@ -271,41 +276,47 @@ class FlatFeatureEncoder(FeatureEncoder):
                      legal_mask: np.ndarray | None = None) -> np.ndarray:
         features: list[np.ndarray] = []
 
+        # CQ-0246: scratch buffer 再利用
+        _s = self._scratch_hand  # reusable (34,) float32
+
         # 全4家手牌
         _need_current = (self._shanten_hint or self._discard_ukeire_hint
                          or self._current_shanten_input or self._shape_hint)
         current_player = obs.current_player
-        hand_counts_current = None  # CQ-0208: current_player の手牌
+        hand_counts_current = None
         for p in range(NUM_PLAYERS):
-            hand_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+            _s.fill(0)
             for tid in obs.hands[p]:
-                hand_counts[tid // 4] += 1.0
-            features.append(hand_counts)
+                _s[tid // 4] += 1.0
+            features.append(_s.copy())
             if p == current_player and _need_current:
-                hand_counts_current = hand_counts.copy()
+                hand_counts_current = _s.copy()
 
         # 4家河
+        _sd = self._scratch_discard
         for p in range(NUM_PLAYERS):
-            discard_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+            _sd.fill(0)
             for di in obs.discards[p]:
-                discard_counts[di.tile // 4] += 1.0
-            features.append(discard_counts)
+                _sd[di.tile // 4] += 1.0
+            features.append(_sd.copy())
 
         # 4家副露
+        _sm = self._scratch_meld
         for p in range(NUM_PLAYERS):
-            meld_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+            _sm.fill(0)
             for meld in obs.melds[p]:
                 for i in range(meld.tile_count):
                     tiles = meld.tiles
                     if i < len(tiles):
-                        meld_counts[tiles[i] // 4] += 1.0
-            features.append(meld_counts)
+                        _sm[tiles[i] // 4] += 1.0
+            features.append(_sm.copy())
 
         # ドラ表示牌
-        dora_counts = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
+        _sdr = self._scratch_dora
+        _sdr.fill(0)
         for ind in obs.dora_indicators:
-            dora_counts[ind // 4] += 1.0
-        features.append(dora_counts)
+            _sdr[ind // 4] += 1.0
+        features.append(_sdr.copy())
 
         # スカラー特徴量
         scalars = np.array([

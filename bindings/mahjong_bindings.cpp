@@ -25,8 +25,51 @@
 #include "rl/observation.h"
 #include "rl/reward_policy.h"
 #include "rl/shanten.h"
+#include "rules/yaku.h"
+#include "rules/agari.h"
+#include "rules/score_calculator.h"
 
 namespace py = pybind11;
+
+// CQ-0227: binding 用 WinContext 構築 helper
+static mahjong::WinContext make_win_context_for_binding(
+    const mahjong::RoundState& rs,
+    mahjong::PlayerId winner,
+    mahjong::TileType agari_tile,
+    bool is_tsumo,
+    bool is_chankan)
+{
+    using namespace mahjong;
+    const auto& player = rs.players[winner];
+    WinContext ctx{};
+    ctx.agari_tile = agari_tile;
+    ctx.is_tsumo = is_tsumo;
+    ctx.is_menzen = player.is_menzen;
+    ctx.is_riichi = player.is_riichi;
+    ctx.is_ippatsu = player.ippatsu;
+    ctx.is_rinshan = player.rinshan_draw;
+    ctx.is_chankan = is_chankan;
+    ctx.is_haitei = is_tsumo && rs.remaining_draws() == 0;
+    ctx.is_houtei = !is_tsumo && rs.remaining_draws() == 0;
+    Wind bakaze = (rs.round_number < 4) ? Wind::East : Wind::South;
+    ctx.bakaze = static_cast<TileType>(27 + static_cast<int>(bakaze));
+    ctx.jikaze = static_cast<TileType>(27 + static_cast<int>(player.jikaze));
+    for (TileId t : player.hand) ctx.all_tile_ids.push_back(t);
+    for (const auto& meld : player.melds) {
+        for (int i = 0; i < meld.tile_count; ++i) {
+            ctx.all_tile_ids.push_back(meld.tiles[i]);
+        }
+    }
+    for (TileId ind : rs.dora_indicators) {
+        ctx.dora_indicators.push_back(ind / 4);
+    }
+    if (player.is_riichi) {
+        for (TileId ind : rs.uradora_indicators) {
+            ctx.uradora_indicators.push_back(ind / 4);
+        }
+    }
+    return ctx;
+}
 using namespace mahjong;
 
 PYBIND11_MODULE(_mahjong_core, m) {
@@ -389,7 +432,13 @@ PYBIND11_MODULE(_mahjong_core, m) {
         return hand_utils::make_type_counts(hand);
     }, "手牌の TileId 列から TileType 別カウントを返す");
     m.def("is_agari", &hand_utils::is_agari, "和了形チェック");
-    m.def("is_tenpai", &hand_utils::is_tenpai, "テンパイチェック");
+    m.def("is_tenpai", &hand_utils::is_tenpai, "テンパイチェック (門前専用)");
+    m.def("is_tenpai_with_melds", [](const std::vector<int>& counts_vec,
+                                      const EnvironmentState& env, int player) {
+        std::array<int, kNumTileTypes> counts;
+        std::copy(counts_vec.begin(), counts_vec.end(), counts.begin());
+        return hand_utils::is_tenpai_with_melds(counts, env.round_state.players[player].melds);
+    }, "テンパイチェック (副露考慮)");
     m.def("get_waits", &hand_utils::get_waits, "待ち牌一覧を返す");
 
     // --- shanten ---
@@ -483,6 +532,102 @@ PYBIND11_MODULE(_mahjong_core, m) {
         return combined;
     }, py::arg("counts"),
        "手牌形状ヒント (chi[21]+outside_wait[24]+inside_wait[21]=66 要素)");
+
+    // --- CQ-0227: round outcome summary ---
+    m.def("get_round_outcome", [](const EnvironmentState& env) {
+        const auto& rs = env.round_state;
+        py::dict outcome;
+        outcome["end_reason"] = static_cast<int>(rs.end_reason);
+
+        // tenpai / noten (副露考慮)
+        py::list tenpai_list, noten_list;
+        for (int p = 0; p < kNumPlayers; ++p) {
+            auto counts = hand_utils::make_type_counts(rs.players[p].hand);
+            if (hand_utils::is_tenpai_with_melds(counts, rs.players[p].melds)) {
+                tenpai_list.append(p);
+            } else {
+                noten_list.append(p);
+            }
+        }
+        outcome["tenpai_players"] = tenpai_list;
+        outcome["noten_players"] = noten_list;
+
+        // win summaries
+        py::list wins;
+        if (rs.end_reason == RoundEndReason::Tsumo) {
+            int winner = rs.current_player;
+            const auto& player = rs.players[winner];
+            TileType agari_tile = player.hand.back() / 4;
+            auto ctx = make_win_context_for_binding(rs, winner, agari_tile, true, false);
+            auto counts = hand_utils::make_type_counts(player.hand);
+            auto decomps = agari::enumerate_decompositions(counts, player.melds);
+            bool is_dealer = (winner == rs.dealer);
+            auto sr = score_calculator::calculate_win_score(decomps, ctx, is_dealer, rs.honba);
+            if (sr.valid) {
+                py::dict w;
+                w["winner"] = winner;
+                w["is_tsumo"] = true;
+                w["total_han"] = sr.total_han;
+                w["fu"] = sr.fu;
+                w["dora_count"] = sr.dora_count;
+                w["akadora_count"] = sr.akadora_count;
+                w["uradora_count"] = sr.uradora_count;
+                py::list yakus;
+                for (const auto& y : sr.yakus) {
+                    yakus.append(static_cast<int>(y.type));
+                }
+                w["yaku_ids"] = yakus;
+                wins.append(w);
+            }
+        } else if (rs.end_reason == RoundEndReason::Ron) {
+            const auto& ctx_resp = rs.response_context;
+            TileId ron_tile = ctx_resp.discard_tile;
+            TileType agari_tile = ron_tile / 4;
+            bool is_chankan = ctx_resp.is_chankan_response;
+            for (int offset = 1; offset <= 3; ++offset) {
+                int p = (ctx_resp.discarder + offset) % kNumPlayers;
+                if (ctx_resp.has_responded[p] && ctx_resp.responses[p].type == ActionType::Ron) {
+                    const auto& player = rs.players[p];
+                    auto hand_with_ron = player.hand;
+                    hand_with_ron.push_back(ron_tile);
+                    auto counts = hand_utils::make_type_counts(hand_with_ron);
+                    auto decomps = agari::enumerate_decompositions(counts, player.melds);
+                    auto win_ctx = make_win_context_for_binding(rs, p, agari_tile, false, is_chankan);
+                    win_ctx.all_tile_ids.push_back(ron_tile);
+                    bool is_dealer = (p == rs.dealer);
+                    auto sr = score_calculator::calculate_win_score(decomps, win_ctx, is_dealer, rs.honba);
+                    if (sr.valid) {
+                        py::dict w;
+                        w["winner"] = p;
+                        w["is_tsumo"] = false;
+                        w["total_han"] = sr.total_han;
+                        w["fu"] = sr.fu;
+                        w["dora_count"] = sr.dora_count;
+                        w["akadora_count"] = sr.akadora_count;
+                        w["uradora_count"] = sr.uradora_count;
+                        py::list yakus;
+                        for (const auto& y : sr.yakus) {
+                            yakus.append(static_cast<int>(y.type));
+                        }
+                        w["yaku_ids"] = yakus;
+                        wins.append(w);
+                    }
+                }
+            }
+            outcome["loser_player"] = static_cast<int>(ctx_resp.discarder);
+        }
+        outcome["wins"] = wins;
+
+        // winner_players
+        py::list winner_players;
+        for (size_t i = 0; i < py::len(wins); ++i) {
+            winner_players.append(wins[i].attr("__getitem__")("winner"));
+        }
+        outcome["winner_players"] = winner_players;
+
+        return outcome;
+    }, py::arg("env"),
+       "局終了時の outcome summary を返す (settle_round 前に呼ぶ)");
 
     // --- 定数 ---
     m.attr("NUM_TILES") = kNumTiles;

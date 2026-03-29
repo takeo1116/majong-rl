@@ -1,0 +1,102 @@
+experiment:
+  name: "stage2a_core_minimal_separated_baseline"
+  stage: stage2a
+  observation_mode: full
+  phases: ["imitation", "selfplay", "learner", "eval"]
+  memo: "Stage02a baseline: A core_minimal + separated PPO + imitation_fixed anchor"
+
+feature_encoder:
+  name: "FlatFeatureEncoder"
+  observation_mode: "full"
+  shanten_hint:
+    enabled: true
+  discard_ukeire_hint:
+    enabled: true
+  current_shanten:
+    enabled: true
+  shape_hint:
+    enabled: true
+  turn_context:
+    enabled: true
+  opponent_current_shanten:
+    enabled: false
+  opponent_tenpai_flag:
+    enabled: false
+  danger_mask:
+    enabled: false
+
+model:
+  discard_hidden_dims: [256, 128]
+  optional_hidden_dims: [128, 64]
+  value_hidden_dims: [128, 64]
+  candidate_dim: 16
+  optional_scorer_hidden: 32
+
+selfplay:
+  imitation_matches: 1000
+  num_matches: 200
+  seed_start: 0
+  num_workers: 10
+  worker_num_threads: 1
+  policy_ratio: 1.0
+  save_baseline_actions: false
+  imitation_seed_start: 0
+  inference_device: "cpu"
+  max_samples_per_shard: 10000
+
+imitation:
+  num_workers: 10
+
+training:
+  algorithm: "ppo"
+  lr: 0.0003
+  batch_size: 256
+  epochs: 1
+  imitation_epochs: 8
+  gamma: 0.50
+  gae_lambda: 0.0
+  clip_epsilon: 0.15
+  value_loss_coef: 0.25
+  entropy_coef: 0.0
+  max_grad_norm: 0.5
+  imitation_loss_mode: "tie_aware_best_set"
+  value_loss:
+    type: "mse"
+  advantage_stabilization:
+    clip: null
+  imitation_value_warmstart:
+    enabled: true
+    coef: 0.3
+  multi_chunk_imitation:
+    enabled: true
+    num_chunks: 3
+    imitation_matches_per_chunk: 1000
+  multi_cycle:
+    enabled: true
+    num_cycles: 20
+    selfplay_matches_per_cycle: 200
+    eval_each_cycle: true
+  rule_mix:
+    enabled: true
+    policy_ratio: 0.25
+    save_baseline_actions: true
+  rule_mix_learner:
+    enabled: true
+    ppo_mode: "separated"
+    baseline_sample_weight: 0.5
+  policy_anchor:
+    enabled: true
+    type: "kl"
+    coef: 0.5
+    reference: "imitation_fixed"
+
+evaluation:
+  mode: "rotation"
+  rotation_seats: [0, 1, 2, 3]
+  num_matches: 50
+  num_workers: 10
+  worker_num_threads: 1
+  seed_start: 200000
+  inference_device: "cpu"
+
+export: {}

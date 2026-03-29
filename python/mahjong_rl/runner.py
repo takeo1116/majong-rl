@@ -119,6 +119,14 @@ from mahjong_rl.evaluator import (
 )
 
 
+def _first_not_none(*values):
+    """最初の non-None 値を返す。全て None なら None。0.0 は有効値として扱う。"""
+    for v in values:
+        if v is not None:
+            return v
+    return None
+
+
 def _parse_encoder_flag(enc_cfg: dict, key: str) -> bool:
     """encoder config のフラグを dict 形式/bool 形式の両方に対応して取得する"""
     v = enc_cfg.get(key, {})
@@ -812,6 +820,15 @@ class Stage1Runner:
                     return result
 
             elif phase == "selfplay":
+                # CQ-0232: Stage2a multi-cycle 時は cycle 内で selfplay するのでスキップ
+                _stage = self._config.experiment.get("stage", "stage1")
+                _mc = self._config.training.get("multi_cycle", {})
+                if _stage == "stage2a" and _mc.get("enabled", False):
+                    logger.info(f"{label} selfplay スキップ (Stage2a multi-cycle)")
+                    phase_status["selfplay"] = "success"
+                    phase_action["selfplay"] = "skipped"
+                    continue
+
                 logger.info(f"{label} self-play データ生成")
                 _record_start("selfplay")
                 profiler.start("selfplay_total")
@@ -831,6 +848,60 @@ class Stage1Runner:
                     return result
 
             elif phase == "learner":
+                # CQ-0225/0226/0232: Stage2a learner 分岐
+                stage = self._config.experiment.get("stage", "stage1")
+                if stage == "stage2a":
+                    mc_cfg = self._config.training.get("multi_cycle", {})
+                    mc_enabled = mc_cfg.get("enabled", False)
+                    num_cycles = mc_cfg.get("num_cycles", 1) if mc_enabled else 1
+
+                    if num_cycles > 1:
+                        # CQ-0232: Stage2a multi-cycle
+                        logger.info(f"{label} Stage2a multi-cycle ({num_cycles} cycles)")
+                        _record_start("learner")
+                        try:
+                            last_tm, cycles_list = \
+                                self._run_stage2a_multi_cycle(
+                                    run_dir, encoder, mc_cfg, num_cycles)
+                            result["train_metrics"] = last_tm
+                            result["cycles"] = cycles_list
+                            # top-level に最終 cycle を昇格
+                            if cycles_list:
+                                last = cycles_list[-1]
+                                result["selfplay_stats"] = last.get("selfplay_stats", {})
+                                if last.get("eval_metrics"):
+                                    result["eval_metrics"] = last["eval_metrics"]
+                            phase_status["learner"] = "success"
+                            _record_end("learner")
+                            phase_action["learner"] = "executed"
+                        except Exception as e:
+                            logger.error(f"  Stage2a multi-cycle で失敗: {e}")
+                            result["error"] = f"learner: {e}"
+                            phase_status["learner"] = "failed"
+                            result["total_duration_sec"] = round(
+                                (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
+                            self._finalize(run_dir, result, phase_status, file_handler)
+                            return result
+                    else:
+                        # single cycle
+                        logger.info(f"{label} Stage2a learner")
+                        _record_start("learner")
+                        try:
+                            result["train_metrics"] = self._run_learner_stage2a(
+                                run_dir, encoder)
+                            phase_status["learner"] = "success"
+                            _record_end("learner")
+                            phase_action["learner"] = "executed"
+                        except Exception as e:
+                            logger.error(f"  Stage2a learner で失敗: {e}")
+                            result["error"] = f"learner: {e}"
+                            phase_status["learner"] = "failed"
+                            result["total_duration_sec"] = round(
+                                (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
+                            self._finalize(run_dir, result, phase_status, file_handler)
+                            return result
+                    continue
+
                 # CQ-0179: multi-cycle 判定
                 mc_cfg = self._config.training.get("multi_cycle", {})
                 mc_enabled = mc_cfg.get("enabled", False)
@@ -1107,6 +1178,27 @@ class Stage1Runner:
                         phase_status["eval"] = "success"
                     continue
 
+                # CQ-0230: Stage2a eval 分岐
+                stage = self._config.experiment.get("stage", "stage1")
+                if stage == "stage2a":
+                    logger.info(f"{label} Stage2a evaluator 評価")
+                    _record_start("eval")
+                    try:
+                        result["eval_metrics"] = self._run_eval_stage2a(
+                            run_dir, encoder)
+                        phase_status["eval"] = "success"
+                        _record_end("eval")
+                        phase_action["eval"] = "executed"
+                    except Exception as e:
+                        logger.error(f"  Stage2a eval フェーズで失敗: {e}")
+                        result["error"] = f"eval: {e}"
+                        phase_status["eval"] = "failed"
+                        result["total_duration_sec"] = round(
+                            (datetime.now(timezone.utc) - run_start).total_seconds(), 3)
+                        self._finalize(run_dir, result, phase_status, file_handler)
+                        return result
+                    continue
+
                 logger.info(f"{label} evaluator 評価")
                 _record_start("eval")
                 profiler.start("eval_total")
@@ -1159,11 +1251,11 @@ class Stage1Runner:
 
     def _run_imitation(self, run_dir: Path, model, encoder,
                        profiler=None) -> dict:
-        """imitation warm start フェーズ (CQ-0206: multi-chunk 対応)
+        """imitation warm start フェーズ (CQ-0206: multi-chunk 対応, CQ-0224: stage2a)"""
+        stage = self._config.experiment.get("stage", "stage1")
+        if stage == "stage2a":
+            return self._run_imitation_stage2a(run_dir, encoder, profiler)
 
-        multi_chunk_imitation.enabled=true の場合は chunk 単位で
-        「データ生成 → 学習」を繰り返す。
-        """
         mci = self._config.training.get("multi_chunk_imitation", {})
         if mci.get("enabled", False):
             return self._run_imitation_multi_chunk(
@@ -1430,10 +1522,11 @@ class Stage1Runner:
 
     def _run_selfplay(self, run_dir: Path, model, encoder,
                       profiler=None) -> dict:
-        """self-play フェーズ
+        """self-play フェーズ (CQ-0224: stage2a 対応)"""
+        stage = self._config.experiment.get("stage", "stage1")
+        if stage == "stage2a":
+            return self._run_selfplay_stage2a(run_dir, encoder, profiler)
 
-        selfplay.num_workers > 1 の場合は multi-process 実行。
-        """
         sp_cfg = self._config.selfplay
         num_workers = sp_cfg.get("num_workers", 1)
 
@@ -1462,6 +1555,562 @@ class Stage1Runner:
         sp_stats.pop("_reward_raw_values", None)
         logger.info(f"  total_steps: {sp_stats['total_steps']}")
         return sp_stats
+
+    def _create_stage2a_model(self, encoder):
+        """Stage2a model factory"""
+        from mahjong_rl.models.stage2a_model import Stage2aModel
+        input_dim = int(np.prod(encoder.metadata().output_shape))
+        mc = self._config.model
+        return Stage2aModel(
+            input_dim=input_dim,
+            discard_hidden_dims=mc.get("discard_hidden_dims", [256, 128]),
+            optional_hidden_dims=mc.get("optional_hidden_dims",
+                mc.get("call_hidden_dims", [128, 64])),
+            value_hidden_dims=mc.get("value_hidden_dims", [128, 64]),
+            candidate_dim=mc.get("candidate_dim", 16),
+            optional_scorer_hidden=mc.get("optional_scorer_hidden", 32),
+        )
+
+    def _run_imitation_stage2a(self, run_dir: Path, encoder, profiler=None) -> dict:
+        """CQ-0236: Stage2a imitation (multi-chunk 対応)"""
+        mci = self._config.training.get("multi_chunk_imitation", {})
+        if mci.get("enabled", False):
+            return self._run_imitation_stage2a_multi_chunk(
+                run_dir, encoder, mci, profiler)
+        return self._run_imitation_stage2a_single(run_dir, encoder, profiler)
+
+    def _run_imitation_stage2a_single(self, run_dir, encoder, profiler=None):
+        """Stage2a single imitation"""
+        from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
+        from mahjong_rl.models.stage2a_model import Stage2aModel
+        from mahjong_rl.stage2a_learner import Stage2aLearner
+
+        sp_cfg = self._config.selfplay
+        imitation_dir = run_dir / "imitation"
+        obs_mode = self._config.experiment.get("observation_mode", "full")
+        num_matches = sp_cfg.get("imitation_matches",
+                                  self._config.imitation.get("num_matches", 100))
+
+        # 1. Data generation (single or parallel)
+        imi_workers = self._config.imitation.get("num_workers", 1)
+        if imi_workers > 1:
+            from mahjong_rl.stage2a_parallel import run_stage2a_selfplay_parallel
+            gen_stats = run_stage2a_selfplay_parallel(
+                output_dir=imitation_dir,
+                num_workers=imi_workers,
+                num_matches=num_matches,
+                base_seed=self._global_seed,
+                obs_mode=obs_mode,
+                encoder_config=dict(self._config.feature_encoder),
+                model_state_path=None,  # imitation は baseline actor
+                model_config=dict(self._config.model),
+                experiment_id=self._config.experiment.get("name", "stage2a"),
+                run_id=str(run_dir),
+                inference_device=sp_cfg.get("inference_device", "cpu"),
+                num_threads=sp_cfg.get("worker_num_threads", 1),
+            )
+        else:
+            worker = Stage2SelfPlayWorker(
+                config=self._as_dict(),
+                output_dir=imitation_dir,
+                observation_mode=obs_mode,
+                encoder=encoder,
+            )
+            gen_stats = worker.generate(
+                num_matches=num_matches,
+                base_seed=self._global_seed,
+                experiment_id=self._config.experiment.get("name", "stage2a"),
+                run_id=str(run_dir),
+            )
+        logger.info(f"  Stage2a imitation data: {gen_stats}")
+
+        # 2. Learner
+        input_dim = int(np.prod(encoder.metadata().output_shape))
+        model_cfg = self._config.model
+        s2_model = self._create_stage2a_model(encoder)
+        learner_config = self._as_dict()
+        learner_config["training"]["algorithm"] = "imitation"
+        # CQ-0231: imitation epoch 分離
+        tc = self._config.training
+        imi_epochs = tc.get("imitation_epochs", tc.get("epochs", 4))
+        learner = Stage2aLearner(
+            config=learner_config,
+            model=s2_model,
+            run_dir=run_dir,
+        )
+        train_metrics = learner.train(imitation_dir, num_epochs=imi_epochs)
+        logger.info(f"  Stage2a imitation learner (epochs={imi_epochs}): {train_metrics}")
+
+        # 3. Checkpoint
+        ckpt_dir = run_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(s2_model.state_dict(), ckpt_dir / "checkpoint_imitation.pt")
+
+        # Store model for later phases
+        self._stage2a_model = s2_model
+
+        return {
+            "stage": "stage2a",
+            "total_steps": gen_stats["total_steps"],
+            "discard_count": gen_stats["discard_count"],
+            "call_count": gen_stats["call_count"],
+            "train_metrics": train_metrics,
+            "imitation_epochs": imi_epochs,
+        }
+
+    def _run_imitation_stage2a_multi_chunk(self, run_dir, encoder, mci, profiler=None):
+        """CQ-0236: Stage2a multi-chunk imitation"""
+        from mahjong_rl.models.stage2a_model import Stage2aModel
+        from mahjong_rl.stage2a_learner import Stage2aLearner
+
+        num_chunks = mci.get("num_chunks", 1)
+        matches_per = mci.get("imitation_matches_per_chunk", 100)
+        obs_mode = self._config.experiment.get("observation_mode", "full")
+        tc = self._config.training
+        imi_epochs = tc.get("imitation_epochs", tc.get("epochs", 4))
+
+        input_dim = int(np.prod(encoder.metadata().output_shape))
+        model_cfg = self._config.model
+        s2_model = self._create_stage2a_model(encoder)
+
+        import time as _time
+        chunks_data = []
+        for ci in range(num_chunks):
+            chunk_dir = run_dir / "imitation" / f"chunk_{ci:02d}"
+            chunk_t0 = _time.perf_counter()
+            # data gen (single or parallel)
+            logger.info(f"  chunk {ci}: data generation start")
+            dg_t0 = _time.perf_counter()
+            imi_workers = self._config.imitation.get("num_workers", 1)
+            chunk_seed = self._global_seed + ci * matches_per
+            if imi_workers > 1:
+                from mahjong_rl.stage2a_parallel import run_stage2a_selfplay_parallel
+                gen = run_stage2a_selfplay_parallel(
+                    output_dir=chunk_dir,
+                    num_workers=imi_workers,
+                    num_matches=matches_per,
+                    base_seed=chunk_seed,
+                    obs_mode=obs_mode,
+                    encoder_config=dict(self._config.feature_encoder),
+                    model_state_path=None,
+                    model_config=dict(self._config.model),
+                    experiment_id=self._config.experiment.get("name", "stage2a"),
+                    run_id=str(run_dir),
+                    inference_device=self._config.selfplay.get("inference_device", "cpu"),
+                    num_threads=self._config.selfplay.get("worker_num_threads", 1),
+                )
+            else:
+                from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
+                worker = Stage2SelfPlayWorker(
+                    config=self._as_dict(), output_dir=chunk_dir,
+                    observation_mode=obs_mode, encoder=encoder,
+                )
+                gen = worker.generate(
+                    num_matches=matches_per,
+                    base_seed=chunk_seed,
+                    experiment_id=self._config.experiment.get("name", "stage2a"),
+                    run_id=str(run_dir),
+                )
+            dg_sec = _time.perf_counter() - dg_t0
+            logger.info(f"  chunk {ci}: data gen done ({dg_sec:.1f}s)")
+
+            # learner
+            logger.info(f"  chunk {ci}: learner start")
+            lr_t0 = _time.perf_counter()
+            lc = self._as_dict()
+            lc["training"]["algorithm"] = "imitation"
+            learner = Stage2aLearner(config=lc, model=s2_model, run_dir=run_dir)
+            tm = learner.train(chunk_dir, num_epochs=imi_epochs)
+            lr_wall = _time.perf_counter() - lr_t0
+            chunk_sec = _time.perf_counter() - chunk_t0
+            # CQ-0248: learner 内訳 (train + diagnostics)
+            tm_timing = tm.get("timing", {})
+            train_sec = tm_timing.get("train_sec", lr_wall)
+            diag_sec = tm_timing.get("diagnostics_sec", 0)
+            logger.info(f"  chunk {ci}: learner done "
+                         f"(train={train_sec:.1f}s diag={diag_sec:.1f}s) "
+                         f"steps={gen['total_steps']} loss={tm.get('policy_loss', 0):.4f} "
+                         f"total={chunk_sec:.1f}s")
+            chunks_data.append({
+                "chunk_index": ci,
+                "gen_stats": gen,
+                "train_metrics": tm,
+                "timing": {
+                    "data_generation_sec": round(dg_sec, 3),
+                    "learner_sec": round(train_sec, 3),
+                    "diagnostics_sec": round(diag_sec, 3),
+                    "chunk_total_sec": round(chunk_sec, 3),
+                },
+            })
+
+        ckpt_dir = run_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(s2_model.state_dict(), ckpt_dir / "checkpoint_imitation.pt")
+        self._stage2a_model = s2_model
+
+        last_tm = chunks_data[-1]["train_metrics"] if chunks_data else {}
+        return {
+            "stage": "stage2a",
+            "total_steps": sum(c["gen_stats"]["total_steps"] for c in chunks_data),
+            "discard_count": sum(c["gen_stats"]["discard_count"] for c in chunks_data),
+            "call_count": sum(c["gen_stats"]["call_count"] for c in chunks_data),
+            "train_metrics": last_tm,
+            "imitation_epochs": imi_epochs,
+            "multi_chunk_imitation": {"enabled": True, "num_chunks": num_chunks,
+                                       "chunks": chunks_data},
+        }
+
+    def _run_selfplay_stage2a(self, run_dir: Path, encoder,
+                              profiler=None, output_dir: Path | None = None,
+                              num_matches: int | None = None,
+                              base_seed: int | None = None) -> dict:
+        """CQ-0234: Stage2a selfplay (single / multi-process)"""
+        sp_cfg = self._config.selfplay
+        selfplay_dir = output_dir or (run_dir / "selfplay")
+        obs_mode = self._config.experiment.get("observation_mode", "full")
+        n_matches = num_matches or sp_cfg.get("num_matches", 10)
+        b_seed = base_seed if base_seed is not None else sp_cfg.get("seed_start", 0)
+        num_workers = sp_cfg.get("num_workers", 1)
+        s2_model = getattr(self, "_stage2a_model", None)
+
+        if num_workers > 1:
+            from mahjong_rl.stage2a_parallel import run_stage2a_selfplay_parallel
+            # model を一時保存
+            model_path = None
+            if s2_model is not None:
+                selfplay_dir.mkdir(parents=True, exist_ok=True)
+                model_path = str(selfplay_dir / "_model.pt")
+                sd = {k: v.cpu() for k, v in s2_model.state_dict().items()}
+                torch.save(sd, model_path)
+            stats = run_stage2a_selfplay_parallel(
+                output_dir=selfplay_dir,
+                num_workers=num_workers,
+                num_matches=n_matches,
+                base_seed=b_seed,
+                obs_mode=obs_mode,
+                encoder_config=dict(self._config.feature_encoder),
+                model_state_path=model_path,
+                model_config=dict(self._config.model),
+                experiment_id=self._config.experiment.get("name", "stage2a"),
+                run_id=str(run_dir),
+                inference_device=sp_cfg.get("inference_device", "cpu"),
+                num_threads=sp_cfg.get("worker_num_threads", 1),
+                policy_ratio=sp_cfg.get("policy_ratio", 1.0),
+                save_baseline_actions=sp_cfg.get("save_baseline_actions", False),
+            )
+        else:
+            from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
+            worker = Stage2SelfPlayWorker(
+                config=self._as_dict(),
+                output_dir=selfplay_dir,
+                observation_mode=obs_mode,
+                encoder=encoder,
+                model=s2_model,
+                policy_ratio=sp_cfg.get("policy_ratio", 1.0),
+                save_baseline_actions=sp_cfg.get("save_baseline_actions", False),
+            )
+            stats = worker.generate(
+                num_matches=n_matches,
+                base_seed=b_seed,
+                experiment_id=self._config.experiment.get("name", "stage2a"),
+                run_id=str(run_dir),
+            )
+
+        logger.info(f"  Stage2a selfplay: {stats}")
+        stats["stage"] = "stage2a"
+        return stats
+
+    def _run_stage2a_multi_cycle(
+        self, run_dir: Path, encoder, mc_cfg: dict, num_cycles: int,
+    ) -> tuple[dict, list[dict]]:
+        """CQ-0232: Stage2a multi-cycle (selfplay → learner → eval) × N"""
+        from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
+        from mahjong_rl.models.stage2a_model import Stage2aModel
+        from mahjong_rl.stage2a_learner import Stage2aLearner
+
+        sp_matches = mc_cfg.get(
+            "selfplay_matches_per_cycle",
+            self._config.selfplay.get("num_matches", 10))
+        eval_each = mc_cfg.get("eval_each_cycle", True)
+        eval_matches = self._config.evaluation.get("num_matches", 0)
+        obs_mode = self._config.experiment.get("observation_mode", "full")
+        tc = self._config.training
+
+        s2_model = getattr(self, "_stage2a_model", None)
+        if s2_model is None:
+            input_dim = int(np.prod(encoder.metadata().output_shape))
+            model_cfg = self._config.model
+            s2_model = self._create_stage2a_model(encoder)
+
+        # CQ-0240: policy anchor 設定
+        pa_cfg = tc.get("policy_anchor", {})
+        pa_enabled = pa_cfg.get("enabled", False)
+        pa_reference = pa_cfg.get("reference", "imitation_fixed")
+        pa_warmup = pa_cfg.get("warmup_cycles", 0)
+        pa_interval = pa_cfg.get("update_interval_cycles", 1)
+
+        # CQ-0236: rule_mix 設定
+        rm_cfg = tc.get("rule_mix", {})
+        rm_enabled = rm_cfg.get("enabled", False)
+        rm_ratio = rm_cfg.get("policy_ratio", 1.0)
+        rm_save_bl = rm_cfg.get("save_baseline_actions", False)
+        rml_cfg = tc.get("rule_mix_learner", {})
+        rml_enabled = rml_cfg.get("enabled", False)
+        rml_bl_epochs = rml_cfg.get("baseline_imitation_epochs", 0)
+        rml_ppo_epochs = rml_cfg.get("policy_ppo_epochs", tc.get("epochs", 4))
+        rml_ppo_mode = rml_cfg.get("ppo_mode", "separated")
+
+        cycles_data: list[dict] = []
+        last_train_metrics: dict = {}
+        last_sp_stats: dict = {}
+        last_eval_metrics: dict = {}
+        # CQ-0240: anchor path を cycle 間で保持
+        _last_anchor_path: str | None = None
+
+        for ci in range(num_cycles):
+            cyc_label = f"cycle_{ci:02d}"
+            cyc_dir = run_dir / cyc_label
+            cyc_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"  --- {cyc_label} ---")
+
+            # 1. Selfplay (rule_mix → 一時上書き)
+            sp_dir = cyc_dir / "selfplay"
+            sp_seed = self._global_seed + ci * sp_matches
+            self._stage2a_model = s2_model
+            if rm_enabled:
+                orig_pr = self._config.selfplay.get("policy_ratio", 1.0)
+                orig_sb = self._config.selfplay.get("save_baseline_actions", False)
+                self._config.selfplay["policy_ratio"] = rm_ratio
+                self._config.selfplay["save_baseline_actions"] = rm_save_bl
+            try:
+                sp_stats = self._run_selfplay_stage2a(
+                    run_dir, encoder, output_dir=sp_dir,
+                    num_matches=sp_matches, base_seed=sp_seed)
+            finally:
+                if rm_enabled:
+                    self._config.selfplay["policy_ratio"] = orig_pr
+                    self._config.selfplay["save_baseline_actions"] = orig_sb
+            last_sp_stats = sp_stats
+            logger.info(f"    selfplay: steps={sp_stats['total_steps']} "
+                         f"rounds={sp_stats.get('num_rounds', 0)}")
+
+            # CQ-0240: anchor loading for PPO
+            def _setup_anchor(learner_obj):
+                nonlocal _last_anchor_path
+                if not pa_enabled or ci < pa_warmup:
+                    return
+                ckpt_dir = run_dir / "checkpoints"
+                if pa_reference == "imitation_fixed":
+                    imi_ckpt = ckpt_dir / "checkpoint_imitation.pt"
+                    if imi_ckpt.exists():
+                        learner_obj.load_anchor(str(imi_ckpt))
+                elif pa_reference == "lagged_policy":
+                    effective_ci = ci - pa_warmup
+                    should_update = (effective_ci % pa_interval == 0
+                                      if pa_interval > 0 else True)
+                    if effective_ci == 0 or _last_anchor_path is None:
+                        # warmup 後最初: 必ず imitation checkpoint
+                        imi = ckpt_dir / "checkpoint_imitation.pt"
+                        if imi.exists():
+                            learner_obj.load_anchor(str(imi))
+                            _last_anchor_path = str(imi)
+                    elif should_update:
+                        # interval に従って lagged checkpoint に更新
+                        prev = ckpt_dir / f"checkpoint_cycle_{ci-1:02d}.pt"
+                        if prev.exists():
+                            learner_obj.load_anchor(str(prev))
+                            _last_anchor_path = str(prev)
+                        elif _last_anchor_path is not None:
+                            learner_obj.load_anchor(_last_anchor_path)
+                    elif _last_anchor_path is not None:
+                        learner_obj.load_anchor(_last_anchor_path)
+
+            # 2. Learner (rule_mix_learner → baseline BC + policy PPO or mixed PPO)
+            learner_stages: dict = {}
+            if rml_enabled and rml_ppo_mode == "separated":
+                # baseline imitation stage
+                if rml_bl_epochs > 0:
+                    bl_lc = self._as_dict()
+                    bl_lc["training"]["algorithm"] = "imitation"
+                    bl_learner = Stage2aLearner(
+                        config=bl_lc, model=s2_model, run_dir=cyc_dir)
+                    bl_tm = bl_learner.train(
+                        sp_dir, num_epochs=rml_bl_epochs,
+                        filter_actor_type="baseline")
+                    learner_stages["baseline_imitation"] = bl_tm
+                    logger.info(f"    baseline BC: {bl_tm.get('num_updates', 0)} updates")
+                # policy PPO stage
+                ppo_lc = self._as_dict()
+                ppo_lc["training"]["algorithm"] = "ppo"
+                ppo_learner = Stage2aLearner(
+                    config=ppo_lc, model=s2_model, run_dir=cyc_dir)
+                _setup_anchor(ppo_learner)
+                train_metrics = ppo_learner.train(
+                    sp_dir, num_epochs=rml_ppo_epochs,
+                    filter_actor_type="policy")
+                learner_stages["policy_ppo"] = train_metrics
+            else:
+                # mixed or simple PPO
+                ppo_epochs = rml_ppo_epochs if rml_enabled else tc.get("epochs", 4)
+                learner_config = self._as_dict()
+                learner_config["training"]["algorithm"] = "ppo"
+                learner = Stage2aLearner(
+                    config=learner_config, model=s2_model, run_dir=cyc_dir)
+                _setup_anchor(learner)
+                train_metrics = learner.train(sp_dir, num_epochs=ppo_epochs)
+                if rml_enabled:
+                    learner_stages["mixed_ppo"] = train_metrics
+                else:
+                    learner_stages["policy_ppo"] = train_metrics
+            last_train_metrics = train_metrics
+            logger.info(f"    learner: loss={train_metrics.get('policy_loss', 0):.4f} "
+                         f"updates={train_metrics.get('num_updates', 0)}")
+
+            # 3. Checkpoint
+            ckpt_dir = run_dir / "checkpoints"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(s2_model.state_dict(),
+                        ckpt_dir / f"checkpoint_{cyc_label}.pt")
+
+            # 4. Eval (optional, single or parallel)
+            eval_metrics: dict = {}
+            if eval_each and eval_matches > 0:
+                self._stage2a_model = s2_model
+                eval_metrics = self._run_eval_stage2a(
+                    run_dir, encoder, seed_offset=ci * 400)
+                last_eval_metrics = eval_metrics
+                logger.info(f"    eval: avg_rank={eval_metrics.get('avg_rank', 0):.2f}")
+
+            cycles_data.append({
+                "cycle_index": ci,
+                "selfplay_stats": sp_stats,
+                "learner_metrics": train_metrics,
+                "learner_stages": learner_stages,
+                "eval_metrics": eval_metrics if eval_metrics else None,
+            })
+
+        # Final checkpoint
+        torch.save(s2_model.state_dict(),
+                    ckpt_dir / "checkpoint_learner.pt")
+        self._stage2a_model = s2_model
+
+        # last cycle eval → top-level
+        if last_eval_metrics:
+            # Store for summary
+            pass
+
+        return last_train_metrics, cycles_data
+
+    def _run_eval_stage2a(self, run_dir: Path, encoder,
+                          seed_offset: int = 0) -> dict:
+        """CQ-0230/0235: Stage2a deterministic evaluation (single / parallel)"""
+        eval_cfg = self._config.evaluation
+        num_matches = eval_cfg.get("num_matches", 100)
+        if num_matches <= 0:
+            return {"skipped": True}
+
+        obs_mode = self._config.experiment.get("observation_mode", "full")
+        eval_mode = eval_cfg.get("mode", eval_cfg.get("eval_mode", "single"))
+        seed_start = eval_cfg.get("seed_start", 10000) + seed_offset
+        num_workers = eval_cfg.get("num_workers", 1)
+        s2_model = getattr(self, "_stage2a_model", None)
+
+        if num_workers > 1 and s2_model is not None:
+            from mahjong_rl.stage2a_parallel import run_stage2a_eval_parallel
+            # model を一時保存
+            eval_dir = run_dir / "eval"
+            eval_dir.mkdir(parents=True, exist_ok=True)
+            model_path = str(eval_dir / "_eval_model.pt")
+            sd = {k: v.cpu() for k, v in s2_model.state_dict().items()}
+            torch.save(sd, model_path)
+            metrics = run_stage2a_eval_parallel(
+                num_workers=num_workers,
+                num_matches=num_matches,
+                seed_start=seed_start,
+                obs_mode=obs_mode,
+                encoder_config=dict(self._config.feature_encoder),
+                model_state_path=model_path,
+                model_config=dict(self._config.model),
+                eval_mode=eval_mode,
+                policy_seat=eval_cfg.get("policy_seat", 0),
+                inference_device=eval_cfg.get("inference_device", "cpu"),
+                num_threads=eval_cfg.get("worker_num_threads", 1),
+            )
+        else:
+            from mahjong_rl.stage2a_evaluator import Stage2aEvaluator
+            from mahjong_rl.models.stage2a_model import Stage2aModel
+            if s2_model is None:
+                input_dim = int(np.prod(encoder.metadata().output_shape))
+                model_cfg = self._config.model
+                s2_model = self._create_stage2a_model(encoder)
+            evaluator = Stage2aEvaluator(
+                model=s2_model, encoder=encoder,
+                observation_mode=obs_mode,
+                device=torch.device("cpu"),
+            )
+
+            if eval_mode == "rotation":
+                metrics = evaluator.evaluate_rotation(
+                    num_matches=num_matches,
+                    seed_start=seed_start,
+                )
+            else:
+                metrics = evaluator.evaluate(
+                    num_matches=num_matches,
+                    seed_start=seed_start,
+                    policy_seat=eval_cfg.get("policy_seat", 0),
+                )
+
+        # eval 成果物を保存
+        eval_dir = run_dir / "eval"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        import json as _json
+        with open(eval_dir / "metrics.json", "w") as f:
+            _json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"  Stage2a eval: avg_rank={metrics['avg_rank']:.2f}, "
+                     f"win_rate={metrics['win_rate']:.3f}")
+        return metrics
+
+    def _run_learner_stage2a(self, run_dir: Path, encoder) -> dict:
+        """CQ-0225/0226: Stage2a learner (PPO on selfplay shard)"""
+        from mahjong_rl.models.stage2a_model import Stage2aModel
+        from mahjong_rl.stage2a_learner import Stage2aLearner
+
+        selfplay_dir = run_dir / "selfplay"
+        s2_model = getattr(self, "_stage2a_model", None)
+        if s2_model is None:
+            input_dim = int(np.prod(encoder.metadata().output_shape))
+            model_cfg = self._config.model
+            s2_model = self._create_stage2a_model(encoder)
+
+        learner_config = self._as_dict()
+        learner_config["training"]["algorithm"] = "ppo"
+        learner = Stage2aLearner(
+            config=learner_config,
+            model=s2_model,
+            run_dir=run_dir,
+        )
+        # CQ-0240: single-cycle anchor
+        pa = self._config.training.get("policy_anchor", {})
+        if pa.get("enabled", False):
+            ref = pa.get("reference", "imitation_fixed")
+            ckpt_dir = run_dir / "checkpoints"
+            imi_ckpt = ckpt_dir / "checkpoint_imitation.pt"
+            if ref == "imitation_fixed" and imi_ckpt.exists():
+                learner.load_anchor(str(imi_ckpt))
+            elif ref == "lagged_policy" and imi_ckpt.exists():
+                learner.load_anchor(str(imi_ckpt))
+        metrics = learner.train(selfplay_dir)
+        logger.info(f"  Stage2a PPO learner: {metrics}")
+
+        # Checkpoint
+        ckpt_dir = run_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(s2_model.state_dict(), ckpt_dir / "checkpoint_learner.pt")
+
+        self._stage2a_model = s2_model
+        return metrics
 
     def _run_selfplay_parallel(
         self, run_dir: Path, model, num_workers: int,
@@ -2084,7 +2733,8 @@ class Stage1Runner:
             sp = result["selfplay_stats"]
             phase_stats["selfplay"] = {
                 "total_steps": sp.get("total_steps", 0),
-                "total_matches": sp.get("num_matches", 0),
+                "total_matches": sp.get("total_matches",
+                                         sp.get("num_matches", 0)),
                 "shard_count": shard_count,
                 "num_workers": sp.get("num_workers", 1),
                 "seed_strategy": sp.get("seed_strategy"),
@@ -2098,6 +2748,10 @@ class Stage1Runner:
                 "policy_draws": sp.get("policy_draws", 0),
                 "policy_win_by_tsumo": sp.get("policy_win_by_tsumo", 0),
                 "policy_win_by_ron": sp.get("policy_win_by_ron", 0),
+                # Stage2a 追加
+                "discard_count": sp.get("discard_count"),
+                "call_count": sp.get("call_count"),
+                "stage": sp.get("stage"),
             }
             # CQ-0139: reward composition
             rc = sp.get("reward_composition")
@@ -2109,36 +2763,53 @@ class Stage1Runner:
                 phase_stats["selfplay"]["reward_shaping"] = rs
         if "imitation_metrics" in result:
             imi = result["imitation_metrics"]
-            # imitation shard 数 (平坦 + worker サブディレクトリ)
+            # imitation shard 数
             imi_dir = run_dir / "imitation"
             if imi_dir.exists():
                 imi_flat = list(imi_dir.glob("shard_*.parquet"))
                 imi_nested = list(imi_dir.glob("worker_*/shard_*.parquet"))
-                # CQ-0207: multi-chunk imitation の chunk 配下も集計
                 imi_chunk_flat = list(imi_dir.glob("chunk_*/shard_*.parquet"))
                 imi_chunk_nested = list(imi_dir.glob("chunk_*/worker_*/shard_*.parquet"))
                 imi_shard_count = len(set(imi_flat) | set(imi_nested)
                                       | set(imi_chunk_flat) | set(imi_chunk_nested))
             else:
                 imi_shard_count = 0
+            # Stage2a: train_metrics がネストされている場合
+            tm = imi.get("train_metrics", {})
             dg = imi.get("data_generation", {})
             imi_stats: dict = {
                 "total_steps": dg.get("total_steps", imi.get("total_steps", 0)),
-                "num_updates": imi.get("num_updates", 0),
+                "num_updates": tm.get("num_updates", imi.get("num_updates", 0)),
                 "shard_count": imi_shard_count,
-                "policy_loss": imi.get("policy_loss"),
+                "policy_loss": tm.get("policy_loss", imi.get("policy_loss")),
                 "num_workers": dg.get("num_workers", 1),
                 "seed_strategy": dg.get("seed_strategy"),
-                # 教師再現メトリクス (CQ-0125, CQ-0128)
-                "teacher_top1_match_rate": imi.get("teacher_top1_match_rate"),
-                "teacher_best_set_hit_rate": imi.get("teacher_best_set_hit_rate"),
+                # Stage2a 追加
+                "discard_count": tm.get("discard_count", imi.get("discard_count")),
+                "call_count": tm.get("call_count", imi.get("call_count")),
+                "discard_loss": tm.get("discard_loss"),
+                "call_loss": tm.get("call_loss"),
+                "stage": imi.get("stage"),
+                # 教師再現メトリクス (Stage1 / Stage2a 共通)
+                # is not None ベースで値解決 (0.0 を欠損扱いしない)
+                "teacher_top1_match_rate": _first_not_none(
+                    tm.get("teacher_top1_match_rate_discard"),
+                    imi.get("teacher_top1_match_rate")),
+                "teacher_best_set_hit_rate": _first_not_none(
+                    tm.get("teacher_best_set_hit_rate_discard"),
+                    imi.get("teacher_best_set_hit_rate")),
                 "teacher_best_set_status": imi.get("teacher_best_set_status"),
                 "teacher_best_mask_shard_info": imi.get("teacher_best_mask_shard_info"),
-                # CQ-0132: loss mode 追跡
-                "imitation_loss_mode": imi.get("imitation_loss_mode"),
-                # CQ-0150, CQ-0152: joint value warm start 追跡
-                "value_loss": imi.get("value_loss"),
-                "imitation_value_warmstart": imi.get("imitation_value_warmstart"),
+                # Stage2a teacher diagnostics
+                "teacher_top1_match_rate_discard": tm.get("teacher_top1_match_rate_discard"),
+                "teacher_best_set_hit_rate_discard": tm.get("teacher_best_set_hit_rate_discard"),
+                "teacher_top1_match_rate_optional": tm.get("teacher_top1_match_rate_optional"),
+                # loss mode 追跡
+                "imitation_loss_mode": tm.get("imitation_loss_mode", imi.get("imitation_loss_mode")),
+                # value warm start 追跡
+                "value_loss": tm.get("value_loss", imi.get("value_loss")),
+                "imitation_value_warmstart": tm.get("imitation_value_warmstart",
+                                                      imi.get("imitation_value_warmstart")),
             }
             # CQ-0209: imitation_optimizer 追跡
             imi_opt = self._config.training.get("imitation_optimizer", {})
@@ -2248,7 +2919,9 @@ class Stage1Runner:
         enc_cfg = self._config.feature_encoder
         summary["encoder_features"] = {
             "name": enc_cfg.get("name", "FlatFeatureEncoder"),
-            "observation_mode": enc_cfg.get("observation_mode", "?"),
+            "observation_mode": enc_cfg.get(
+                "observation_mode",
+                self._config.experiment.get("observation_mode", "?")),
             "shanten_hint": _parse_encoder_flag(enc_cfg, "shanten_hint"),
             "discard_ukeire_hint": _parse_encoder_flag(enc_cfg, "discard_ukeire_hint"),
             "current_shanten": _parse_encoder_flag(enc_cfg, "current_shanten"),
@@ -2378,11 +3051,17 @@ class Stage1Runner:
             "deal_in_rate": eb_result.get("deal_in_rate"),
         }
 
-        # learner checkpoint
-        learner_ckpt = run_dir / "checkpoints" / "checkpoint_final.pt"
+        # learner checkpoint (CQ-0228: Stage2a は checkpoint_learner.pt)
+        stage = self._config.experiment.get("stage", "stage1")
+        if stage == "stage2a":
+            ckpt_name = "checkpoint_learner.pt"
+        else:
+            ckpt_name = "checkpoint_final.pt"
+        learner_ckpt = run_dir / "checkpoints" / ckpt_name
         artifacts["learner_checkpoint"] = {
             "exists": learner_ckpt.exists(),
-            "path": "checkpoints/checkpoint_final.pt",
+            "path": f"checkpoints/{ckpt_name}",
+            "stage": stage,
         }
 
         # eval

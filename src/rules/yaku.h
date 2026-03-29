@@ -30,6 +30,10 @@ enum class YakuType : uint8_t {
     HouteiRon   = 8,   // 河底撈魚
     RinshanKaihou = 9, // 嶺上開花
     Chankan     = 10,  // 槍槓
+    // CQ-0220: Stage2a 追加役
+    Toitoi      = 11,  // 対々和 (2翻)
+    Ikkitsuukan = 12,  // 一気通貫 (門前2翻 / 食い下がり1翻)
+    SanshokuDoujun = 13,  // 三色同順 (門前2翻 / 食い下がり1翻)
 };
 
 // 役判定結果（1つの役）

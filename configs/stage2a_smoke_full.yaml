@@ -1,0 +1,30 @@
+# Stage2a smoke config: imitation + selfplay + learner
+# usage: python -m mahjong_rl.cli --config configs/stage2a_smoke_full.yaml
+
+experiment:
+  name: stage2a_smoke_full
+  stage: stage2a
+  observation_mode: full
+  phases: [imitation, selfplay, learner]
+
+selfplay:
+  imitation_matches: 10
+  num_matches: 10
+  seed_start: 0
+
+imitation:
+  num_matches: 10
+
+model:
+  discard_hidden_dims: [64, 32]
+  call_hidden_dims: [32, 16]
+  candidate_dim: 8
+
+training:
+  algorithm: ppo
+  lr: 0.001
+  batch_size: 32
+  epochs: 2
+
+evaluation:
+  num_matches: 0

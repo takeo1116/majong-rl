@@ -80,6 +80,59 @@ int count_iipeiko(const AgariDecomposition& decomp) {
     return pairs;
 }
 
+// 対々和: 全面子が刻子または槓子
+bool check_toitoi(const AgariDecomposition& decomp) {
+    for (const auto& m : decomp.mentsu_list) {
+        if (m.kind == MentsuKind::Shuntsu) return false;
+    }
+    return true;
+}
+
+// 一気通貫: 同一スートで 123+456+789 の順子3組
+bool check_ikkitsuukan(const AgariDecomposition& decomp, bool& has_open) {
+    // スートごとに順子の先頭を収集
+    for (int suit = 0; suit < 3; ++suit) {
+        TileType base = static_cast<TileType>(suit * 9);
+        bool found1 = false, found4 = false, found7 = false;
+        bool open1 = false, open4 = false, open7 = false;
+        for (const auto& m : decomp.mentsu_list) {
+            if (m.kind != MentsuKind::Shuntsu) continue;
+            if (m.first_type == base) { found1 = true; open1 = m.is_open; }
+            if (m.first_type == base + 3) { found4 = true; open4 = m.is_open; }
+            if (m.first_type == base + 6) { found7 = true; open7 = m.is_open; }
+        }
+        if (found1 && found4 && found7) {
+            has_open = open1 || open4 || open7;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 三色同順: 3スートで同じ数字の順子 (例: 萬子123, 筒子123, 索子123)
+bool check_sanshoku_doujun(const AgariDecomposition& decomp, bool& has_open) {
+    // 各順子の先頭の number (1-7) × suit を記録
+    for (int num = 0; num < 7; ++num) {
+        bool found[3] = {};
+        bool open[3] = {};
+        for (const auto& m : decomp.mentsu_list) {
+            if (m.kind != MentsuKind::Shuntsu) continue;
+            for (int suit = 0; suit < 3; ++suit) {
+                TileType target = static_cast<TileType>(suit * 9 + num);
+                if (m.first_type == target) {
+                    found[suit] = true;
+                    open[suit] = m.is_open;
+                }
+            }
+        }
+        if (found[0] && found[1] && found[2]) {
+            has_open = open[0] || open[1] || open[2];
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // anonymous namespace
 
 YakuEvaluation evaluate_yaku(
@@ -148,6 +201,29 @@ YakuEvaluation evaluate_yaku(
     // 槍槓
     if (ctx.is_chankan) {
         eval.yakus.push_back({YakuType::Chankan, 1});
+    }
+
+    // CQ-0220: 対々和 (2翻, 門前/副露問わず)
+    if (check_toitoi(decomp)) {
+        eval.yakus.push_back({YakuType::Toitoi, 2});
+    }
+
+    // CQ-0220: 一気通貫 (門前2翻 / 食い下がり1翻)
+    {
+        bool ikki_open = false;
+        if (check_ikkitsuukan(decomp, ikki_open)) {
+            int han = (ctx.is_menzen && !ikki_open) ? 2 : 1;
+            eval.yakus.push_back({YakuType::Ikkitsuukan, han});
+        }
+    }
+
+    // CQ-0220: 三色同順 (門前2翻 / 食い下がり1翻)
+    {
+        bool sanshoku_open = false;
+        if (check_sanshoku_doujun(decomp, sanshoku_open)) {
+            int han = (ctx.is_menzen && !sanshoku_open) ? 2 : 1;
+            eval.yakus.push_back({YakuType::SanshokuDoujun, han});
+        }
     }
 
     // 役が1つもなければドラも加算しない
@@ -282,6 +358,9 @@ std::string to_string(YakuType type) {
         case YakuType::HouteiRon:   return "河底撈魚";
         case YakuType::RinshanKaihou: return "嶺上開花";
         case YakuType::Chankan:     return "槍槓";
+        case YakuType::Toitoi:      return "対々和";
+        case YakuType::Ikkitsuukan: return "一気通貫";
+        case YakuType::SanshokuDoujun: return "三色同順";
     }
     return "Unknown";
 }
