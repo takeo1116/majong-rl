@@ -3,6 +3,14 @@
 作成日: YYYY-MM-DD  
 対象: `experiments/exp_XXX/runbook.md`
 
+## 0. 記述ルール
+
+- Git 管理下の参照は、必ず**リポジトリ相対パス**で書く
+- **ローカル絶対パスは書かない**
+- `runs/` 配下の run dir / `summary.json` / `run.log` などは、いつでも削除されうる前提で扱う
+- `runs/` 配下を report の恒久参照先として書かない
+- 実行時にしか取れない値は、「どの run dir を見たか」ではなく**数値そのものを report に転記して残す**
+
 ## 1. 実験概要
 
 - 目的:
@@ -16,11 +24,11 @@
 
 ## 2. 実行結果
 
-| 条件 | run/batch | success |
+| 条件 | run label / batch label | success |
 |---|---|---:|
-| A | （ローカル run） | x/x |
-| B | （ローカル run） | x/x |
-| C | （ローカル run） | x/x |
+| A | （run_map に対応を記録） | x/x |
+| B | （run_map に対応を記録） | x/x |
+| C | （run_map に対応を記録） | x/x |
 
 注記:
 - 再実行・手動実行・途中停止など、比較解釈に効く事実を短く残す
@@ -82,9 +90,10 @@ mean ± std（seed=n）
 
 ## 9. 実行対応表
 
-run_map はローカル管理なので、比較に必要な対応はここへ転記する。
+`run_map.json` は対応確認用であり、report には比較に必要な対応だけを転記する。
+絶対パスや `runs/` 配下の run dir は書かず、run label / source label と参照文書で追えるようにする。
 
-| seed | role | run_dir | source_run_dir | 備考 |
+| seed | role | run label | source label | 参照 | 備考 |
 |---|---|---|---|---|
-| 42 | A | （ローカル run） |  |  |
-| 42 | B | （ローカル run） | （ローカル run） | reuse |
+| 42 | A | （run label） |  | `experiments/exp_XXX/run_map.json` |  |
+| 42 | B | （run label） | （source label） | `experiments/exp_XXX/run_map.json` | reuse |

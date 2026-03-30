@@ -165,7 +165,7 @@ B に追加:
 
 流用対象:
 
-- `runs/20260329_stage2a_rerun_A_core_minimal_seed42_mc20_separated_pr025_bsw05_v1_ef08cd25`
+- `exp_002` の A2 `separated` control
 
 流用理由:
 
@@ -206,7 +206,7 @@ B に追加:
 
 新規実行は行わず、以下を control として流用する。
 
-- `runs/20260329_stage2a_rerun_A_core_minimal_seed42_mc20_separated_pr025_bsw05_v1_ef08cd25`
+- `exp_002` の A2 `separated` control
 
 ### B `stage1style_context`
 
@@ -245,8 +245,7 @@ B に追加:
 
 - A を `exp_002` 既存 run から流用
 - B/C を順番に実行
-- `experiments/Stage02_CallUnlock/exp_003/driver_logs/` にログ保存
-- `experiments/Stage02_CallUnlock/exp_003/run_map.json` を更新
+- 実行ログと対応表は `experiments/Stage02_CallUnlock/exp_003/run_map.json` を中心に管理する
 
 する。
 

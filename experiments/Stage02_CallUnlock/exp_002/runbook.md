@@ -379,7 +379,7 @@ Stage02a の現行 scaffold で、PPO を安定して回せる条件はどれか
    - `updates`
    - `avg_rank`
    - `win_rate`
-3. final `summary.json` の
+3. final に report へ転記する
    - `policy_loss`
    - `value_loss`
    - `ratio_mean`

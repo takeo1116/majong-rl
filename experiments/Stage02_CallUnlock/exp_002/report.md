@@ -3,8 +3,7 @@
 作成日: 2026-03-29  
 参照:
 - `experiments/Stage02_CallUnlock/exp_002/runbook.md`
-- `runs/20260329_stage2a_rerun_A_core_minimal_seed42_mc20_mixed_pr025_bsw05_v2_4333595f/summary.json`
-- `runs/20260329_stage2a_rerun_A_core_minimal_seed42_mc20_separated_pr025_bsw05_v1_ef08cd25/summary.json`
+- `experiments/Stage02_CallUnlock/exp_002/report.md`
 
 ## 1. 要約
 
@@ -67,12 +66,12 @@
 
 ### Run A1 `mixed`
 
-- run dir: `runs/20260329_stage2a_rerun_A_core_minimal_seed42_mc20_mixed_pr025_bsw05_v2_4333595f`
+- run label: `A1_mixed` （数値は本 report に転記済み）
 - `training.rule_mix_learner.ppo_mode = "mixed"`
 
 ### Run A2 `separated`
 
-- run dir: `runs/20260329_stage2a_rerun_A_core_minimal_seed42_mc20_separated_pr025_bsw05_v1_ef08cd25`
+- run label: `A2_separated` （数値は本 report に転記済み）
 - `training.rule_mix_learner.ppo_mode = "separated"`
 
 ## 4. imitation の確認

@@ -4,8 +4,8 @@
 Stage: `Stage02_CallUnlock`  
 参照:
 - `experiments/Stage01_DiscardOnly/README.md`
-- `runs/20260327_stage2a_core_minimal_seed42_rebuilt_92ba4766/summary.json`
-- `runs/20260327_stage2a_stage1style_seed42_rebuilt_56386931/summary.json`
+- `experiments/Stage02_CallUnlock/exp_001/report.md`
+- `experiments/Stage02_CallUnlock/exp_001/run_map.json`
 
 ## 1. 背景
 
@@ -519,6 +519,6 @@ Stage02 では、実験番号を **`exp_001` から振り直す**。
 
 - `Stage02_CallUnlock/exp_001` と見た時点で「Stage02 の最初の実験」と分かる
 - stage ごとに README / runbook / report を閉じやすい
-- 実行時系列は `runs/` の timestamp と Git 履歴で追える
+- 実行時系列は `experiments/Stage02_CallUnlock/exp_001/run_map.json` と Git 履歴で追える
 
 したがって以後の Stage02 実験も stage ローカル番号で管理する。

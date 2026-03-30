@@ -1,7 +1,7 @@
 # Experiment Report: exp_001
 
 作成日: 2026-03-29  
-参照: `experiments/Stage02_CallUnlock/exp_001/runbook.md`, `experiments/Stage02_CallUnlock/exp_001/run_map.json`, `experiments/Stage02_CallUnlock/exp_001/driver_logs/`
+参照: `experiments/Stage02_CallUnlock/exp_001/runbook.md`, `experiments/Stage02_CallUnlock/exp_001/run_map.json`
 
 ## 1. 要約
 
@@ -94,8 +94,7 @@ long run に入る前に、Stage02a の correctness と CPU 使用率に関す�
 
 ### 4.1 A `core_minimal`
 
-- ログ: `experiments/Stage02_CallUnlock/exp_001/driver_logs/20260329_065801_A_core_minimal.log`
-- run dir: `runs/20260329_stage2a_long_A_core_minimal_seed42_mc30_75857344`
+- run label: `A_core_minimal` （対応は `experiments/Stage02_CallUnlock/exp_001/run_map.json` を参照）
 - 結果: **失敗**
 
 A は imitation 自体は正常に完了したが、PPO 後半 cycle で learner loss が急激に悪化した。
@@ -116,8 +115,7 @@ A は imitation 自体は正常に完了したが、PPO 後半 cycle で learner
 
 ### 4.2 B `stage1style_context`
 
-- ログ: `experiments/Stage02_CallUnlock/exp_001/driver_logs/20260329_101722_B_stage1style_context.log`
-- run dir: `runs/20260329_stage2a_long_B_stage1style_seed42_mc30_e9c8aa70`
+- run label: `B_stage1style_context` （対応は `experiments/Stage02_CallUnlock/exp_001/run_map.json` を参照）
 - 結果: **完走したが採用不可**
 
 B は最後まで走ったが、後半 PPO diagnostics が不健全だった。
@@ -136,8 +134,7 @@ final summary では概ね以下。
 
 ### 4.3 C `stage1style_context_plus_danger`
 
-- ログ: `experiments/Stage02_CallUnlock/exp_001/driver_logs/20260329_133830_C_stage1style_context_plus_danger.log`
-- run dir: `runs/20260329_stage2a_long_C_stage1style_plus_danger_seed42_mc30_739b5564`
+- run label: `C_stage1style_context_plus_danger` （対応は `experiments/Stage02_CallUnlock/exp_001/run_map.json` を参照）
 - 結果: **途中停止**
 
 C は imitation chunk 0 の時点で手動停止した。
@@ -265,8 +262,8 @@ source review で、Stage1 の安定 run と比べて Stage02a にはいくつ�
 
 ## 10. 実行対応表
 
-| seed | role | run_dir | log | 備考 |
+| seed | role | run label | 参照 | 備考 |
 |---|---|---|---|---|
-| 42 | A | `runs/20260329_stage2a_long_A_core_minimal_seed42_mc30_75857344` | `experiments/Stage02_CallUnlock/exp_001/driver_logs/20260329_065801_A_core_minimal.log` | cycle 29 で NaN / illegal discard |
-| 42 | B | `runs/20260329_stage2a_long_B_stage1style_seed42_mc30_e9c8aa70` | `experiments/Stage02_CallUnlock/exp_001/driver_logs/20260329_101722_B_stage1style_context.log` | 完走したが divergence で不採用 |
-| 42 | C | `runs/20260329_stage2a_long_C_stage1style_plus_danger_seed42_mc30_739b5564` | `experiments/Stage02_CallUnlock/exp_001/driver_logs/20260329_133830_C_stage1style_context_plus_danger.log` | imitation chunk 0 で手動停止 |
+| 42 | A | `A_core_minimal` | `experiments/Stage02_CallUnlock/exp_001/run_map.json` | cycle 29 で NaN / illegal discard |
+| 42 | B | `B_stage1style_context` | `experiments/Stage02_CallUnlock/exp_001/run_map.json` | 完走したが divergence で不採用 |
+| 42 | C | `C_stage1style_context_plus_danger` | `experiments/Stage02_CallUnlock/exp_001/run_map.json` | imitation chunk 0 で手動停止 |
