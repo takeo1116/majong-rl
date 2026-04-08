@@ -238,6 +238,18 @@ R3 条件:
 
 長時間実験なので、夜間バッチ向きである。
 
+実行コマンド:
+
+```bash
+./.venv/bin/python scripts/local/stage2/exp_008_driver.py
+```
+
+1 seed だけ試す場合:
+
+```bash
+EXP008_ONLY=42 ./.venv/bin/python scripts/local/stage2/exp_008_driver.py
+```
+
 ## 12. 次アクション判定
 
 ### 良い結果だった場合
