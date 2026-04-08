@@ -10,6 +10,12 @@ from mahjong_rl.call_shard import (
     DecisionShardWriter, DecisionShardReader,
 )
 
+# CQ-0265: Stage2a では shanten_hint / discard_ukeire_hint が必須
+_STAGE2A_ENCODER_CFG = {
+    "shanten_hint": True,
+    "discard_ukeire_hint": True,
+}
+
 
 class TestFutureLabelsRoundTrip:
     """CQ-0227: future labels の shard round-trip"""
@@ -42,7 +48,7 @@ class TestFutureLabelsRoundTrip:
                 CandidateRecord(action_type=4, tile_type=10, target_rel_seat=2),
                 CandidateRecord(action_type=8),
             ],
-            round_terminal_label="ron_loss",
+            round_terminal_label="deal_in",
             eventual_win_yaku_ids=[],
             eventual_total_han=-1,
             eventual_fu=-1,
@@ -61,7 +67,7 @@ class TestFutureLabelsRoundTrip:
         assert s0.eventual_fu == 40
 
         s1 = loaded[1]
-        assert s1.round_terminal_label == "ron_loss"
+        assert s1.round_terminal_label == "deal_in"
         assert s1.eventual_win_yaku_ids == []
         assert s1.eventual_total_han == -1
 
@@ -75,14 +81,14 @@ class TestFutureLabelsRoundTrip:
             terminated=False, round_over=False,
             action=0,
             legal_mask=np.ones(34, dtype=np.float32),
-            round_terminal_label="ryukyoku_noten",
+            round_terminal_label="other_non_dealin",
             eventual_win_yaku_ids=[],
             experiment_id="t", run_id="r", worker_id="w",
             episode_id="e",
         ))
         writer.close()
         loaded = DecisionShardReader(tmp_path).read_all()
-        assert loaded[0].round_terminal_label == "ryukyoku_noten"
+        assert loaded[0].round_terminal_label == "other_non_dealin"
         assert loaded[0].eventual_win_yaku_ids == []
 
 
@@ -112,7 +118,7 @@ class TestRoundOutcomeIntegration:
 
         # win label があるサンプルで yaku_ids が非空
         win_samples = [s for s in samples
-                       if s.round_terminal_label == "win"]
+                       if s.round_terminal_label in ("win_menzen", "win_called")]
         if win_samples:
             has_yakus = any(len(s.eventual_win_yaku_ids) > 0
                            for s in win_samples)
@@ -154,8 +160,8 @@ class TestRoundOutcomeIntegration:
         assert ratio > 0.7, \
             f"future label coverage が低い: {labeled}/{total} = {ratio:.2%}"
 
-    def test_ron_bystander_label_exists(self, tmp_path: Path):
-        """ron 和了の第三者に ron_bystander ラベルが付く"""
+    def test_other_non_dealin_label_exists(self, tmp_path: Path):
+        """CQ-0266: other_non_dealin ラベルが出る"""
         from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
         from mahjong_rl.encoders import FlatFeatureEncoder
 
@@ -168,8 +174,8 @@ class TestRoundOutcomeIntegration:
 
         samples = DecisionShardReader(tmp_path).read_all()
         labels = set(s.round_terminal_label for s in samples)
-        assert "ron_bystander" in labels, \
-            f"ron_bystander が出ない: {labels}"
+        assert "other_non_dealin" in labels, \
+            f"other_non_dealin が出ない: {labels}"
 
     def test_no_empty_label_for_labeled_round(self, tmp_path: Path):
         """backfill された round 内で空ラベルが残らない"""
@@ -313,6 +319,131 @@ class TestGetRoundOutcomeBinding:
                     e.advance_round(env)
         pytest.skip("100 seed で和了が得られなかった")
 
+    def test_win_has_is_menzen(self):
+        """CQ-0256 Blocker #3: 和了局で is_menzen フラグがある"""
+        from mahjong_rl._mahjong_core import (
+            GameEngine, EnvironmentState, RunMode, Phase,
+            get_round_outcome,
+        )
+        e = GameEngine()
+        env = EnvironmentState()
+        for seed in range(100):
+            e.reset_match(env, seed, RunMode.Fast)
+            for _ in range(5000):
+                p = env.round_state.phase
+                if p in (Phase.EndRound, Phase.EndMatch):
+                    break
+                actions = e.get_legal_actions(env)
+                if not actions:
+                    break
+                r = e.step(env, actions[0])
+                if r.round_over:
+                    outcome = get_round_outcome(env)
+                    if outcome["wins"]:
+                        w = outcome["wins"][0]
+                        assert "is_menzen" in w, \
+                            f"is_menzen が wins dict にない: {list(w.keys())}"
+                        assert isinstance(w["is_menzen"], bool)
+                        return
+                    if r.match_over:
+                        break
+                    e.advance_round(env)
+        pytest.skip("100 seed で和了が得られなかった")
+
+
+class TestTerminalLabelToClass:
+    """CQ-0266: terminal_label_to_class の 5-class mapping"""
+
+    def test_win_menzen_maps_to_0(self):
+        from mahjong_rl.outcome_vocab import terminal_label_to_class
+        assert terminal_label_to_class("win_menzen") == 0
+
+    def test_win_called_maps_to_1(self):
+        from mahjong_rl.outcome_vocab import terminal_label_to_class
+        assert terminal_label_to_class("win_called") == 1
+
+    def test_draw_tenpai_maps_to_2(self):
+        from mahjong_rl.outcome_vocab import terminal_label_to_class
+        assert terminal_label_to_class("draw_tenpai") == 2
+
+    def test_deal_in_maps_to_3(self):
+        from mahjong_rl.outcome_vocab import terminal_label_to_class
+        assert terminal_label_to_class("deal_in") == 3
+
+    def test_other_non_dealin_maps_to_4(self):
+        from mahjong_rl.outcome_vocab import terminal_label_to_class
+        assert terminal_label_to_class("other_non_dealin") == 4
+
+    def test_legacy_win_maps_to_win_menzen(self):
+        from mahjong_rl.outcome_vocab import terminal_label_to_class
+        assert terminal_label_to_class("win") == 0
+
+    def test_all_terminal_classes(self):
+        from mahjong_rl.outcome_vocab import (
+            terminal_label_to_class, TERMINAL_CLASSES)
+        for i, name in enumerate(TERMINAL_CLASSES):
+            assert terminal_label_to_class(name) == i
+
+    def test_old_8class_remapped(self):
+        """旧 8-class ラベルが正しく 5-class にマップされる"""
+        from mahjong_rl.outcome_vocab import terminal_label_to_class
+        assert terminal_label_to_class("ron_loss") == 3       # → deal_in
+        assert terminal_label_to_class("tsumo_loss") == 4     # → other_non_dealin
+        assert terminal_label_to_class("ron_bystander") == 4  # → other_non_dealin
+        assert terminal_label_to_class("ryukyoku_tenpai") == 2  # → draw_tenpai
+        assert terminal_label_to_class("ryukyoku_noten") == 4   # → other_non_dealin
+        assert terminal_label_to_class("abortive_draw") == 4    # → other_non_dealin
+
+    def test_unknown_maps_to_other(self):
+        from mahjong_rl.outcome_vocab import terminal_label_to_class
+        assert terminal_label_to_class("unknown_label") == 4
+        assert terminal_label_to_class("") == 4
+
+
+class TestWinMenzenCalledInSelfplay:
+    """CQ-0256 Blocker #3: selfplay で win_menzen / win_called が正しく付く"""
+
+    def test_win_labels_are_split(self, tmp_path: Path):
+        """selfplay 生成で win_menzen / win_called のうち少なくとも win_menzen が出る"""
+        from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
+        from mahjong_rl.encoders import FlatFeatureEncoder
+
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        worker = Stage2SelfPlayWorker(
+            config={}, output_dir=tmp_path,
+            observation_mode="full", encoder=encoder,
+        )
+        worker.generate(num_matches=10, base_seed=0)
+
+        samples = DecisionShardReader(tmp_path).read_all()
+        labels = set(s.round_terminal_label for s in samples)
+        # "win" (旧ラベル) は出ないこと
+        assert "win" not in labels, \
+            f"旧 'win' ラベルが残っている: {labels}"
+        # win_menzen か win_called の少なくとも一方が出る
+        win_labels = labels & {"win_menzen", "win_called"}
+        assert len(win_labels) > 0, \
+            f"win_menzen / win_called が出ない: {labels}"
+
+    def test_read_as_tensors_is_winner_set(self, tmp_path: Path):
+        """read_as_tensors で win_menzen/win_called が is_winner=1 になる"""
+        from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
+        from mahjong_rl.encoders import FlatFeatureEncoder
+
+        encoder = FlatFeatureEncoder(observation_mode="full")
+        worker = Stage2SelfPlayWorker(
+            config={}, output_dir=tmp_path,
+            observation_mode="full", encoder=encoder,
+        )
+        worker.generate(num_matches=5, base_seed=42)
+
+        data = DecisionShardReader(tmp_path).read_as_tensors()
+        d = data["discard"]
+        if d is not None:
+            # is_winner が正しくセットされている
+            assert d["is_winner"].sum() > 0 or d["n"] < 5, \
+                "discard is_winner が全ゼロ (5 match でありえない)"
+
 
 class TestStage2aEval:
     """CQ-0230: Stage2a deterministic eval テスト"""
@@ -348,6 +479,7 @@ class TestStage2aEval:
             "global_seed": 42,
             "phases": ["imitation", "selfplay", "learner", "eval"],
         }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
         config.selfplay = {
             "imitation_matches": 3,
             "num_matches": 3,
@@ -429,6 +561,7 @@ class TestStage2aImitationEpochSeparation:
             "global_seed": 42,
             "phases": ["imitation", "selfplay", "learner"],
         }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
         config.selfplay = {"imitation_matches": 3, "num_matches": 3, "seed_start": 0}
         config.imitation = {"num_matches": 3}
         config.model = {"discard_hidden_dims": [32], "optional_hidden_dims": [32],
@@ -471,6 +604,7 @@ class TestStage2aMultiCycle:
             "global_seed": 42,
             "phases": ["imitation", "selfplay", "learner"],
         }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
         config.selfplay = {"imitation_matches": 3, "num_matches": 3, "seed_start": 0}
         config.imitation = {"num_matches": 3}
         config.model = {"discard_hidden_dims": [32], "optional_hidden_dims": [32],
@@ -531,6 +665,7 @@ class TestStage2aMultiCycle:
             "global_seed": 42,
             "phases": ["imitation", "selfplay", "learner"],
         }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
         config.selfplay = {"imitation_matches": 3, "num_matches": 3, "seed_start": 0}
         config.imitation = {"num_matches": 3}
         config.model = {"discard_hidden_dims": [32], "optional_hidden_dims": [32],
@@ -586,6 +721,7 @@ class TestStage2aParallel:
             "global_seed": 42,
             "phases": ["imitation", "selfplay", "learner", "eval"],
         }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
         config.selfplay = {
             "imitation_matches": 4,
             "num_matches": 4,
@@ -718,6 +854,7 @@ class TestStage2aMultiChunkImitation:
             "name": "mc_imi", "stage": "stage2a", "observation_mode": "full",
             "global_seed": 42, "phases": ["imitation", "selfplay"],
         }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
         config.selfplay = {"imitation_matches": 3}
         config.imitation = {"num_matches": 3}
         config.model = {"discard_hidden_dims": [32], "optional_hidden_dims": [32], "candidate_dim": 8}
@@ -784,6 +921,7 @@ class TestStage2aMultiChunkParallel:
             "name": "mcp", "stage": "stage2a", "observation_mode": "full",
             "global_seed": 42, "phases": ["imitation", "selfplay"],
         }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
         config.selfplay = {"imitation_matches": 4}
         config.imitation = {"num_matches": 4, "num_workers": 2}
         config.model = {"discard_hidden_dims": [32], "optional_hidden_dims": [32], "candidate_dim": 8}
@@ -813,6 +951,7 @@ class TestStage2aRuleMix:
             "name": "rm", "stage": "stage2a", "observation_mode": "full",
             "global_seed": 42, "phases": ["imitation", "selfplay", "learner"],
         }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
         config.selfplay = {"imitation_matches": 3, "num_matches": 3, "seed_start": 0}
         config.imitation = {"num_matches": 3}
         config.model = {"discard_hidden_dims": [32], "optional_hidden_dims": [32], "candidate_dim": 8}
@@ -841,6 +980,132 @@ class TestStage2aRuleMix:
             assert "policy_ppo" in ls
 
 
+class TestImitationEval:
+    """CQ-0254: imitation 直後 eval"""
+
+    def test_single_imitation_eval(self, tmp_path: Path):
+        """single imitation + imitation_eval"""
+        from mahjong_rl.runner import Stage1Runner
+        from mahjong_rl.experiment import ExperimentConfig
+        import json
+
+        config = ExperimentConfig()
+        config.experiment = {
+            "name": "imi_eval",
+            "stage": "stage2a",
+            "observation_mode": "full",
+            "global_seed": 42,
+            "phases": ["imitation", "selfplay"],
+        }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
+        config.selfplay = {"imitation_matches": 3, "num_matches": 3, "seed_start": 0}
+        config.imitation = {"num_matches": 3}
+        config.model = {"discard_hidden_dims": [32], "optional_hidden_dims": [32],
+                         "candidate_dim": 8}
+        config.training = {
+            "algorithm": "ppo", "lr": 1e-3, "batch_size": 16, "epochs": 1,
+            "imitation_eval": {"enabled": True, "num_matches": 3},
+        }
+        config.evaluation = {"num_matches": 3}
+
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result, f"error: {result.get('error')}"
+
+        imi = result.get("imitation_metrics", {})
+        ie = imi.get("imitation_eval")
+        assert ie is not None, "imitation_eval が結果にない"
+        assert ie.get("avg_rank") is not None
+
+        run_dir = Path(result["run_dir"])
+
+        # 保存先が eval/ ではなく imitation_eval/ にある
+        assert (run_dir / "imitation_eval" / "metrics.json").exists()
+        assert not (run_dir / "eval" / "metrics.json").exists()
+
+        # summary にも反映
+        with open(run_dir / "summary.json") as f:
+            summary = json.load(f)
+        ps_ie = summary["phase_stats"]["imitation"].get("imitation_eval")
+        assert ps_ie is not None
+
+        # manifest
+        with open(run_dir / "artifacts_manifest.json") as f:
+            manifest = json.load(f)
+        assert manifest["artifacts"]["imitation_eval"]["exists"] is True
+
+    def test_multi_chunk_eval_each_chunk(self, tmp_path: Path):
+        """multi-chunk + eval_each_chunk"""
+        from mahjong_rl.runner import Stage1Runner
+        from mahjong_rl.experiment import ExperimentConfig
+
+        config = ExperimentConfig()
+        config.experiment = {
+            "name": "mc_eval",
+            "stage": "stage2a",
+            "observation_mode": "full",
+            "global_seed": 42,
+            "phases": ["imitation", "selfplay"],
+        }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
+        config.selfplay = {"imitation_matches": 4}
+        config.imitation = {"num_matches": 4}
+        config.model = {"discard_hidden_dims": [32], "optional_hidden_dims": [32],
+                         "candidate_dim": 8}
+        config.training = {
+            "algorithm": "imitation", "lr": 1e-3, "batch_size": 16, "epochs": 1,
+            "multi_chunk_imitation": {
+                "enabled": True, "num_chunks": 2, "imitation_matches_per_chunk": 2,
+            },
+            "imitation_eval": {
+                "enabled": True, "eval_each_chunk": True, "num_matches": 2,
+            },
+        }
+        config.evaluation = {"num_matches": 2}
+
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result, f"error: {result.get('error')}"
+
+        imi = result.get("imitation_metrics", {})
+        mci = imi.get("multi_chunk_imitation", {})
+        chunks = mci.get("chunks", [])
+        assert len(chunks) == 2
+        for ch in chunks:
+            ce = ch.get("imitation_eval")
+            assert ce is not None, "chunk eval がない"
+            assert ce.get("avg_rank") is not None
+        # final eval
+        assert imi.get("imitation_eval") is not None
+
+    def test_disabled_no_eval(self, tmp_path: Path):
+        """enabled=false で eval なし"""
+        from mahjong_rl.runner import Stage1Runner
+        from mahjong_rl.experiment import ExperimentConfig
+
+        config = ExperimentConfig()
+        config.experiment = {
+            "name": "no_eval",
+            "stage": "stage2a",
+            "observation_mode": "full",
+            "global_seed": 42,
+            "phases": ["imitation", "selfplay"],
+        }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
+        config.selfplay = {"imitation_matches": 3, "num_matches": 3, "seed_start": 0}
+        config.imitation = {"num_matches": 3}
+        config.model = {"discard_hidden_dims": [32], "optional_hidden_dims": [32],
+                         "candidate_dim": 8}
+        config.training = {"algorithm": "ppo", "lr": 1e-3, "batch_size": 16, "epochs": 1}
+        config.evaluation = {"num_matches": 0}
+
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        result = runner.run()
+        assert "error" not in result
+        imi = result.get("imitation_metrics", {})
+        assert imi.get("imitation_eval") is None
+
+
 class TestStage2aSmokeConfig:
     """CQ-0228: smoke config テスト"""
 
@@ -865,6 +1130,7 @@ class TestStage2aSmokeConfig:
             "global_seed": 42,
             "phases": ["imitation", "selfplay", "learner"],
         }
+        config.feature_encoder = _STAGE2A_ENCODER_CFG.copy()
         config.selfplay = {
             "imitation_matches": 5,
             "num_matches": 5,

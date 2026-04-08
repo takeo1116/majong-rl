@@ -21,6 +21,7 @@ class Stage2aOutput(NamedTuple):
     discard_logits: torch.Tensor | None  # (B, 34) or None
     optional_scores: torch.Tensor | None     # (B, max_cands) or None
     values: dict[str, torch.Tensor]      # {"round_delta": (B, 1)}
+    semantic: dict | None = None  # CQ-0256: {terminal_logits, yaku_logits, semantic_summary}
 
 
 # ---------- Candidate Encoder ----------
@@ -91,25 +92,56 @@ class Stage2aModel(nn.Module):
         candidate_dim: int = 16,
         optional_scorer_hidden: int = 32,
         value_aux_dim: int = 0,
+        semantic_aux_config: dict | None = None,
+        direct_hint_ranges: dict[str, tuple[int, int]] | None = None,
     ):
         super().__init__()
         self._input_dim = input_dim
         self._value_aux_dim = value_aux_dim
         self._candidate_dim = candidate_dim
+        sa = semantic_aux_config or {}
+        self._semantic_aux_enabled = sa.get("enabled", False)
+
+        # CQ-0265: direct hint branch for discard path
+        self._direct_hint_ranges = direct_hint_ranges or {}
+        self._direct_hint_sources = sorted(self._direct_hint_ranges.keys())
+        self._direct_hints_enabled = len(self._direct_hint_sources) > 0
+        excluded_dim = sum(
+            e - s for s, e in self._direct_hint_ranges.values()
+        ) if self._direct_hints_enabled else 0
+        trunk_input_dim = input_dim - excluded_dim
+
+        if self._direct_hints_enabled:
+            num_sources = len(self._direct_hint_sources)
+            tile_emb_dim = 4
+            local_hidden = 16
+            self._tile_embedding = nn.Embedding(34, tile_emb_dim)
+            self._local_scorer = nn.Sequential(
+                nn.Linear(num_sources + tile_emb_dim, local_hidden),
+                nn.ReLU(),
+                nn.Linear(local_hidden, 1),
+            )
+            self.register_buffer("_tile_ids", torch.arange(34, dtype=torch.long))
 
         # Discard trunk
         discard_layers: list[nn.Module] = []
-        prev = input_dim
+        prev = trunk_input_dim
         for h in discard_hidden_dims:
             discard_layers.append(nn.Linear(prev, h))
             discard_layers.append(nn.ReLU())
             prev = h
         self.discard_trunk = nn.Sequential(*discard_layers)
         self.discard_head = nn.Linear(prev, 34)
+        self._discard_trunk_out_dim = prev
+
+        # CQ-0265: context gate (trunk hidden → 34-way sigmoid gate)
+        if self._direct_hints_enabled:
+            self._context_gate = nn.Linear(prev, 34)
 
         # Optional trunk (input: x_state + response_context)
+        # Uses trunk_input_dim (hint excluded)
         opt_layers: list[nn.Module] = []
-        prev_c = input_dim + RESPONSE_CONTEXT_DIM
+        prev_c = trunk_input_dim + RESPONSE_CONTEXT_DIM
         for h in optional_hidden_dims:
             opt_layers.append(nn.Linear(prev_c, h))
             opt_layers.append(nn.ReLU())
@@ -127,8 +159,9 @@ class Stage2aModel(nn.Module):
 
         # Value trunk (CQ-0242: independent from policy)
         # input: x_state + decision_family(1) + response_context + optional_summary
+        # Uses trunk_input_dim (hint excluded)
         summary_dim = self._SUMMARY_FIXED + candidate_dim * 2  # mean + max
-        val_input = input_dim + 1 + RESPONSE_CONTEXT_DIM + summary_dim + value_aux_dim
+        val_input = trunk_input_dim + 1 + RESPONSE_CONTEXT_DIM + summary_dim + value_aux_dim
         val_layers: list[nn.Module] = []
         prev_v = val_input
         for h in value_hidden_dims:
@@ -138,6 +171,111 @@ class Stage2aModel(nn.Module):
         self.value_trunk = nn.Sequential(*val_layers)
         self.value_head = nn.Linear(prev_v, 1)
         self._summary_dim = summary_dim
+
+        # CQ-0256: semantic auxiliary trunk + heads
+        self._semantic_summary_dim = 0
+        if self._semantic_aux_enabled:
+            from mahjong_rl.outcome_vocab import NUM_TERMINAL_CLASSES, NUM_YAKU
+            sa_proj = sa.get("policy_projection_dim", 16)
+            # reuse value_trunk hidden → semantic heads
+            self.terminal_head = nn.Linear(prev_v, NUM_TERMINAL_CLASSES)
+            self.yaku_head = nn.Linear(prev_v, NUM_YAKU)
+            self.semantic_proj = nn.Linear(prev_v, sa_proj)
+            # summary dim = terminal_probs + yaku_probs + projection
+            self._semantic_summary_dim = NUM_TERMINAL_CLASSES + NUM_YAKU + sa_proj
+
+            # expand discard / optional trunk input to accept semantic summary
+            # rebuild first layer of each trunk to accept wider input
+            d_first_in = trunk_input_dim + self._semantic_summary_dim
+            o_first_in = trunk_input_dim + RESPONSE_CONTEXT_DIM + self._semantic_summary_dim
+            # replace first linear layers
+            d_first_hidden = discard_hidden_dims[0] if discard_hidden_dims else 128
+            o_first_hidden = optional_hidden_dims[0] if optional_hidden_dims else 64
+            old_d = list(self.discard_trunk)
+            old_d[0] = nn.Linear(d_first_in, d_first_hidden)
+            self.discard_trunk = nn.Sequential(*old_d)
+            old_o = list(self.optional_trunk)
+            old_o[0] = nn.Linear(o_first_in, o_first_hidden)
+            self.optional_trunk = nn.Sequential(*old_o)
+
+    def _split_features(self, features: torch.Tensor
+                        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """CQ-0265: features を global (trunk 入力) と direct hints に分離する
+
+        Returns:
+            (global_features, direct_hints)
+            direct_hints: (B, 34, K) or None
+        """
+        if not self._direct_hints_enabled:
+            return features, None
+
+        exclude_ranges = [
+            self._direct_hint_ranges[src]
+            for src in self._direct_hint_sources
+        ]
+        # hint parts
+        hint_parts = [features[:, s:e] for s, e in exclude_ranges]  # each (B, 34)
+
+        # global: keep everything except excluded ranges
+        total_dim = features.size(-1)
+        excluded = set()
+        for s, e in exclude_ranges:
+            excluded.update(range(s, e))
+        keep = [i for i in range(total_dim) if i not in excluded]
+        keep_idx = torch.tensor(keep, device=features.device, dtype=torch.long)
+        global_features = features.index_select(1, keep_idx)
+
+        hints_stacked = torch.stack(hint_parts, dim=1)  # (B, K, 34)
+        direct_hints = hints_stacked.transpose(1, 2)     # (B, 34, K)
+        return global_features, direct_hints
+
+    def _apply_direct_hints(self, base_logits: torch.Tensor,
+                             direct_hints: torch.Tensor,
+                             h_trunk: torch.Tensor) -> torch.Tensor:
+        """CQ-0265: tile-wise local scorer + context gate で delta logits を加算"""
+        B = base_logits.size(0)
+        tile_emb = self._tile_embedding(
+            self._tile_ids.expand(B, -1))  # (B, 34, tile_emb_dim)
+        local_input = torch.cat([direct_hints, tile_emb], dim=-1)
+        delta_logits = self._local_scorer(local_input).squeeze(-1)  # (B, 34)
+        gate = torch.sigmoid(self._context_gate(h_trunk))  # (B, 34)
+        return base_logits + gate * delta_logits
+
+    def _compute_value_hidden(
+        self, features, decision_family, response_context=None,
+        optional_summary=None, value_aux_features=None,
+    ) -> torch.Tensor:
+        """value trunk の hidden 表現を返す (value_head 前)"""
+        B = features.size(0)
+        df = torch.full((B, 1), decision_family, device=features.device)
+        if response_context is None:
+            response_context = torch.zeros(B, RESPONSE_CONTEXT_DIM, device=features.device)
+        if optional_summary is None:
+            optional_summary = torch.zeros(B, self._summary_dim, device=features.device)
+        parts = [features, df, response_context, optional_summary]
+        if self._value_aux_dim > 0 and value_aux_features is not None:
+            parts.append(value_aux_features)
+        elif self._value_aux_dim > 0:
+            parts.append(torch.zeros(B, self._value_aux_dim, device=features.device))
+        val_in = torch.cat(parts, dim=-1)
+        return self.value_trunk(val_in)
+
+    def _compute_semantic(self, h_value: torch.Tensor) -> dict:
+        """CQ-0256: semantic heads + detached summary for policy"""
+        terminal_logits = self.terminal_head(h_value)
+        yaku_logits = self.yaku_head(h_value)
+        proj = self.semantic_proj(h_value)
+        # summary: detach for policy input
+        summary = torch.cat([
+            torch.softmax(terminal_logits, dim=-1).detach(),
+            torch.sigmoid(yaku_logits).detach(),
+            proj.detach(),
+        ], dim=-1)
+        return {
+            "terminal_logits": terminal_logits,
+            "yaku_logits": yaku_logits,
+            "semantic_summary": summary,
+        }
 
     def _compute_value(
         self, features: torch.Tensor,
@@ -202,21 +340,44 @@ class Stage2aModel(nn.Module):
         compute_value: bool = True,
     ) -> Stage2aOutput:
         """discard decision の forward"""
-        h_d = self.discard_trunk(features)
+        # CQ-0265: split features into global (trunk) + direct hints
+        global_features, direct_hints = self._split_features(features)
+
+        # CQ-0256: semantic summary → policy input (always when enabled)
+        semantic = None
+        policy_input = global_features
+        h_v = None
+        if self._semantic_aux_enabled:
+            h_v = self._compute_value_hidden(
+                global_features, decision_family=0.0,
+                value_aux_features=value_aux_features)
+            semantic = self._compute_semantic(h_v)
+            policy_input = torch.cat([global_features, semantic["semantic_summary"]], dim=-1)
+
+        h_d = self.discard_trunk(policy_input)
         logits = self.discard_head(h_d)
+
+        # CQ-0265: direct hint branch (discard only)
+        if self._direct_hints_enabled and direct_hints is not None:
+            logits = self._apply_direct_hints(logits, direct_hints, h_d)
+
         logits = logits + (1.0 - legal_mask) * (-1e9)
 
         values: dict[str, torch.Tensor] = {}
         if compute_value:
-            value = self._compute_value(
-                features, decision_family=0.0,
-                value_aux_features=value_aux_features)
-            values["round_delta"] = value
+            if self._semantic_aux_enabled and h_v is not None:
+                values["round_delta"] = self.value_head(h_v)
+            else:
+                value = self._compute_value(
+                    global_features, decision_family=0.0,
+                    value_aux_features=value_aux_features)
+                values["round_delta"] = value
 
         return Stage2aOutput(
             discard_logits=logits,
             optional_scores=None,
             values=values,
+            semantic=semantic,
         )
 
     def forward_optional(
@@ -239,10 +400,30 @@ class Stage2aModel(nn.Module):
         Returns:
             Stage2aOutput with discard_logits=None, optional_scores, values
         """
-        B_feat = features.size(0)
+        # CQ-0265: strip direct hints (optional/value/semantic don't use them)
+        global_features, _ = self._split_features(features)
+
+        B_feat = global_features.size(0)
         if response_context is None:
-            response_context = torch.zeros(B_feat, RESPONSE_CONTEXT_DIM, device=features.device)
-        opt_input = torch.cat([features, response_context], dim=-1)
+            response_context = torch.zeros(B_feat, RESPONSE_CONTEXT_DIM, device=global_features.device)
+
+        # CQ-0256: semantic summary → policy input (always when enabled)
+        semantic = None
+        h_v = None
+        if self._semantic_aux_enabled:
+            cand_enc_pre = self.candidate_encoder(cand_features)
+            opt_summary_pre = self._make_optional_summary(
+                cand_enc_pre, cand_mask, cand_features=cand_features)
+            h_v = self._compute_value_hidden(
+                global_features, decision_family=1.0,
+                response_context=response_context,
+                optional_summary=opt_summary_pre,
+                value_aux_features=value_aux_features)
+            semantic = self._compute_semantic(h_v)
+            opt_input = torch.cat([global_features, response_context,
+                                    semantic["semantic_summary"]], dim=-1)
+        else:
+            opt_input = torch.cat([global_features, response_context], dim=-1)
         h_c = self.optional_trunk(opt_input)  # (B, optional_trunk_dim)
 
         # Candidate encoding
@@ -257,20 +438,24 @@ class Stage2aModel(nn.Module):
         # Mask invalid candidates
         scores = scores + (1.0 - cand_mask) * (-1e9)
 
-        # Value (independent trunk, optional → decision_family=1)
+        # Value
         values: dict[str, torch.Tensor] = {}
         if compute_value:
-            opt_summary = self._make_optional_summary(
-                cand_enc, cand_mask, cand_features=cand_features)
-            value = self._compute_value(
-                features, decision_family=1.0,
-                response_context=response_context,
-                optional_summary=opt_summary,
-                value_aux_features=value_aux_features)
-            values["round_delta"] = value
+            if self._semantic_aux_enabled:
+                values["round_delta"] = self.value_head(h_v)
+            else:
+                opt_summary = self._make_optional_summary(
+                    cand_enc, cand_mask, cand_features=cand_features)
+                value = self._compute_value(
+                    global_features, decision_family=1.0,
+                    response_context=response_context,
+                    optional_summary=opt_summary,
+                    value_aux_features=value_aux_features)
+                values["round_delta"] = value
 
         return Stage2aOutput(
             discard_logits=None,
             optional_scores=scores,
             values=values,
+            semantic=semantic,
         )

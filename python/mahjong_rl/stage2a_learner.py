@@ -44,6 +44,9 @@ class Stage2aLearner:
         self._model = model.to(self._device)
 
         tc = config.get("training", {})
+        # CQ-0255: CUDA memory debug
+        cmd = tc.get("cuda_memory_debug", {})
+        self._cuda_mem_debug = cmd.get("enabled", False) and self._device.type == "cuda"
         self._mode = tc.get("algorithm", "imitation")
         self._lr = tc.get("lr", 3e-4)
         self._batch_size = tc.get("batch_size", 256)
@@ -76,8 +79,52 @@ class Stage2aLearner:
         rml = tc.get("rule_mix_learner", {})
         self._baseline_sample_weight = rml.get("baseline_sample_weight", 1.0)
         self._mixed_ppo_mode = rml.get("ppo_mode", "separated")
+        # CQ-0256: semantic aux
+        sa = tc.get("semantic_aux", {})
+        self._semantic_aux_enabled = sa.get("enabled", False)
+        self._terminal_loss_coef = sa.get("terminal_loss_coef", 0.2)
+        self._yaku_loss_coef = sa.get("yaku_loss_coef", 0.1)
 
         self._optimizer = torch.optim.Adam(model.parameters(), lr=self._lr)
+
+    @staticmethod
+    def _compute_terminal_weights(episode_ids, round_ids, player_ids, n: int,
+                                   device: torch.device) -> torch.Tensor:
+        """CQ-0268: player-round 正規化重みを計算する
+
+        同じ (episode_id, round_id, player_id) に属する row の weight 合計が 1.0 になる。
+        """
+        from collections import Counter
+        keys = []
+        for i in range(n):
+            eid = episode_ids[i] if isinstance(episode_ids[i], str) else str(episode_ids[i])
+            rid = int(round_ids[i])
+            pid = int(player_ids[i])
+            keys.append((eid, rid, pid))
+        counts = Counter(keys)
+        weights = torch.zeros(n, dtype=torch.float32, device=device)
+        for i in range(n):
+            weights[i] = 1.0 / counts[keys[i]]
+        return weights
+
+    def _log_cuda_memory(self, label: str) -> dict | None:
+        """CQ-0255: CUDA memory debug ログ (enabled 時のみ)"""
+        if not self._cuda_mem_debug:
+            return None
+        import logging
+        _logger = logging.getLogger(__name__)
+        alloc = torch.cuda.memory_allocated(self._device)
+        reserved = torch.cuda.memory_reserved(self._device)
+        max_alloc = torch.cuda.max_memory_allocated(self._device)
+        max_reserved = torch.cuda.max_memory_reserved(self._device)
+        snap = {
+            "allocated_mb": round(alloc / 1048576, 1),
+            "reserved_mb": round(reserved / 1048576, 1),
+            "max_allocated_mb": round(max_alloc / 1048576, 1),
+            "max_reserved_mb": round(max_reserved / 1048576, 1),
+        }
+        _logger.info(f"[CUDA mem] {label}: {snap}")
+        return snap
 
     def train(self, shard_dir: Path, num_epochs: int | None = None,
               filter_actor_type: str | None = None) -> dict:
@@ -197,6 +244,7 @@ class Stage2aLearner:
 
         # pre-move to device
         d_obs = d_masks = d_actions = d_teacher_top1 = d_tbm = d_returns_t = None
+        d_term_cls = d_yaku_mh = d_is_winner = d_term_weights = None
         if d:
             d_obs = torch.tensor(d["observations"], dtype=torch.float32, device=self._device)
             d_masks = torch.tensor(d["legal_masks"], dtype=torch.float32, device=self._device)
@@ -206,8 +254,17 @@ class Stage2aLearner:
                 d_tbm = torch.tensor(d["teacher_best_mask"], dtype=torch.float32, device=self._device)
             if d_ret_np is not None:
                 d_returns_t = torch.tensor(d_ret_np, dtype=torch.float32, device=self._device)
+            # CQ-0256: semantic targets
+            d_term_cls = torch.tensor(d["terminal_classes"], dtype=torch.long, device=self._device) if "terminal_classes" in d else None
+            d_yaku_mh = torch.tensor(d["yaku_multihot"], dtype=torch.float32, device=self._device) if "yaku_multihot" in d else None
+            d_is_winner = torch.tensor(d["is_winner"], dtype=torch.float32, device=self._device) if "is_winner" in d else None
+            # CQ-0268: terminal player-round weights
+            d_term_weights = self._compute_terminal_weights(
+                d["episode_ids"], d.get("round_ids", np.zeros(nd, dtype=np.int64)),
+                d["player_ids"], nd, self._device) if self._semantic_aux_enabled else None
 
         c_obs = c_cf = c_cm = c_rc = c_targets = c_returns_t = None
+        c_rewards = c_term_cls = c_yaku_mh = c_is_winner = c_term_weights = None
         if c:
             c_obs = torch.tensor(c["observations"], dtype=torch.float32, device=self._device)
             c_cf = torch.tensor(c["cand_feats"], dtype=torch.long, device=self._device)
@@ -220,6 +277,16 @@ class Stage2aLearner:
             if c_ret_np is not None:
                 c_returns_t = torch.tensor(c_ret_np, dtype=torch.float32, device=self._device)
             c_rewards = torch.tensor(c["rewards"], dtype=torch.float32, device=self._device)
+            c_term_cls = torch.tensor(c["terminal_classes"], dtype=torch.long, device=self._device) if "terminal_classes" in c else None
+            c_yaku_mh = torch.tensor(c["yaku_multihot"], dtype=torch.float32, device=self._device) if "yaku_multihot" in c else None
+            c_is_winner = torch.tensor(c["is_winner"], dtype=torch.float32, device=self._device) if "is_winner" in c else None
+            # CQ-0268: terminal player-round weights
+            c_term_weights = self._compute_terminal_weights(
+                c["episode_ids"], c.get("round_ids", np.zeros(nc, dtype=np.int64)),
+                c["player_ids"], nc, self._device) if self._semantic_aux_enabled else None
+
+        self._log_cuda_memory("imitation_preload")
+        sem_tl_list, sem_yl_list = [], []
 
         for _ in range(epochs):
             # discard imitation (CQ-0252: vectorized best-set)
@@ -259,6 +326,15 @@ class Stage2aLearner:
                         vl = self._compute_value_loss(v, d_returns_t[idx])
                         total = total + self._imi_value_coef * vl
                         vl_list.append(vl.item())
+                    # CQ-0256/0268: semantic aux loss with terminal weights
+                    if self._semantic_aux_enabled and d_term_cls is not None:
+                        tw = d_term_weights[idx] if d_term_weights is not None else None
+                        sa_loss, tl_v, yl_v = self._compute_semantic_aux_loss(
+                            out.semantic, d_term_cls[idx], d_yaku_mh[idx], d_is_winner[idx],
+                            terminal_weights=tw)
+                        total = total + sa_loss
+                        sem_tl_list.append(tl_v)
+                        sem_yl_list.append(yl_v)
 
                     self._optimizer.zero_grad()
                     total.backward()
@@ -286,6 +362,15 @@ class Stage2aLearner:
                         vl = self._compute_value_loss(v, c_returns_t[idx])
                         total = total + self._imi_value_coef * vl
                         vl_list.append(vl.item())
+                    # CQ-0256/0268: semantic aux loss with terminal weights
+                    if self._semantic_aux_enabled and c_term_cls is not None:
+                        tw = c_term_weights[idx] if c_term_weights is not None else None
+                        sa_loss, tl_v, yl_v = self._compute_semantic_aux_loss(
+                            out.semantic, c_term_cls[idx], c_yaku_mh[idx], c_is_winner[idx],
+                            terminal_weights=tw)
+                        total = total + sa_loss
+                        sem_tl_list.append(tl_v)
+                        sem_yl_list.append(yl_v)
 
                     self._optimizer.zero_grad()
                     total.backward()
@@ -296,9 +381,24 @@ class Stage2aLearner:
                     num_updates += 1
 
         train_end = _time.perf_counter()
+        self._log_cuda_memory("imitation_train_end")
+
+        # CQ-0255: free training-only GPU tensors before diagnostics
+        # Keep d_obs, d_masks, c_obs, c_cf, c_cm, c_rc for diagnostics reuse
+        d_actions = d_teacher_top1 = d_returns_t = d_tbm = None
+        d_term_cls = d_yaku_mh = d_is_winner = None
+        c_targets = c_returns_t = c_rewards = None
+        c_term_cls = c_yaku_mh = c_is_winner = None
+
+        self._log_cuda_memory("imitation_pre_diag")
         diag_t0 = _time.perf_counter()
-        diag = self._compute_imitation_diagnostics_tensor(d, c)
+        diag = self._compute_imitation_diagnostics_preloaded(
+            d, d_obs, d_masks, c, c_obs, c_cf, c_cm, c_rc)
         diag_sec = _time.perf_counter() - diag_t0
+
+        # CQ-0255: free remaining GPU tensors
+        del d_obs, d_masks, c_obs, c_cf, c_cm, c_rc
+        self._log_cuda_memory("imitation_post_diag")
 
         return {
             "mode": "imitation",
@@ -312,6 +412,9 @@ class Stage2aLearner:
             "value_loss": float(np.mean(vl_list)) if vl_list else 0.0,
             "num_updates": num_updates,
             "imitation_value_warmstart": self._imi_value_enabled,
+            "semantic_aux_enabled": self._semantic_aux_enabled,
+            "terminal_loss": float(np.mean(sem_tl_list)) if sem_tl_list else None,
+            "yaku_loss": float(np.mean(sem_yl_list)) if sem_yl_list else None,
             "timing": {
                 "train_sec": round(train_end - train_start, 3),
                 "diagnostics_sec": round(diag_sec, 3),
@@ -319,15 +422,15 @@ class Stage2aLearner:
             **diag,
         }
 
-    def _compute_imitation_diagnostics_tensor(self, d, c):
-        """CQ-0247/0251: tensor ベース diagnostics"""
+    def _compute_imitation_diagnostics_preloaded(
+        self, d, d_obs, d_masks, c, c_obs, c_cf, c_cm, c_rc,
+    ):
+        """CQ-0255: diagnostics using preloaded GPU tensors (no re-allocation)"""
         diag: dict = {}
         self._model.eval()
         with torch.inference_mode():
-            if d and d["n"] > 0:
-                obs = torch.tensor(d["observations"], dtype=torch.float32, device=self._device)
-                masks = torch.tensor(d["legal_masks"], dtype=torch.float32, device=self._device)
-                out = self._model.forward_discard(obs, masks, compute_value=False)
+            if d and d["n"] > 0 and d_obs is not None:
+                out = self._model.forward_discard(d_obs, d_masks, compute_value=False)
                 pred = out.discard_logits.argmax(dim=-1).cpu().numpy()
                 t1 = d["teacher_top1"]
                 valid = t1 >= 0
@@ -342,19 +445,14 @@ class Stage2aLearner:
                         diag["teacher_best_set_hit_rate_discard"] = float(
                             (hits > 0).mean())
 
-            if c and c["n"] > 0:
-                obs = torch.tensor(c["observations"], dtype=torch.float32, device=self._device)
-                cf = torch.tensor(c["cand_feats"], dtype=torch.long, device=self._device)
-                cm = torch.tensor(c["cand_mask"], dtype=torch.float32, device=self._device)
-                rc = torch.tensor(c["response_context"], dtype=torch.float32, device=self._device)
-                # batched forward
+            if c and c["n"] > 0 and c_obs is not None:
                 bs = min(self._batch_size, c["n"])
                 preds = []
                 for start in range(0, c["n"], bs):
                     end = min(start + bs, c["n"])
                     out = self._model.forward_optional(
-                        obs[start:end], cf[start:end], cm[start:end],
-                        response_context=rc[start:end], compute_value=False)
+                        c_obs[start:end], c_cf[start:end], c_cm[start:end],
+                        response_context=c_rc[start:end], compute_value=False)
                     preds.append(out.optional_scores.argmax(dim=-1).cpu().numpy())
                 pred = np.concatenate(preds)
                 t1 = c["teacher_top1"]
@@ -690,25 +788,91 @@ class Stage2aLearner:
         c_weights = torch.tensor(c_weight_list, dtype=torch.float32,
                                   device=self._device) if c_weight_list else None
 
+        # CQ-0256: semantic aux targets for PPO
+        d_term_cls = d_yaku_mh = d_is_winner = None
+        c_term_cls = c_yaku_mh = c_is_winner = None
+        if self._semantic_aux_enabled:
+            from mahjong_rl.outcome_vocab import (
+                terminal_label_to_class, yaku_ids_to_multihot, NUM_YAKU)
+            if discard_samples:
+                d_term_cls = torch.tensor(
+                    [terminal_label_to_class(s.round_terminal_label)
+                     for s in discard_samples],
+                    dtype=torch.long, device=self._device)
+                d_yaku_mh = torch.tensor(
+                    [yaku_ids_to_multihot(s.eventual_win_yaku_ids)
+                     for s in discard_samples],
+                    dtype=torch.float32, device=self._device)
+                d_is_winner = torch.tensor(
+                    [1.0 if s.round_terminal_label in
+                     ("win", "win_menzen", "win_called") else 0.0
+                     for s in discard_samples],
+                    dtype=torch.float32, device=self._device)
+            if call_samples:
+                c_term_cls = torch.tensor(
+                    [terminal_label_to_class(s.round_terminal_label)
+                     for s in call_samples],
+                    dtype=torch.long, device=self._device)
+                c_yaku_mh = torch.tensor(
+                    [yaku_ids_to_multihot(s.eventual_win_yaku_ids)
+                     for s in call_samples],
+                    dtype=torch.float32, device=self._device)
+                c_is_winner = torch.tensor(
+                    [1.0 if s.round_terminal_label in
+                     ("win", "win_menzen", "win_called") else 0.0
+                     for s in call_samples],
+                    dtype=torch.float32, device=self._device)
+
+        # CQ-0268: terminal player-round weights for PPO
+        d_term_weights = c_term_weights = None
+        if self._semantic_aux_enabled:
+            if discard_samples:
+                d_term_weights = self._compute_terminal_weights(
+                    [s.episode_id for s in discard_samples],
+                    [s.round_id for s in discard_samples],
+                    [s.player_id for s in discard_samples],
+                    len(discard_samples), self._device)
+            if call_samples:
+                c_term_weights = self._compute_terminal_weights(
+                    [s.episode_id for s in call_samples],
+                    [s.round_id for s in call_samples],
+                    [s.player_id for s in call_samples],
+                    len(call_samples), self._device)
+
+        all_sem_tl: list[float] = []
+        all_sem_yl: list[float] = []
+
         for _ in range(epochs):
             if discard_samples:
-                pl, vl, ent, rats, akl = self._ppo_discard_epoch(
-                    discard_samples, d_ret, d_adv, d_weights)
+                pl, vl, ent, rats, akl, stl, syl = self._ppo_discard_epoch(
+                    discard_samples, d_ret, d_adv, d_weights,
+                    terminal_classes_t=d_term_cls,
+                    yaku_multihot_t=d_yaku_mh,
+                    is_winner_t=d_is_winner,
+                    terminal_weights_t=d_term_weights)
                 all_policy_losses.extend(pl)
                 all_value_losses.extend(vl)
                 all_entropies.extend(ent)
                 all_ratios.extend(rats)
                 all_anchor_kl_discard.extend(akl)
+                all_sem_tl.extend(stl)
+                all_sem_yl.extend(syl)
                 num_updates += len(pl)
 
             if call_samples:
-                pl, vl, ent, rats, akl = self._ppo_call_epoch(
-                    call_samples, c_ret, c_adv, c_weights)
+                pl, vl, ent, rats, akl, stl, syl = self._ppo_call_epoch(
+                    call_samples, c_ret, c_adv, c_weights,
+                    terminal_classes_t=c_term_cls,
+                    yaku_multihot_t=c_yaku_mh,
+                    is_winner_t=c_is_winner,
+                    terminal_weights_t=c_term_weights)
                 all_policy_losses.extend(pl)
                 all_value_losses.extend(vl)
                 all_entropies.extend(ent)
                 all_ratios.extend(rats)
                 all_anchor_kl_optional.extend(akl)
+                all_sem_tl.extend(stl)
+                all_sem_yl.extend(syl)
                 num_updates += len(pl)
 
         # diagnostics
@@ -757,6 +921,9 @@ class Stage2aLearner:
             "value_loss": float(np.mean(all_value_losses)) if all_value_losses else 0.0,
             "entropy": float(np.mean(all_entropies)) if all_entropies else 0.0,
             "num_updates": num_updates,
+            "semantic_aux_enabled": self._semantic_aux_enabled,
+            "terminal_loss": float(np.mean(all_sem_tl)) if all_sem_tl else None,
+            "yaku_loss": float(np.mean(all_sem_yl)) if all_sem_yl else None,
             "ppo_diag": ppo_diag,
         }
 
@@ -923,6 +1090,38 @@ class Stage2aLearner:
             return F.huber_loss(value, target, delta=self._huber_delta)
         return F.mse_loss(value, target)
 
+    def _compute_semantic_aux_loss(
+        self, semantic: dict | None,
+        terminal_targets: torch.Tensor,
+        yaku_targets: torch.Tensor,
+        is_winner: torch.Tensor,
+        terminal_weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, float, float]:
+        """CQ-0256/0268: semantic aux loss (terminal CE + winner-only yaku BCE)
+
+        terminal_weights: CQ-0268 player-round 正規化重み (optional)
+        """
+        if semantic is None or not self._semantic_aux_enabled:
+            z = torch.tensor(0.0, device=self._device)
+            return z, 0.0, 0.0
+        # CQ-0268: terminal CE with player-round weights
+        tl_per = F.cross_entropy(
+            semantic["terminal_logits"], terminal_targets, reduction="none")
+        if terminal_weights is not None:
+            tl = (tl_per * terminal_weights).sum()
+        else:
+            tl = tl_per.mean()
+        # yaku: winner-only BCE (unchanged)
+        yl_per = F.binary_cross_entropy_with_logits(
+            semantic["yaku_logits"], yaku_targets, reduction="none")
+        mask = is_winner.unsqueeze(-1)  # (B, 1)
+        if mask.sum() > 0:
+            yl = (yl_per * mask).sum() / mask.sum() / yl_per.size(-1)
+        else:
+            yl = torch.tensor(0.0, device=self._device)
+        total = self._terminal_loss_coef * tl + self._yaku_loss_coef * yl
+        return total, tl.item(), yl.item()
+
     def _compute_value_loss_per_sample(self, value: torch.Tensor,
                                         target: torch.Tensor) -> torch.Tensor:
         """per-sample value loss (reduction=none) for weighted mean"""
@@ -932,11 +1131,15 @@ class Stage2aLearner:
         return (value - target).pow(2)
 
     def _ppo_discard_epoch(self, samples, returns_t, advantages_t,
-                           weights_t=None):
+                           weights_t=None,
+                           terminal_classes_t=None, yaku_multihot_t=None,
+                           is_winner_t=None, terminal_weights_t=None):
         """discard PPO の 1 epoch (CQ-0249: weighted mean)"""
         policy_losses, value_losses, entropies = [], [], []
         all_ratios = []
         _anchor_kls: list[float] = []
+        _sem_tl: list[float] = []
+        _sem_yl: list[float] = []
         n = len(samples)
         indices = np.random.permutation(n)
 
@@ -994,6 +1197,17 @@ class Stage2aLearner:
                 anchor_kl, akl_val = self._compute_anchor_kl_discard(obs, masks, out)
                 loss = loss + self._anchor_coef * anchor_kl
 
+            # CQ-0256/0268: semantic aux loss with terminal weights
+            if self._semantic_aux_enabled and terminal_classes_t is not None:
+                tw = terminal_weights_t[idx_t] if terminal_weights_t is not None else None
+                sa_loss, tl_v, yl_v = self._compute_semantic_aux_loss(
+                    out.semantic, terminal_classes_t[idx_t],
+                    yaku_multihot_t[idx_t], is_winner_t[idx_t],
+                    terminal_weights=tw)
+                loss = loss + sa_loss
+                _sem_tl.append(tl_v)
+                _sem_yl.append(yl_v)
+
             self._optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self._model.parameters(), self._max_grad_norm)
@@ -1006,14 +1220,19 @@ class Stage2aLearner:
             if self._anchor_enabled and self._anchor_model is not None:
                 _anchor_kls.append(akl_val)
 
-        return policy_losses, value_losses, entropies, all_ratios, _anchor_kls
+        return (policy_losses, value_losses, entropies, all_ratios,
+                _anchor_kls, _sem_tl, _sem_yl)
 
     def _ppo_call_epoch(self, samples, returns_t, advantages_t,
-                        weights_t=None):
+                        weights_t=None,
+                        terminal_classes_t=None, yaku_multihot_t=None,
+                        is_winner_t=None, terminal_weights_t=None):
         """optional PPO の 1 epoch (CQ-0249: weighted mean)"""
         policy_losses, value_losses, entropies = [], [], []
         all_ratios = []
         _anchor_kls: list[float] = []
+        _sem_tl: list[float] = []
+        _sem_yl: list[float] = []
         max_cands = max(s.candidate_count for s in samples)
         n = len(samples)
         indices = np.random.permutation(n)
@@ -1083,6 +1302,17 @@ class Stage2aLearner:
                     response_context=rc_t)
                 loss = loss + self._anchor_coef * anchor_kl
 
+            # CQ-0256/0268: semantic aux loss with terminal weights
+            if self._semantic_aux_enabled and terminal_classes_t is not None:
+                tw = terminal_weights_t[idx_t] if terminal_weights_t is not None else None
+                sa_loss, tl_v, yl_v = self._compute_semantic_aux_loss(
+                    out.semantic, terminal_classes_t[idx_t],
+                    yaku_multihot_t[idx_t], is_winner_t[idx_t],
+                    terminal_weights=tw)
+                loss = loss + sa_loss
+                _sem_tl.append(tl_v)
+                _sem_yl.append(yl_v)
+
             self._optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self._model.parameters(), self._max_grad_norm)
@@ -1095,4 +1325,5 @@ class Stage2aLearner:
             if self._anchor_enabled and self._anchor_model is not None:
                 _anchor_kls.append(akl_val)
 
-        return policy_losses, value_losses, entropies, all_ratios, _anchor_kls
+        return (policy_losses, value_losses, entropies, all_ratios,
+                _anchor_kls, _sem_tl, _sem_yl)

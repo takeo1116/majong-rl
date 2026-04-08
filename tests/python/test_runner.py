@@ -373,6 +373,54 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="バリデーションエラー"):
             runner.run()
 
+    def test_semantic_aux_model_only_error(self):
+        """CQ-0257: model.semantic_aux.enabled=true, training 側 false でエラー"""
+        config = _make_minimal_config()
+        config.experiment["stage"] = "stage2a"
+        config.model["semantic_aux"] = {"enabled": True}
+        # training.semantic_aux は未設定 (= enabled: false)
+        runner = Stage1Runner(config=config, base_dir=Path("/tmp"))
+        errors = runner.validate_config()
+        assert any("model.semantic_aux.enabled=true" in e for e in errors)
+
+    def test_semantic_aux_training_only_error(self):
+        """CQ-0257: training.semantic_aux.enabled=true, model 側 false でエラー"""
+        config = _make_minimal_config()
+        config.experiment["stage"] = "stage2a"
+        config.training["semantic_aux"] = {"enabled": True}
+        # model.semantic_aux は未設定 (= enabled: false)
+        runner = Stage1Runner(config=config, base_dir=Path("/tmp"))
+        errors = runner.validate_config()
+        assert any("training.semantic_aux.enabled=true" in e for e in errors)
+
+    def test_semantic_aux_both_enabled_ok(self):
+        """CQ-0257: 両方 enabled なら OK"""
+        config = _make_minimal_config()
+        config.experiment["stage"] = "stage2a"
+        config.model["semantic_aux"] = {"enabled": True}
+        config.training["semantic_aux"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=Path("/tmp"))
+        errors = runner.validate_config()
+        assert not any("semantic_aux" in e for e in errors)
+
+    def test_semantic_aux_both_disabled_ok(self):
+        """CQ-0257: 両方 disabled なら OK"""
+        config = _make_minimal_config()
+        config.experiment["stage"] = "stage2a"
+        # semantic_aux 設定なし → both disabled
+        runner = Stage1Runner(config=config, base_dir=Path("/tmp"))
+        errors = runner.validate_config()
+        assert not any("semantic_aux" in e for e in errors)
+
+    def test_semantic_aux_stage1_ignored(self):
+        """CQ-0257: Stage1 では semantic_aux 不一致を無視"""
+        config = _make_minimal_config()
+        # stage=1 (default)
+        config.model["semantic_aux"] = {"enabled": True}
+        runner = Stage1Runner(config=config, base_dir=Path("/tmp"))
+        errors = runner.validate_config()
+        assert not any("semantic_aux" in e for e in errors)
+
 
 @pytest.mark.slow
 class TestPhaseStats:
@@ -2345,7 +2393,7 @@ class TestShantenHintIntegration:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("shanten_hint") is True
-        assert ef.get("input_dim") == 489  # full + 34
+        assert ef.get("input_dim") == 501  # full(467) + 34
 
         # notes に encoder 情報が含まれる (CQ-0121)
         notes = (run_dir / "notes.md").read_text()
@@ -2364,7 +2412,7 @@ class TestShantenHintIntegration:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("shanten_hint") is False
-        assert ef.get("input_dim") == 455  # full
+        assert ef.get("input_dim") == 467  # full (CQ-0264: +4 menzen)
 
 
 @pytest.mark.smoke
@@ -2907,7 +2955,7 @@ class TestEncoderFeatureWiring:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("discard_ukeire_hint") is True
-        assert ef.get("input_dim") == 489  # full(455) + 34
+        assert ef.get("input_dim") == 501  # full(467) + 34
 
     def test_current_shanten_on(self, tmp_path: Path):
         """current_shanten=on で run 完走し summary に記録される"""
@@ -2923,7 +2971,7 @@ class TestEncoderFeatureWiring:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("current_shanten") is True
-        assert ef.get("input_dim") == 456  # full(455) + 1
+        assert ef.get("input_dim") == 468  # full(467) + 1
 
     def test_shape_hint_on(self, tmp_path: Path):
         """shape_hint=on で run 完走し summary に記録される"""
@@ -2939,7 +2987,7 @@ class TestEncoderFeatureWiring:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("shape_hint") is True
-        assert ef.get("input_dim") == 521  # full(455) + 66
+        assert ef.get("input_dim") == 533  # full(467) + 66
 
     def test_all_new_features_on(self, tmp_path: Path):
         """全新オプション有効で run 完走"""
@@ -2959,8 +3007,8 @@ class TestEncoderFeatureWiring:
         assert ef.get("discard_ukeire_hint") is True
         assert ef.get("current_shanten") is True
         assert ef.get("shape_hint") is True
-        # full(455) + 34 + 1 + 66 = 556
-        assert ef.get("input_dim") == 556
+        # full(467) + 34 + 1 + 66 = 560
+        assert ef.get("input_dim") == 568
 
     def test_default_off_backward_compat(self, tmp_path: Path):
         """新オプション既定 off で従来の次元を維持"""
@@ -2978,7 +3026,7 @@ class TestEncoderFeatureWiring:
         assert ef.get("current_shanten") is False
         assert ef.get("shape_hint") is False
         assert ef.get("turn_context") is False
-        assert ef.get("input_dim") == 455
+        assert ef.get("input_dim") == 467  # CQ-0267: +4 menzen
 
     def test_turn_context_on(self, tmp_path: Path):
         """turn_context=on で run 完走し summary に記録される (CQ-0177)"""
@@ -2994,7 +3042,7 @@ class TestEncoderFeatureWiring:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("turn_context") is True
-        assert ef.get("input_dim") == 459  # full(455) + 4
+        assert ef.get("input_dim") == 471  # full(467) + 4
 
 
 @pytest.mark.smoke

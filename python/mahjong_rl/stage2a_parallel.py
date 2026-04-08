@@ -74,7 +74,11 @@ def _stage2a_selfplay_worker_fn(
         model = None
         if model_state_path:
             from mahjong_rl.models.stage2a_model import Stage2aModel
-            input_dim = int(np.prod(enc.metadata().output_shape))
+            meta = enc.metadata()
+            input_dim = int(np.prod(meta.output_shape))
+            hint_ranges = {s: meta.feature_ranges[s]
+                           for s in ("shanten_hint", "discard_ukeire_hint")
+                           if s in meta.feature_ranges}
             model = Stage2aModel(
                 input_dim=input_dim,
                 discard_hidden_dims=model_config.get("discard_hidden_dims", [256, 128]),
@@ -83,6 +87,8 @@ def _stage2a_selfplay_worker_fn(
                 value_hidden_dims=model_config.get("value_hidden_dims", [128, 64]),
                 candidate_dim=model_config.get("candidate_dim", 16),
                 optional_scorer_hidden=model_config.get("optional_scorer_hidden", 32),
+                semantic_aux_config=model_config.get("semantic_aux"),
+                direct_hint_ranges=hint_ranges if hint_ranges else None,
             )
             sd = torch.load(model_state_path, map_location="cpu", weights_only=True)
             model.load_state_dict(sd)
@@ -200,7 +206,11 @@ def _stage2a_eval_worker_fn(
             danger_mask=_parse_encoder_flag(encoder_config, "danger_mask"),
         )
 
-        input_dim = int(np.prod(enc.metadata().output_shape))
+        meta = enc.metadata()
+        input_dim = int(np.prod(meta.output_shape))
+        hint_ranges = {s: meta.feature_ranges[s]
+                       for s in ("shanten_hint", "discard_ukeire_hint")
+                       if s in meta.feature_ranges}
         model = Stage2aModel(
             input_dim=input_dim,
             discard_hidden_dims=model_config.get("discard_hidden_dims", [256, 128]),
@@ -209,6 +219,8 @@ def _stage2a_eval_worker_fn(
             value_hidden_dims=model_config.get("value_hidden_dims", [128, 64]),
             candidate_dim=model_config.get("candidate_dim", 16),
             optional_scorer_hidden=model_config.get("optional_scorer_hidden", 32),
+            semantic_aux_config=model_config.get("semantic_aux"),
+            direct_hint_ranges=hint_ranges if hint_ranges else None,
         )
         sd = torch.load(model_state_path, map_location="cpu", weights_only=True)
         model.load_state_dict(sd)

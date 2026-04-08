@@ -630,6 +630,33 @@ class Stage1Runner:
             errors.append(
                 f"profiling.enabled は bool で指定してください: {prof_enabled}")
 
+        # CQ-0257: Stage2a semantic_aux 整合性チェック
+        stage = cfg.experiment.get("stage", 1)
+        if str(stage) == "stage2a":
+            model_sa = cfg.model.get("semantic_aux", {})
+            train_sa = cfg.training.get("semantic_aux", {})
+            model_sa_enabled = model_sa.get("enabled", False)
+            train_sa_enabled = train_sa.get("enabled", False)
+            if model_sa_enabled and not train_sa_enabled:
+                errors.append(
+                    "model.semantic_aux.enabled=true だが"
+                    " training.semantic_aux.enabled=false です。"
+                    " 両方揃えてください。")
+            if not model_sa_enabled and train_sa_enabled:
+                errors.append(
+                    "training.semantic_aux.enabled=true だが"
+                    " model.semantic_aux.enabled=false です。"
+                    " 両方揃えてください。")
+
+            # CQ-0265: Stage2a requires shanten_hint / discard_ukeire_hint
+            enc_cfg = cfg.feature_encoder
+            if not _parse_encoder_flag(enc_cfg, "shanten_hint"):
+                errors.append(
+                    "Stage2a では feature_encoder.shanten_hint=true が必須です。")
+            if not _parse_encoder_flag(enc_cfg, "discard_ukeire_hint"):
+                errors.append(
+                    "Stage2a では feature_encoder.discard_ukeire_hint=true が必須です。")
+
         return errors
 
     def run(self) -> dict:
@@ -1559,8 +1586,14 @@ class Stage1Runner:
     def _create_stage2a_model(self, encoder):
         """Stage2a model factory"""
         from mahjong_rl.models.stage2a_model import Stage2aModel
-        input_dim = int(np.prod(encoder.metadata().output_shape))
+        meta = encoder.metadata()
+        input_dim = int(np.prod(meta.output_shape))
         mc = self._config.model
+        # CQ-0265: extract direct hint ranges for discard branch
+        hint_ranges = {}
+        for src in ("shanten_hint", "discard_ukeire_hint"):
+            if src in meta.feature_ranges:
+                hint_ranges[src] = meta.feature_ranges[src]
         return Stage2aModel(
             input_dim=input_dim,
             discard_hidden_dims=mc.get("discard_hidden_dims", [256, 128]),
@@ -1569,6 +1602,8 @@ class Stage1Runner:
             value_hidden_dims=mc.get("value_hidden_dims", [128, 64]),
             candidate_dim=mc.get("candidate_dim", 16),
             optional_scorer_hidden=mc.get("optional_scorer_hidden", 32),
+            semantic_aux_config=mc.get("semantic_aux"),
+            direct_hint_ranges=hint_ranges if hint_ranges else None,
         )
 
     def _run_imitation_stage2a(self, run_dir: Path, encoder, profiler=None) -> dict:
@@ -1649,6 +1684,21 @@ class Stage1Runner:
         # Store model for later phases
         self._stage2a_model = s2_model
 
+        # CQ-0254: imitation eval
+        imi_eval = self._config.training.get("imitation_eval", {})
+        imitation_eval_metrics = None
+        if imi_eval.get("enabled", False):
+            logger.info("  Stage2a imitation eval start")
+            imitation_eval_metrics = self._run_eval_stage2a(
+                run_dir, encoder,
+                num_matches_override=imi_eval.get("num_matches"),
+                num_workers_override=imi_eval.get("num_workers"),
+                seed_start_override=imi_eval.get("seed_start"),
+                eval_subdir="imitation_eval",
+            )
+            logger.info(f"  Stage2a imitation eval: "
+                         f"avg_rank={imitation_eval_metrics.get('avg_rank', 0):.2f}")
+
         return {
             "stage": "stage2a",
             "total_steps": gen_stats["total_steps"],
@@ -1656,6 +1706,7 @@ class Stage1Runner:
             "call_count": gen_stats["call_count"],
             "train_metrics": train_metrics,
             "imitation_epochs": imi_epochs,
+            "imitation_eval": imitation_eval_metrics,
         }
 
     def _run_imitation_stage2a_multi_chunk(self, run_dir, encoder, mci, profiler=None):
@@ -1731,10 +1782,29 @@ class Stage1Runner:
                          f"(train={train_sec:.1f}s diag={diag_sec:.1f}s) "
                          f"steps={gen['total_steps']} loss={tm.get('policy_loss', 0):.4f} "
                          f"total={chunk_sec:.1f}s")
+            # CQ-0254: chunk eval
+            chunk_eval = None
+            imi_eval = self._config.training.get("imitation_eval", {})
+            if imi_eval.get("enabled", False) and imi_eval.get("eval_each_chunk", False):
+                self._stage2a_model = s2_model
+                logger.info(f"  chunk {ci}: eval start")
+                chunk_eval = self._run_eval_stage2a(
+                    run_dir, encoder,
+                    seed_offset=ci * 200,
+                    num_matches_override=imi_eval.get("num_matches"),
+                    num_workers_override=imi_eval.get("num_workers"),
+                    seed_start_override=imi_eval.get("seed_start"),
+                    eval_subdir=f"imitation/chunk_{ci:02d}/eval",
+                )
+                logger.info(f"  chunk {ci}: eval avg_rank="
+                             f"{chunk_eval.get('avg_rank', 0):.2f}")
+
+            chunk_sec = _time.perf_counter() - chunk_t0
             chunks_data.append({
                 "chunk_index": ci,
                 "gen_stats": gen,
                 "train_metrics": tm,
+                "imitation_eval": chunk_eval,
                 "timing": {
                     "data_generation_sec": round(dg_sec, 3),
                     "learner_sec": round(train_sec, 3),
@@ -1748,6 +1818,22 @@ class Stage1Runner:
         torch.save(s2_model.state_dict(), ckpt_dir / "checkpoint_imitation.pt")
         self._stage2a_model = s2_model
 
+        # CQ-0254: final imitation eval (multi-chunk 完了後)
+        imitation_eval_metrics = None
+        imi_eval = self._config.training.get("imitation_eval", {})
+        if imi_eval.get("enabled", False):
+            self._stage2a_model = s2_model
+            logger.info("  Stage2a imitation eval (final) start")
+            imitation_eval_metrics = self._run_eval_stage2a(
+                run_dir, encoder,
+                num_matches_override=imi_eval.get("num_matches"),
+                num_workers_override=imi_eval.get("num_workers"),
+                seed_start_override=imi_eval.get("seed_start"),
+                eval_subdir="imitation_eval",
+            )
+            logger.info(f"  Stage2a imitation eval (final): "
+                         f"avg_rank={imitation_eval_metrics.get('avg_rank', 0):.2f}")
+
         last_tm = chunks_data[-1]["train_metrics"] if chunks_data else {}
         return {
             "stage": "stage2a",
@@ -1756,6 +1842,7 @@ class Stage1Runner:
             "call_count": sum(c["gen_stats"]["call_count"] for c in chunks_data),
             "train_metrics": last_tm,
             "imitation_epochs": imi_epochs,
+            "imitation_eval": imitation_eval_metrics,
             "multi_chunk_imitation": {"enabled": True, "num_chunks": num_chunks,
                                        "chunks": chunks_data},
         }
@@ -2002,23 +2089,31 @@ class Stage1Runner:
         return last_train_metrics, cycles_data
 
     def _run_eval_stage2a(self, run_dir: Path, encoder,
-                          seed_offset: int = 0) -> dict:
-        """CQ-0230/0235: Stage2a deterministic evaluation (single / parallel)"""
+                          seed_offset: int = 0,
+                          num_matches_override: int | None = None,
+                          num_workers_override: int | None = None,
+                          seed_start_override: int | None = None,
+                          eval_subdir: str = "eval",
+                          ) -> dict:
+        """CQ-0230/0235/0254: Stage2a deterministic evaluation"""
         eval_cfg = self._config.evaluation
-        num_matches = eval_cfg.get("num_matches", 100)
+        num_matches = (num_matches_override if num_matches_override is not None
+                       else eval_cfg.get("num_matches", 100))
         if num_matches <= 0:
             return {"skipped": True}
 
         obs_mode = self._config.experiment.get("observation_mode", "full")
         eval_mode = eval_cfg.get("mode", eval_cfg.get("eval_mode", "single"))
-        seed_start = eval_cfg.get("seed_start", 10000) + seed_offset
-        num_workers = eval_cfg.get("num_workers", 1)
+        seed_start = ((seed_start_override if seed_start_override is not None
+                        else eval_cfg.get("seed_start", 10000)) + seed_offset)
+        num_workers = (num_workers_override if num_workers_override is not None
+                       else eval_cfg.get("num_workers", 1))
         s2_model = getattr(self, "_stage2a_model", None)
 
         if num_workers > 1 and s2_model is not None:
             from mahjong_rl.stage2a_parallel import run_stage2a_eval_parallel
             # model を一時保存
-            eval_dir = run_dir / "eval"
+            eval_dir = run_dir / eval_subdir
             eval_dir.mkdir(parents=True, exist_ok=True)
             model_path = str(eval_dir / "_eval_model.pt")
             sd = {k: v.cpu() for k, v in s2_model.state_dict().items()}
@@ -2062,7 +2157,7 @@ class Stage1Runner:
                 )
 
         # eval 成果物を保存
-        eval_dir = run_dir / "eval"
+        eval_dir = run_dir / eval_subdir
         eval_dir.mkdir(parents=True, exist_ok=True)
         import json as _json
         with open(eval_dir / "metrics.json", "w") as f:
@@ -2822,6 +2917,10 @@ class Stage1Runner:
             chunks = imi.get("chunks")
             if chunks is not None:
                 imi_stats["chunks"] = chunks
+            # CQ-0254: imitation eval
+            imi_eval = imi.get("imitation_eval")
+            if imi_eval is not None:
+                imi_stats["imitation_eval"] = imi_eval
             phase_stats["imitation"] = imi_stats
         if "train_metrics" in result:
             tm = result["train_metrics"]
@@ -3069,6 +3168,14 @@ class Stage1Runner:
         artifacts["eval"] = {
             "exists": eval_dir.exists() and any(eval_dir.iterdir()) if eval_dir.exists() else False,
             "path": "eval",
+        }
+
+        # CQ-0254: imitation eval
+        imi_eval_dir = run_dir / "imitation_eval"
+        artifacts["imitation_eval"] = {
+            "exists": (imi_eval_dir.exists()
+                       and any(imi_eval_dir.iterdir()) if imi_eval_dir.exists() else False),
+            "path": "imitation_eval",
         }
 
         # config fingerprint

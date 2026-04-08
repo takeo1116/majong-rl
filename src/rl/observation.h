@@ -41,6 +41,7 @@ struct PartialObservation {
     PlayerId current_player = 0;
     Phase phase = Phase::StartRound;
     std::vector<TileId> dora_indicators;
+    int remaining_draws = 0;
 };
 
 // 完全観測（デバッグ・学習補助・探索補助用）
@@ -50,6 +51,8 @@ struct FullObservation {
     std::array<std::vector<Meld>, kNumPlayers> melds;
     std::array<std::vector<DiscardInfo>, kNumPlayers> discards;
     std::array<int32_t, kNumPlayers> scores = {};
+    std::array<bool, kNumPlayers> riichi_declared = {};
+    std::array<bool, kNumPlayers> menzen_flags = {};
 
     // 山・王牌
     std::array<TileId, kNumTiles> wall = {};
@@ -66,6 +69,7 @@ struct FullObservation {
     uint8_t kyotaku = 0;
     uint8_t turn_number = 0;
     RoundEndReason end_reason = RoundEndReason::None;
+    int remaining_draws = 0;
 
     // 半荘情報
     MatchState match_state;

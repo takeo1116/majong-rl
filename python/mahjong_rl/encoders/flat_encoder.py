@@ -69,8 +69,10 @@ class FlatFeatureEncoder(FeatureEncoder):
 
     # Partial 特徴量の次元
     _PARTIAL_DIM = 34 + 4 * 34 + 4 * 34 + 34 + 5 + 4 + 4  # 353
-    # Full 追加分 (自家手牌34 → 4家手牌136 = +102)
-    _FULL_EXTRA_DIM = 3 * 34  # 102
+    # Full 追加分 (自家手牌34 → 4家手牌136 = +102) + menzen(4)
+    _FULL_EXTRA_DIM = 3 * 34 + 4  # 106
+    # CQ-0264: menzen flags の次元
+    _MENZEN_DIM = 4
     # シャンテン補助特徴の次元 (CQ-0119)
     _SHANTEN_HINT_DIM = 34
     # 打牌候補受け入れ枚数の次元 (CQ-0168)
@@ -81,6 +83,18 @@ class FlatFeatureEncoder(FeatureEncoder):
     _SHAPE_HINT_DIM = _CHI_KIND_SIZE + _SERIAL_PAIR_KIND_SIZE + _INSIDE_WAIT_KIND_SIZE  # 66
     # turn_context の次元 (CQ-0175): turn_progress(1) + bucket_one_hot(3) = 4
     _TURN_CONTEXT_DIM = 4
+    # CQ-0267: self_tenpai_flag + remaining_draws_norm
+    _SELF_TENPAI_FLAG_DIM = 1
+    _REMAINING_DRAWS_DIM = 1
+    _MAX_REMAINING_DRAWS = 70.0
+    # CQ-0270: tile presence flags
+    _TILE_PRESENCE_DIM = 6
+    _HONOR_INDICES = list(range(27, 34))
+    _TERMINAL_INDICES = [0, 8, 9, 17, 18, 26]
+    _SIMPLE_INDICES = [i for i in range(27) if i % 9 not in (0, 8)]
+    _MAN_INDICES = list(range(0, 9))
+    _PIN_INDICES = list(range(9, 18))
+    _SOU_INDICES = list(range(18, 27))
     # CQ-0213: opponent 防御特徴
     _OPPONENT_SHANTEN_DIM = 3    # 相対席3家 × shanten/8.0
     _OPPONENT_TENPAI_DIM = 3     # 相対席3家 × 0/1
@@ -158,14 +172,30 @@ class FlatFeatureEncoder(FeatureEncoder):
         if self._current_shanten_input:
             ranges["current_shanten"] = (dim, dim + self._CURRENT_SHANTEN_DIM)
             dim += self._CURRENT_SHANTEN_DIM
+        # CQ-0267: self_tenpai_flag + remaining_draws_norm (always on)
+        ranges["self_tenpai_flag"] = (dim, dim + self._SELF_TENPAI_FLAG_DIM)
+        dim += self._SELF_TENPAI_FLAG_DIM
+        ranges["remaining_draws_norm"] = (dim, dim + self._REMAINING_DRAWS_DIM)
+        dim += self._REMAINING_DRAWS_DIM
+        # CQ-0270: tile presence flags (always on)
+        ranges["tile_presence_flags"] = (dim, dim + self._TILE_PRESENCE_DIM)
+        dim += self._TILE_PRESENCE_DIM
         if self._shape_hint:
             ranges["shape_hint"] = (dim, dim + self._SHAPE_HINT_DIM)
             dim += self._SHAPE_HINT_DIM
         if self._turn_context:
             ranges["turn_context"] = (dim, dim + self._TURN_CONTEXT_DIM)
             dim += self._TURN_CONTEXT_DIM
-        # CQ-0213: full-only features — Partial mode では含めない
+        # CQ-0264: riichi / menzen are part of base_dim for full mode
         _is_full = self._observation_mode != "partial"
+        _RIICHI_DIM = 4
+        if _is_full:
+            # riichi: 直前は scores(4), menzen: riichi の直後
+            riichi_start = base_dim - self._MENZEN_DIM - _RIICHI_DIM
+            ranges["riichi"] = (riichi_start, riichi_start + _RIICHI_DIM)
+            ranges["menzen"] = (base_dim - self._MENZEN_DIM, base_dim)
+
+        # CQ-0213: full-only features — Partial mode では含めない
         if self._opponent_current_shanten and _is_full:
             ranges["opponent_current_shanten"] = (dim, dim + self._OPPONENT_SHANTEN_DIM)
             dim += self._OPPONENT_SHANTEN_DIM
@@ -197,10 +227,8 @@ class FlatFeatureEncoder(FeatureEncoder):
         for tid in obs.hand:
             hand_counts[tid // 4] += 1.0
         features.append(hand_counts)
-        # 追加特徴量用にコピーを保持
-        _need_hand_copy = (self._shanten_hint or self._discard_ukeire_hint
-                           or self._current_shanten_input or self._shape_hint)
-        hand_counts_for_hint = hand_counts.copy() if _need_hand_copy else None
+        # 追加特徴量用にコピーを保持 (CQ-0267: self_tenpai_flag で常に必要)
+        hand_counts_for_hint = hand_counts.copy()
 
         # 4家河
         for p in range(NUM_PLAYERS):
@@ -249,10 +277,13 @@ class FlatFeatureEncoder(FeatureEncoder):
         )
         features.append(riichi)
 
+        # CQ-0260/0267: self の open hand meld count
+        meld_count = len(obs.melds)
+
         # シャンテン補助特徴 + 打牌候補受け入れ枚数 (CQ-0119, CQ-0168, CQ-0172)
         if self._shanten_hint or self._discard_ukeire_hint:
             hint, ukeire = self._compute_hint_and_ukeire(
-                hand_counts_for_hint, legal_mask)
+                hand_counts_for_hint, legal_mask, meld_count=meld_count)
             if self._shanten_hint:
                 features.append(hint)
             if self._discard_ukeire_hint:
@@ -260,7 +291,16 @@ class FlatFeatureEncoder(FeatureEncoder):
 
         # policy 用 current_shanten (CQ-0169)
         if self._current_shanten_input:
-            features.append(self._compute_current_shanten(hand_counts_for_hint))
+            features.append(self._compute_current_shanten(
+                hand_counts_for_hint, meld_count=meld_count))
+
+        # CQ-0267: self_tenpai_flag + remaining_draws_norm (always on)
+        features.append(self._compute_self_tenpai_flag(
+            hand_counts_for_hint, meld_count=meld_count))
+        features.append(self._compute_remaining_draws_norm(obs.remaining_draws))
+
+        # CQ-0270: tile presence flags (always on, self = hand + melds)
+        features.append(self._compute_tile_presence_flags(obs.hand, obs.melds))
 
         # 手牌形状ヒント (CQ-0170)
         if self._shape_hint:
@@ -279,30 +319,34 @@ class FlatFeatureEncoder(FeatureEncoder):
         # CQ-0246: scratch buffer 再利用
         _s = self._scratch_hand  # reusable (34,) float32
 
-        # 全4家手牌
-        _need_current = (self._shanten_hint or self._discard_ukeire_hint
-                         or self._current_shanten_input or self._shape_hint)
+        # CQ-0263: actor-relative seat order
+        # 0=self, 1=shimo, 2=toimen, 3=kamicha
         current_player = obs.current_player
+        seat_order = [(current_player + offset) % NUM_PLAYERS
+                      for offset in range(NUM_PLAYERS)]
+
+        # 全4家手牌 (actor-relative 順)
+        # CQ-0267: self_tenpai_flag で常に current player の hand_counts が必要
         hand_counts_current = None
-        for p in range(NUM_PLAYERS):
+        for p in seat_order:
             _s.fill(0)
             for tid in obs.hands[p]:
                 _s[tid // 4] += 1.0
             features.append(_s.copy())
-            if p == current_player and _need_current:
+            if p == current_player:
                 hand_counts_current = _s.copy()
 
-        # 4家河
+        # 4家河 (actor-relative 順)
         _sd = self._scratch_discard
-        for p in range(NUM_PLAYERS):
+        for p in seat_order:
             _sd.fill(0)
             for di in obs.discards[p]:
                 _sd[di.tile // 4] += 1.0
             features.append(_sd.copy())
 
-        # 4家副露
+        # 4家副露 (actor-relative 順)
         _sm = self._scratch_meld
-        for p in range(NUM_PLAYERS):
+        for p in seat_order:
             _sm.fill(0)
             for meld in obs.melds[p]:
                 for i in range(meld.tile_count):
@@ -319,32 +363,43 @@ class FlatFeatureEncoder(FeatureEncoder):
         features.append(_sdr.copy())
 
         # スカラー特徴量
+        # CQ-0263: dealer を actor-relative に変換
+        relative_dealer = (obs.dealer - current_player) % NUM_PLAYERS
         scalars = np.array([
             obs.round_number / 8.0,
-            obs.dealer / 3.0,
+            relative_dealer / 3.0,
             obs.honba / 10.0,
             obs.kyotaku / 10.0,
             obs.turn_number / 18.0,
         ], dtype=np.float32)
         features.append(scalars)
 
-        # スコア
+        # スコア (actor-relative 順)
         scores = np.array(
-            [obs.scores[p] / 100000.0 for p in range(NUM_PLAYERS)],
+            [obs.scores[p] / 100000.0 for p in seat_order],
             dtype=np.float32,
         )
         features.append(scores)
 
-        # 立直宣言 (FullObservation では match_state から取得可能だが簡易版)
-        # FullObservation には riichi_declared がないため players から取得
-        # → FullObservation には直接含まれない → 0埋め
-        riichi = np.zeros(NUM_PLAYERS, dtype=np.float32)
+        # 立直宣言 (actor-relative 順, CQ-0264: 実値を使用)
+        riichi = np.array(
+            [1.0 if obs.riichi_declared[p] else 0.0 for p in seat_order],
+            dtype=np.float32)
         features.append(riichi)
+
+        # CQ-0264: menzen flags (actor-relative 順, full-only)
+        menzen = np.array(
+            [1.0 if obs.menzen_flags[p] else 0.0 for p in seat_order],
+            dtype=np.float32)
+        features.append(menzen)
+
+        # CQ-0260: open hand meld count for current player
+        meld_count = len(obs.melds[current_player])
 
         # シャンテン補助特徴 + 打牌候補受け入れ枚数 (CQ-0119, CQ-0168, CQ-0172)
         if self._shanten_hint or self._discard_ukeire_hint:
             hint, ukeire = self._compute_hint_and_ukeire(
-                hand_counts_current, legal_mask)
+                hand_counts_current, legal_mask, meld_count=meld_count)
             if self._shanten_hint:
                 features.append(hint)
             if self._discard_ukeire_hint:
@@ -352,7 +407,17 @@ class FlatFeatureEncoder(FeatureEncoder):
 
         # policy 用 current_shanten (CQ-0169)
         if self._current_shanten_input:
-            features.append(self._compute_current_shanten(hand_counts_current))
+            features.append(self._compute_current_shanten(
+                hand_counts_current, meld_count=meld_count))
+
+        # CQ-0267: self_tenpai_flag + remaining_draws_norm (always on)
+        features.append(self._compute_self_tenpai_flag(
+            hand_counts_current, meld_count=meld_count))
+        features.append(self._compute_remaining_draws_norm(obs.remaining_draws))
+
+        # CQ-0270: tile presence flags (always on, self = hand + melds)
+        features.append(self._compute_tile_presence_flags(
+            obs.hands[current_player], obs.melds[current_player]))
 
         # 手牌形状ヒント (CQ-0170)
         if self._shape_hint:
@@ -375,7 +440,8 @@ class FlatFeatureEncoder(FeatureEncoder):
                 for tid in obs.hands[seat]:
                     hc[tid // 4] += 1.0
                 opp_hand_counts.append(hc)
-                opp_shantens.append(compute_shanten(hc))
+                opp_mc = len(obs.melds[seat])
+                opp_shantens.append(compute_shanten(hc, meld_count=opp_mc))
 
             if self._opponent_current_shanten:
                 opp_sh = np.array(
@@ -390,14 +456,18 @@ class FlatFeatureEncoder(FeatureEncoder):
                 features.append(opp_tp)
 
             if self._danger_mask:
-                for hc, sh in zip(opp_hand_counts, opp_shantens):
-                    features.append(self._compute_danger_mask(hc, known_shanten=sh))
+                for idx_r, (hc, sh) in enumerate(zip(opp_hand_counts, opp_shantens)):
+                    opp_seat = rel_seats[idx_r]
+                    opp_mc_dm = len(obs.melds[opp_seat])
+                    features.append(self._compute_danger_mask(
+                        hc, known_shanten=sh, meld_count=opp_mc_dm))
 
         return np.concatenate(features)
 
     @staticmethod
     def _compute_danger_mask(opp_hand_counts: np.ndarray, *,
-                             known_shanten: int | None = None) -> np.ndarray:
+                             known_shanten: int | None = None,
+                             meld_count: int = 0) -> np.ndarray:
         """相手がテンパイ時に待ち牌を danger=1 にする (CQ-0213)
 
         テンパイでなければ全 0。テンパイなら各牌種について
@@ -406,10 +476,12 @@ class FlatFeatureEncoder(FeatureEncoder):
         Args:
             opp_hand_counts: 相手の手牌カウント (float32)
             known_shanten: 既に計算済みのシャンテン数 (再計算回避用)
+            meld_count: 相手の副露済み面子数 (CQ-0261)
         """
         from mahjong_rl.baseline.shanten import compute_shanten
         mask = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
-        sh = known_shanten if known_shanten is not None else compute_shanten(opp_hand_counts)
+        sh = known_shanten if known_shanten is not None else compute_shanten(
+            opp_hand_counts, meld_count=meld_count)
         if sh != 0:
             return mask
         # テンパイ: 待ち牌を探す
@@ -417,7 +489,7 @@ class FlatFeatureEncoder(FeatureEncoder):
             if opp_hand_counts[t] >= 4:
                 continue
             opp_hand_counts[t] += 1
-            if compute_shanten(opp_hand_counts) < 0:
+            if compute_shanten(opp_hand_counts, meld_count=meld_count) < 0:
                 mask[t] = 1.0
             opp_hand_counts[t] -= 1
         return mask
@@ -426,6 +498,7 @@ class FlatFeatureEncoder(FeatureEncoder):
     def _compute_hint_and_ukeire(
         hand_counts: np.ndarray,
         legal_mask: np.ndarray | None = None,
+        meld_count: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """shanten_hint と discard_ukeire_norm を一括計算する
 
@@ -436,14 +509,14 @@ class FlatFeatureEncoder(FeatureEncoder):
         Args:
             hand_counts: 34種の手牌カウント (float32)
             legal_mask: 合法手マスク (optional, discard_ukeire 用)
+            meld_count: 副露済み面子数 (CQ-0260)
 
         Returns:
             (shanten_sign[34], ukeire_norm[34])
         """
         if _HAS_CPP_ANALYZE:
             counts_list = hand_counts.astype(int).tolist()
-            # 1回の C++ 呼び出しで全候補の shanten_sign + acceptance を取得
-            result = _analyze_discards_cpp(counts_list, [1] * 34)
+            result = _analyze_discards_cpp(counts_list, [1] * 34, meld_count)
             hint = np.array(result["shanten_sign"], dtype=np.float32)
 
             # ukeire: acceptance を legal_mask で絞り、Python 側で再正規化
@@ -456,42 +529,35 @@ class FlatFeatureEncoder(FeatureEncoder):
             return hint, ukeire
         else:
             # Python fallback
-            hint = FlatFeatureEncoder._compute_shanten_hint(hand_counts.copy())
+            hint = FlatFeatureEncoder._compute_shanten_hint(
+                hand_counts.copy(), meld_count=meld_count)
             ukeire = FlatFeatureEncoder._compute_discard_ukeire(
-                hand_counts.copy(), legal_mask=legal_mask)
+                hand_counts.copy(), legal_mask=legal_mask,
+                meld_count=meld_count)
             return hint, ukeire
 
     @staticmethod
-    def _compute_shanten_hint(hand_counts: np.ndarray) -> np.ndarray:
+    def _compute_shanten_hint(hand_counts: np.ndarray,
+                               meld_count: int = 0) -> np.ndarray:
         """各打牌候補のシャンテン維持/悪化を計算する (CQ-0119, CQ-0123, CQ-0124)
 
         delta = shanten(手牌) - shanten(手牌 - t) の符号を返す。
 
-        運用値域 (現行 discard 評価):
-          0.0 = 維持（最適打牌候補）または手牌に存在しない牌種
-         -1.0 = 悪化（シャンテン数が増加する打牌）
-
-        +1 について:
-          shanten(n枚) <= shanten(n-1枚) の単調性により、1枚減らして改善する
-          ケースは数学的に発生しない。そのため現行の discard 評価では +1.0 は
-          出力されない（テストで不在を保証: test_improvement_never_occurs）。
-          ただし将来 draw 評価やツモ牌選択など異なる文脈で本関数を流用する
-          可能性に備え、delta > 0 分岐はガード節として残している。
-
         Args:
             hand_counts: 34種の手牌カウント (float32, 一時的に変更→復元)
+            meld_count: 副露済み面子数 (CQ-0261)
 
         Returns:
-            delta_shanten_sign[34]: 実質 {-1.0, 0.0} のみ（上記参照）
+            delta_shanten_sign[34]: 実質 {-1.0, 0.0} のみ
         """
         from mahjong_rl.baseline.shanten import compute_shanten
 
-        base = compute_shanten(hand_counts)
+        base = compute_shanten(hand_counts, meld_count=meld_count)
         hint = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
         for t in range(NUM_TILE_TYPES):
             if hand_counts[t] >= 1:
                 hand_counts[t] -= 1
-                after = compute_shanten(hand_counts)
+                after = compute_shanten(hand_counts, meld_count=meld_count)
                 hand_counts[t] += 1
                 delta = base - after  # 正=改善
                 # NOTE: delta > 0 は discard 文脈では発生しない（単調性）。
@@ -504,18 +570,14 @@ class FlatFeatureEncoder(FeatureEncoder):
 
     @staticmethod
     def _compute_discard_ukeire(hand_counts: np.ndarray, *,
-                                legal_mask: np.ndarray | None = None) -> np.ndarray:
+                                legal_mask: np.ndarray | None = None,
+                                meld_count: int = 0) -> np.ndarray:
         """各打牌候補の受け入れ枚数を計算し、局面内 max で正規化する (CQ-0168, CQ-0172)
-
-        手牌にある牌種のみ計算し、非合法候補は 0.0。
-        legal_mask が与えられた場合、mask が 0 の牌種も 0.0 にする。
-        正規化: acceptance / max_acceptance (max=0 なら全て 0.0)。
-        値域: [0, 1]
 
         Args:
             hand_counts: 34種の手牌カウント (float32, 一時的に変更→復元)
-            legal_mask: 合法手マスク (34次元, optional)。
-                与えられた場合 legal_mask[t] < 0.5 の牌種を 0.0 にする。
+            legal_mask: 合法手マスク (34次元, optional)
+            meld_count: 副露済み面子数 (CQ-0261)
 
         Returns:
             discard_ukeire_norm[34]: 正規化受け入れ枚数
@@ -526,20 +588,17 @@ class FlatFeatureEncoder(FeatureEncoder):
         for t in range(NUM_TILE_TYPES):
             if hand_counts[t] < 1:
                 continue
-            # legal_mask が指定されていて非合法なら skip (CQ-0172)
             if legal_mask is not None and legal_mask[t] < 0.5:
                 continue
-            # t を切った後のシャンテン数を計算
             hand_counts[t] -= 1
-            sh_after = compute_shanten(hand_counts)
-            # 受け入れ枚数: sh_after が下がる牌種の残り枚数合計
+            sh_after = compute_shanten(hand_counts, meld_count=meld_count)
             acceptance = 0
             for u in range(NUM_TILE_TYPES):
                 if hand_counts[u] >= 4:
                     continue
                 hand_counts[u] += 1
-                if compute_shanten(hand_counts) < sh_after:
-                    acceptance += 4 - int(hand_counts[u] - 1)  # 残り枚数概算
+                if compute_shanten(hand_counts, meld_count=meld_count) < sh_after:
+                    acceptance += 4 - int(hand_counts[u] - 1)
                 hand_counts[u] -= 1
             hand_counts[t] += 1
             raw[t] = float(acceptance)
@@ -550,19 +609,63 @@ class FlatFeatureEncoder(FeatureEncoder):
         return raw
 
     @staticmethod
-    def _compute_current_shanten(hand_counts: np.ndarray) -> np.ndarray:
+    def _compute_current_shanten(hand_counts: np.ndarray,
+                                  meld_count: int = 0) -> np.ndarray:
         """current_shanten / 8.0 を共通特徴として返す (CQ-0169)
 
         Args:
             hand_counts: 34種の手牌カウント (float32)
+            meld_count: 副露済み面子数 (CQ-0260)
 
         Returns:
             [current_shanten / 8.0]: shape=(1,), 値域 [0, 1]
         """
         from mahjong_rl.baseline.shanten import compute_shanten
 
-        sh = compute_shanten(hand_counts)
+        sh = compute_shanten(hand_counts, meld_count=meld_count)
         return np.array([sh / 8.0], dtype=np.float32)
+
+    @staticmethod
+    def _compute_self_tenpai_flag(hand_counts: np.ndarray,
+                                   meld_count: int = 0) -> np.ndarray:
+        """CQ-0267: self_tenpai_flag (shanten==0 なら 1.0)"""
+        from mahjong_rl.baseline.shanten import compute_shanten
+        sh = compute_shanten(hand_counts, meld_count=meld_count)
+        return np.array([1.0 if sh == 0 else 0.0], dtype=np.float32)
+
+    @staticmethod
+    def _compute_remaining_draws_norm(remaining_draws: int) -> np.ndarray:
+        """CQ-0267: remaining_draws / max で正規化 (終盤ほど小さい)"""
+        return np.array(
+            [remaining_draws / FlatFeatureEncoder._MAX_REMAINING_DRAWS],
+            dtype=np.float32)
+
+    @staticmethod
+    def _compute_tile_presence_flags(hand_tile_ids, melds) -> np.ndarray:
+        """CQ-0270: self tile-presence flags (hand + meld)
+
+        Returns:
+            (6,) float32: [has_honor, has_terminal, has_simple,
+                           has_man, has_pin, has_sou]
+        """
+        tile_types = set()
+        for tid in hand_tile_ids:
+            tile_types.add(tid // 4)
+        for meld in melds:
+            for i in range(meld.tile_count):
+                tiles = meld.tiles
+                if i < len(tiles):
+                    tile_types.add(tiles[i] // 4)
+
+        cls = FlatFeatureEncoder
+        has_honor = 1.0 if tile_types & set(cls._HONOR_INDICES) else 0.0
+        has_terminal = 1.0 if tile_types & set(cls._TERMINAL_INDICES) else 0.0
+        has_simple = 1.0 if tile_types & set(cls._SIMPLE_INDICES) else 0.0
+        has_man = 1.0 if tile_types & set(cls._MAN_INDICES) else 0.0
+        has_pin = 1.0 if tile_types & set(cls._PIN_INDICES) else 0.0
+        has_sou = 1.0 if tile_types & set(cls._SOU_INDICES) else 0.0
+        return np.array([has_honor, has_terminal, has_simple,
+                         has_man, has_pin, has_sou], dtype=np.float32)
 
     @staticmethod
     def _compute_shape_hint(hand_counts: np.ndarray) -> np.ndarray:

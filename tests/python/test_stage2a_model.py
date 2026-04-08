@@ -325,7 +325,7 @@ class TestStage2aRealShardPPO:
         from mahjong_rl.encoders import FlatFeatureEncoder
 
         # 1. Real data generation with model
-        obs_dim = 455  # full observation
+        obs_dim = 467  # full observation (CQ-0264: +4 menzen)
         encoder = FlatFeatureEncoder(observation_mode="full")
         model = Stage2aModel(input_dim=obs_dim, discard_hidden_dims=[32],
                               optional_hidden_dims=[32])
@@ -417,3 +417,309 @@ class TestStage1Regression:
     def test_stage1_selector_import(self):
         from mahjong_rl.action_selector import ActionSelector
         assert ActionSelector is not None
+
+
+# ========== CQ-0256 Blocker Fix Tests ==========
+
+
+class TestSemanticAuxComputeValueFalse:
+    """CQ-0256 Blocker #1: compute_value=False でも semantic summary は生成される"""
+
+    @staticmethod
+    def _make_semantic_model(input_dim=50):
+        return Stage2aModel(
+            input_dim=input_dim,
+            discard_hidden_dims=[32],
+            optional_hidden_dims=[32],
+            value_hidden_dims=[32],
+            semantic_aux_config={"enabled": True,
+                                  "policy_projection_dim": 8},
+        )
+
+    def test_discard_compute_value_false_has_semantic(self):
+        """forward_discard(compute_value=False) で semantic が返る"""
+        model = self._make_semantic_model()
+        features = torch.randn(2, 50)
+        mask = torch.ones(2, 34)
+        out = model.forward_discard(features, mask, compute_value=False)
+        assert out.semantic is not None
+        assert "terminal_logits" in out.semantic
+        assert "yaku_logits" in out.semantic
+        assert "semantic_summary" in out.semantic
+        assert out.values == {}  # value は計算しない
+
+    def test_optional_compute_value_false_has_semantic(self):
+        """forward_optional(compute_value=False) で semantic が返る"""
+        model = self._make_semantic_model()
+        features = torch.randn(2, 50)
+        cand_feats = torch.zeros(2, 3, 6, dtype=torch.long)
+        cand_mask = torch.ones(2, 3)
+        out = model.forward_optional(features, cand_feats, cand_mask,
+                                      compute_value=False)
+        assert out.semantic is not None
+        assert "terminal_logits" in out.semantic
+        assert out.values == {}
+
+    def test_discard_compute_value_true_has_both(self):
+        """compute_value=True で semantic + value 両方返る"""
+        model = self._make_semantic_model()
+        features = torch.randn(2, 50)
+        mask = torch.ones(2, 34)
+        out = model.forward_discard(features, mask, compute_value=True)
+        assert out.semantic is not None
+        assert "round_delta" in out.values
+        assert out.values["round_delta"].shape == (2, 1)
+
+    def test_semantic_summary_detached(self):
+        """semantic_summary は detached (gradient 流さない)"""
+        model = self._make_semantic_model()
+        features = torch.randn(2, 50, requires_grad=True)
+        mask = torch.ones(2, 34)
+        out = model.forward_discard(features, mask, compute_value=False)
+        assert not out.semantic["semantic_summary"].requires_grad
+
+
+class TestSemanticAuxPPO:
+    """CQ-0256 Blocker #4: PPO で semantic aux loss が加算される"""
+
+    def test_ppo_with_semantic_aux_runs(self, tmp_path):
+        """semantic_aux 有効 PPO が crash せず学習が回り diagnostics が出る"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        _write_stage2a_shards_with_labels(shard_dir, obs_dim=obs_dim)
+
+        model = Stage2aModel(
+            input_dim=obs_dim, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+            semantic_aux_config={"enabled": True,
+                                  "policy_projection_dim": 8},
+        )
+        learner = Stage2aLearner(
+            config={"training": {
+                "algorithm": "ppo", "epochs": 2, "batch_size": 16,
+                "semantic_aux": {"enabled": True,
+                                  "terminal_loss_coef": 0.2,
+                                  "yaku_loss_coef": 0.1},
+            }},
+            model=model, run_dir=tmp_path / "run",
+            device=torch.device("cpu"),
+        )
+        metrics = learner.train(shard_dir)
+        assert metrics["mode"] == "ppo"
+        assert metrics["num_updates"] > 0
+        assert not np.isnan(metrics["policy_loss"])
+        # CQ-0257: PPO diagnostics に semantic aux loss が含まれる
+        assert metrics["semantic_aux_enabled"] is True
+        assert metrics["terminal_loss"] is not None
+        assert metrics["yaku_loss"] is not None
+        assert isinstance(metrics["terminal_loss"], float)
+        assert isinstance(metrics["yaku_loss"], float)
+
+    def test_ppo_without_semantic_aux_has_none(self, tmp_path):
+        """CQ-0257: semantic_aux 無効 PPO では terminal_loss/yaku_loss が None"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        _write_stage2a_shards_with_labels(shard_dir, obs_dim=obs_dim)
+
+        model = Stage2aModel(
+            input_dim=obs_dim, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+        )
+        learner = Stage2aLearner(
+            config={"training": {
+                "algorithm": "ppo", "epochs": 1, "batch_size": 16,
+            }},
+            model=model, run_dir=tmp_path / "run",
+            device=torch.device("cpu"),
+        )
+        metrics = learner.train(shard_dir)
+        assert metrics["semantic_aux_enabled"] is False
+        assert metrics["terminal_loss"] is None
+        assert metrics["yaku_loss"] is None
+
+    def test_imitation_with_semantic_aux_runs(self, tmp_path):
+        """semantic_aux 有効 imitation が crash せず学習が回る"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        _write_stage2a_shards_with_labels(shard_dir, obs_dim=obs_dim)
+
+        model = Stage2aModel(
+            input_dim=obs_dim, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+            semantic_aux_config={"enabled": True,
+                                  "policy_projection_dim": 8},
+        )
+        learner = Stage2aLearner(
+            config={"training": {
+                "algorithm": "imitation", "epochs": 2, "batch_size": 16,
+                "semantic_aux": {"enabled": True,
+                                  "terminal_loss_coef": 0.2,
+                                  "yaku_loss_coef": 0.1},
+            }},
+            model=model, run_dir=tmp_path / "run",
+            device=torch.device("cpu"),
+        )
+        metrics = learner.train(shard_dir)
+        assert metrics["mode"] == "imitation"
+        assert metrics["num_updates"] > 0
+
+
+def _write_stage2a_shards_with_labels(shard_dir, obs_dim=50,
+                                        n_discard=30, n_call=20):
+    """CQ-0256 テスト用: terminal_label + yaku_ids 付き shard"""
+    writer = DecisionShardWriter(shard_dir, max_samples=10000)
+    labels = ["win_menzen", "win_called", "draw_tenpai", "deal_in",
+              "other_non_dealin"]
+    for i in range(n_discard):
+        mask = np.random.rand(34).astype(np.float32)
+        mask[mask < 0.3] = 0
+        mask[mask > 0] = 1.0
+        if mask.sum() == 0:
+            mask[0] = 1.0
+        label = labels[i % len(labels)]
+        yaku_ids = [3, 5] if label.startswith("win") else []
+        writer.add(DecisionSample(
+            decision_type="discard",
+            observation=np.random.randn(obs_dim).astype(np.float32),
+            reward=np.random.randn() * 0.01,
+            log_prob=-np.random.rand(),
+            value=0.0,
+            terminated=(i == n_discard - 1),
+            round_over=False,
+            action=int(np.argmax(mask)),
+            legal_mask=mask,
+            player_id=i % 4,
+            episode_id="ep0",
+            step_id=i,
+            round_terminal_label=label,
+            eventual_win_yaku_ids=yaku_ids,
+            experiment_id="test", run_id="run0", worker_id="w0",
+        ))
+    for i in range(n_call):
+        n_cands = np.random.randint(2, 5)
+        cands = []
+        for j in range(n_cands):
+            if j == n_cands - 1:
+                cands.append(CandidateRecord(action_type=8))
+            else:
+                cands.append(CandidateRecord(
+                    action_type=np.random.choice([3, 4, 5]),
+                    tile_type=np.random.randint(0, 34),
+                    target_rel_seat=np.random.randint(1, 4),
+                    consumed_tile_ids=(np.random.randint(0, 136),
+                                       np.random.randint(0, 136)),
+                ))
+        label = labels[(n_discard + i) % len(labels)]
+        yaku_ids = [0, 1] if label.startswith("win") else []
+        writer.add(DecisionSample(
+            decision_type="call",
+            observation=np.random.randn(obs_dim).astype(np.float32),
+            reward=np.random.randn() * 0.01,
+            log_prob=-np.random.rand(),
+            value=0.0,
+            terminated=False,
+            round_over=False,
+            selected_candidate_index=0,
+            candidate_count=n_cands,
+            candidates=cands,
+            player_id=1,
+            episode_id="ep0",
+            step_id=n_discard + i,
+            round_terminal_label=label,
+            eventual_win_yaku_ids=yaku_ids,
+            response_context=np.array([0.1, 0.25, 1.0], dtype=np.float32),
+            experiment_id="test", run_id="run0", worker_id="w0",
+        ))
+    writer.close()
+
+
+class TestCudaMemoryDebug:
+    """CQ-0255: CUDA memory debug flag"""
+
+    def test_debug_disabled_no_crash(self, tmp_path):
+        """cuda_memory_debug disabled (default) で通常通り動く"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        _write_stage2a_shards_with_labels(shard_dir, obs_dim=obs_dim)
+
+        model = Stage2aModel(input_dim=obs_dim, discard_hidden_dims=[32],
+                              optional_hidden_dims=[32])
+        learner = Stage2aLearner(
+            config={"training": {"algorithm": "imitation", "epochs": 1,
+                                  "batch_size": 16}},
+            model=model, run_dir=tmp_path / "run",
+            device=torch.device("cpu"),
+        )
+        metrics = learner.train(shard_dir)
+        assert metrics["num_updates"] > 0
+
+    def test_debug_enabled_no_crash_cpu(self, tmp_path):
+        """cuda_memory_debug enabled on CPU はスキップされる (crash しない)"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        _write_stage2a_shards_with_labels(shard_dir, obs_dim=obs_dim)
+
+        model = Stage2aModel(input_dim=obs_dim, discard_hidden_dims=[32],
+                              optional_hidden_dims=[32])
+        learner = Stage2aLearner(
+            config={"training": {
+                "algorithm": "imitation", "epochs": 1, "batch_size": 16,
+                "cuda_memory_debug": {"enabled": True},
+            }},
+            model=model, run_dir=tmp_path / "run",
+            device=torch.device("cpu"),
+        )
+        # CPU device: debug flag is silently disabled (no CUDA)
+        assert learner._cuda_mem_debug is False
+        metrics = learner.train(shard_dir)
+        assert metrics["num_updates"] > 0
+
+
+class TestImitationDiagnosticsPreloaded:
+    """CQ-0255: diagnostics が preloaded tensor を使う"""
+
+    def test_diagnostics_produces_same_keys(self, tmp_path):
+        """refactor 後も diagnostics が crash せず、timing が出る"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        _write_stage2a_shards_with_labels(shard_dir, obs_dim=obs_dim)
+
+        model = Stage2aModel(input_dim=obs_dim, discard_hidden_dims=[32],
+                              optional_hidden_dims=[32])
+        learner = Stage2aLearner(
+            config={"training": {"algorithm": "imitation", "epochs": 1,
+                                  "batch_size": 16}},
+            model=model, run_dir=tmp_path / "run",
+            device=torch.device("cpu"),
+        )
+        metrics = learner.train(shard_dir)
+        assert "timing" in metrics
+        assert metrics["timing"]["diagnostics_sec"] >= 0
+        assert metrics["num_updates"] > 0
+
+    def test_diagnostics_with_semantic_aux(self, tmp_path):
+        """semantic_aux 有効で diagnostics が出る (compute_value=False 経路)"""
+        obs_dim = 50
+        shard_dir = tmp_path / "shards"
+        _write_stage2a_shards_with_labels(shard_dir, obs_dim=obs_dim)
+
+        model = Stage2aModel(
+            input_dim=obs_dim, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+            semantic_aux_config={"enabled": True,
+                                  "policy_projection_dim": 8},
+        )
+        learner = Stage2aLearner(
+            config={"training": {
+                "algorithm": "imitation", "epochs": 1, "batch_size": 16,
+                "semantic_aux": {"enabled": True,
+                                  "terminal_loss_coef": 0.2,
+                                  "yaku_loss_coef": 0.1},
+            }},
+            model=model, run_dir=tmp_path / "run",
+            device=torch.device("cpu"),
+        )
+        metrics = learner.train(shard_dir)
+        assert metrics["semantic_aux_enabled"] is True
+        assert metrics["terminal_loss"] is not None
+        assert metrics["timing"]["diagnostics_sec"] >= 0

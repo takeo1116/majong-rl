@@ -14,11 +14,13 @@ except ImportError:
 _TERMINALS_AND_HONORS = [0, 8, 9, 17, 18, 26, 27, 28, 29, 30, 31, 32, 33]
 
 
-def compute_shanten(counts: np.ndarray | list[int]) -> int:
-    """シャンテン数を計算する (通常形・七対子・国士の最小値)
+def compute_shanten(counts: np.ndarray | list[int],
+                     meld_count: int = 0) -> int:
+    """シャンテン数を計算する
 
     Args:
-        counts: 34種の牌カウント配列
+        counts: 34種の牌カウント配列 (concealed tiles only for open hand)
+        meld_count: 副露済み面子数。>0 で七対子・国士をスキップ
 
     Returns:
         シャンテン数 (-1=和了, 0=テンパイ, 1=一向聴, ...)
@@ -29,7 +31,10 @@ def compute_shanten(counts: np.ndarray | list[int]) -> int:
         c = list(counts)
 
     if _USE_CPP:
-        return _compute_shanten_cpp(c)
+        return _compute_shanten_cpp(c, meld_count)
+
+    if meld_count > 0:
+        return _regular_shanten(c, meld_count)
 
     return min(
         _regular_shanten(c),
@@ -59,22 +64,23 @@ def _chiitoitsu_shanten(counts: list[int]) -> int:
     return 6 - pairs
 
 
-def _regular_shanten(counts: list[int]) -> int:
+def _regular_shanten(counts: list[int], meld_count: int = 0) -> int:
     """通常形 (4面子1雀頭) のシャンテン数
 
     雀頭を取る/取らないで分岐し、各分岐で面子分解を探索する。
+    meld_count > 0 のとき、副露面子が既にあるものとして計算する。
     """
-    best = [8]
+    best = [8 - 2 * meld_count]
     c = list(counts)
 
     # 雀頭なしで探索
-    _remove_groups(c, 0, 0, 0, best)
+    _remove_groups(c, 0, meld_count, 0, best)
 
     # 各牌種を雀頭として取って探索
     for t in range(34):
         if c[t] >= 2:
             c[t] -= 2
-            _remove_groups(c, 0, 0, 1, best)
+            _remove_groups(c, 0, meld_count, 1, best)
             c[t] += 2
 
     return best[0]

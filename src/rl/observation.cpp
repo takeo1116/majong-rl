@@ -37,6 +37,7 @@ PartialObservation make_partial_observation(const EnvironmentState& env, PlayerI
     obs.current_player = rs.current_player;
     obs.phase = rs.phase;
     obs.dora_indicators = rs.dora_indicators;
+    obs.remaining_draws = rs.remaining_draws();
 
     return obs;
 }
@@ -51,6 +52,8 @@ FullObservation make_full_observation(const EnvironmentState& env) {
         obs.melds[p] = rs.players[p].melds;
         obs.discards[p] = rs.players[p].discards;
         obs.scores[p] = rs.players[p].score;
+        obs.riichi_declared[p] = rs.players[p].is_riichi;
+        obs.menzen_flags[p] = rs.players[p].is_menzen;
     }
 
     // 山・王牌
@@ -68,6 +71,7 @@ FullObservation make_full_observation(const EnvironmentState& env) {
     obs.kyotaku = rs.kyotaku;
     obs.turn_number = rs.turn_number;
     obs.end_reason = rs.end_reason;
+    obs.remaining_draws = rs.remaining_draws();
 
     // 半荘情報
     obs.match_state = env.match_state;

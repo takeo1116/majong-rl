@@ -172,6 +172,26 @@ int regular_shanten(const std::array<int, 34>& counts) {
     return best;
 }
 
+/// open-hand regular shanten: meld_count 分の面子が既に確定している
+int regular_shanten_open(const std::array<int, 34>& counts, int meld_count) {
+    int best = 8 - 2 * meld_count;  // 副露面子は確定
+    std::array<int, 34> c = counts;
+
+    // 雀頭なしで探索 (mentsu は meld_count からスタート)
+    remove_groups(c, 0, meld_count, 0, best);
+
+    // 各牌種を雀頭として取って探索
+    for (int t = 0; t < 34; ++t) {
+        if (c[t] >= 2) {
+            c[t] -= 2;
+            remove_groups(c, 0, meld_count, 1, best);
+            c[t] += 2;
+        }
+    }
+
+    return best;
+}
+
 }  // anonymous namespace
 
 int compute_shanten(const std::array<int, kNumTileTypesShanten>& counts) {
@@ -182,18 +202,26 @@ int compute_shanten(const std::array<int, kNumTileTypesShanten>& counts) {
     });
 }
 
+int compute_shanten(const std::array<int, kNumTileTypesShanten>& counts, int meld_count) {
+    if (meld_count <= 0) {
+        return compute_shanten(counts);
+    }
+    // open hand: chiitoi / kokushi は不可
+    return regular_shanten_open(counts, meld_count);
+}
+
 namespace {
 
 /// 受け入れ枚数を計算する (shanten が下がる牌種の残り枚数合計)
-int count_acceptance(std::array<int, 34>& counts, int shanten) {
+int count_acceptance(std::array<int, 34>& counts, int shanten, int meld_count = 0) {
     int total = 0;
     for (int t = 0; t < 34; ++t) {
         if (counts[t] >= 4) continue;
         counts[t] += 1;
-        int new_sh = compute_shanten(counts);
+        int new_sh = compute_shanten(counts, meld_count);
         counts[t] -= 1;
         if (new_sh < shanten) {
-            total += 4 - counts[t];  // 残り枚数の概算
+            total += 4 - counts[t];
         }
     }
     return total;
@@ -203,7 +231,8 @@ int count_acceptance(std::array<int, 34>& counts, int shanten) {
 
 DiscardAnalysis analyze_discards(
     const std::array<int, 34>& counts,
-    const std::array<int, 34>& legal_mask)
+    const std::array<int, 34>& legal_mask,
+    int meld_count)
 {
     DiscardAnalysis result{};
     result.shanten_after.fill(-1);
@@ -211,7 +240,7 @@ DiscardAnalysis analyze_discards(
     result.ukeire_norm.fill(0.0f);
     result.shanten_sign.fill(0.0f);
 
-    int base_shanten = compute_shanten(counts);
+    int base_shanten = compute_shanten(counts, meld_count);
     std::array<int, 34> c = counts;
 
     int max_acceptance = 0;
@@ -220,10 +249,10 @@ DiscardAnalysis analyze_discards(
         if (c[t] < 1 || legal_mask[t] < 1) continue;
 
         c[t] -= 1;
-        int sh_after = compute_shanten(c);
+        int sh_after = compute_shanten(c, meld_count);
         result.shanten_after[t] = sh_after;
 
-        int acc = count_acceptance(c, sh_after);
+        int acc = count_acceptance(c, sh_after, meld_count);
         result.acceptance[t] = acc;
         if (acc > max_acceptance) max_acceptance = acc;
 
@@ -250,7 +279,8 @@ DiscardAnalysis analyze_discards(
 
 BestDiscardResult find_best_discard(
     const std::array<int, 34>& counts,
-    const std::array<int, 34>& legal_mask)
+    const std::array<int, 34>& legal_mask,
+    int meld_count)
 {
     BestDiscardResult result{};
     result.best_shanten = 999;
@@ -260,8 +290,6 @@ BestDiscardResult find_best_discard(
 
     std::array<int, 34> c = counts;
 
-    // 1パス目: 最良 (shanten, acceptance) を探す
-    // shanten_after と acceptance を保持して2パス目で再利用
     std::array<int, 34> sh_after_arr;
     std::array<int, 34> acc_arr;
     sh_after_arr.fill(999);
@@ -270,8 +298,8 @@ BestDiscardResult find_best_discard(
     for (int t = 0; t < 34; ++t) {
         if (legal_mask[t] < 1 || c[t] <= 0) continue;
         c[t] -= 1;
-        int sh = compute_shanten(c);
-        int acc = count_acceptance(c, sh);
+        int sh = compute_shanten(c, meld_count);
+        int acc = count_acceptance(c, sh, meld_count);
         sh_after_arr[t] = sh;
         acc_arr[t] = acc;
         if (sh < result.best_shanten ||

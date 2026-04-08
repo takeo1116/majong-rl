@@ -360,7 +360,8 @@ PYBIND11_MODULE(_mahjong_core, m) {
         .def_readonly("turn_number", &PartialObservation::turn_number)
         .def_readonly("current_player", &PartialObservation::current_player)
         .def_readonly("phase", &PartialObservation::phase)
-        .def_readonly("dora_indicators", &PartialObservation::dora_indicators);
+        .def_readonly("dora_indicators", &PartialObservation::dora_indicators)
+        .def_readonly("remaining_draws", &PartialObservation::remaining_draws);
 
     py::class_<FullObservation>(m, "FullObservation")
         .def_property_readonly("hands", [](const FullObservation& obs) {
@@ -387,6 +388,12 @@ PYBIND11_MODULE(_mahjong_core, m) {
         .def_property_readonly("scores", [](const FullObservation& obs) {
             return std::vector<int32_t>(obs.scores.begin(), obs.scores.end());
         })
+        .def_property_readonly("riichi_declared", [](const FullObservation& obs) {
+            return std::vector<bool>(obs.riichi_declared.begin(), obs.riichi_declared.end());
+        })
+        .def_property_readonly("menzen_flags", [](const FullObservation& obs) {
+            return std::vector<bool>(obs.menzen_flags.begin(), obs.menzen_flags.end());
+        })
         .def_property_readonly("wall", [](const FullObservation& obs) {
             return std::vector<uint8_t>(obs.wall.begin(), obs.wall.end());
         })
@@ -401,6 +408,7 @@ PYBIND11_MODULE(_mahjong_core, m) {
         .def_readonly("kyotaku", &FullObservation::kyotaku)
         .def_readonly("turn_number", &FullObservation::turn_number)
         .def_readonly("end_reason", &FullObservation::end_reason)
+        .def_readonly("remaining_draws", &FullObservation::remaining_draws)
         .def_readonly("match_state", &FullObservation::match_state);
 
     // --- GameEngine ---
@@ -442,50 +450,52 @@ PYBIND11_MODULE(_mahjong_core, m) {
     m.def("get_waits", &hand_utils::get_waits, "待ち牌一覧を返す");
 
     // --- shanten ---
-    m.def("compute_shanten", [](const std::vector<int>& counts_vec) {
+    m.def("compute_shanten", [](const std::vector<int>& counts_vec, int meld_count) {
         if (counts_vec.size() != 34) {
             throw std::invalid_argument("counts must have exactly 34 elements");
         }
         std::array<int, 34> counts;
         std::copy(counts_vec.begin(), counts_vec.end(), counts.begin());
-        return compute_shanten(counts);
-    }, py::arg("counts"),
-       "シャンテン数を計算する (通常形・七対子・国士の最小値)");
+        return compute_shanten(counts, meld_count);
+    }, py::arg("counts"), py::arg("meld_count") = 0,
+       "シャンテン数を計算する (meld_count > 0 で open hand 対応)");
 
     m.def("analyze_discards", [](const std::vector<int>& counts_vec,
-                                  const std::vector<int>& mask_vec) {
+                                  const std::vector<int>& mask_vec,
+                                  int meld_count) {
         if (counts_vec.size() != 34 || mask_vec.size() != 34) {
             throw std::invalid_argument("counts and legal_mask must have exactly 34 elements");
         }
         std::array<int, 34> counts, mask;
         std::copy(counts_vec.begin(), counts_vec.end(), counts.begin());
         std::copy(mask_vec.begin(), mask_vec.end(), mask.begin());
-        auto result = analyze_discards(counts, mask);
+        auto result = analyze_discards(counts, mask, meld_count);
         py::dict d;
         d["shanten_after"] = py::cast(std::vector<int>(result.shanten_after.begin(), result.shanten_after.end()));
         d["acceptance"] = py::cast(std::vector<int>(result.acceptance.begin(), result.acceptance.end()));
         d["ukeire_norm"] = py::cast(std::vector<float>(result.ukeire_norm.begin(), result.ukeire_norm.end()));
         d["shanten_sign"] = py::cast(std::vector<float>(result.shanten_sign.begin(), result.shanten_sign.end()));
         return d;
-    }, py::arg("counts"), py::arg("legal_mask"),
+    }, py::arg("counts"), py::arg("legal_mask"), py::arg("meld_count") = 0,
        "打牌候補の一括分析 (shanten/acceptance/ukeire_norm/shanten_sign)");
 
     m.def("find_best_discard", [](const std::vector<int>& counts_vec,
-                                   const std::vector<int>& mask_vec) {
+                                   const std::vector<int>& mask_vec,
+                                   int meld_count) {
         if (counts_vec.size() != 34 || mask_vec.size() != 34) {
             throw std::invalid_argument("counts and legal_mask must have exactly 34 elements");
         }
         std::array<int, 34> counts, mask;
         std::copy(counts_vec.begin(), counts_vec.end(), counts.begin());
         std::copy(mask_vec.begin(), mask_vec.end(), mask.begin());
-        auto result = find_best_discard(counts, mask);
+        auto result = find_best_discard(counts, mask, meld_count);
         py::dict d;
         d["best_shanten"] = result.best_shanten;
         d["best_acceptance"] = result.best_acceptance;
         d["best_tile"] = result.best_tile;
         d["best_mask"] = py::cast(std::vector<int>(result.best_mask.begin(), result.best_mask.end()));
         return d;
-    }, py::arg("counts"), py::arg("legal_mask"),
+    }, py::arg("counts"), py::arg("legal_mask"), py::arg("meld_count") = 0,
        "最善打牌を選択する (シャンテン最小 → 受け入れ最大)");
 
     m.def("make_discard_mask", [](GameEngine& engine, EnvironmentState& env) {
@@ -567,6 +577,7 @@ PYBIND11_MODULE(_mahjong_core, m) {
                 py::dict w;
                 w["winner"] = winner;
                 w["is_tsumo"] = true;
+                w["is_menzen"] = player.is_menzen;
                 w["total_han"] = sr.total_han;
                 w["fu"] = sr.fu;
                 w["dora_count"] = sr.dora_count;
@@ -600,6 +611,7 @@ PYBIND11_MODULE(_mahjong_core, m) {
                         py::dict w;
                         w["winner"] = p;
                         w["is_tsumo"] = false;
+                        w["is_menzen"] = player.is_menzen;
                         w["total_han"] = sr.total_han;
                         w["fu"] = sr.fu;
                         w["dora_count"] = sr.dora_count;

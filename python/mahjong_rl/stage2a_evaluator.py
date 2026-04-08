@@ -77,13 +77,16 @@ class Stage2aEvaluator:
                 is_policy = (player == policy_seat)
 
                 if env.decision_type == DecisionType.DISCARD:
-                    mask = env.get_legal_mask()
+                    # CQ-0271: snapshot-based discard
+                    mask, discard_snap = env.get_legal_discard_snapshot()
                     if is_policy:
                         action = self._policy_discard(env, mask)
                     else:
                         hand_ids = list(env.env_state.round_state.players[player].hand)
-                        action = self._baseline.select_discard(hand_ids, mask)
-                    _, _, terminated, _, info = env.step_discard(action)
+                        mc = len(env.env_state.round_state.players[player].melds)
+                        action = self._baseline.select_discard(hand_ids, mask, meld_count=mc)
+                    _, _, terminated, _, info = env.step_discard_with_snapshot(
+                        action, discard_snap)
 
                 elif env.decision_type == DecisionType.RESPONSE:
                     candidates = env.response_candidates

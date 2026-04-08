@@ -367,6 +367,9 @@ class DecisionShardReader:
         from mahjong_rl.candidate_encoding import (
             ACTION_TYPE_MAP, MAX_CONSUMED, CAND_FEAT_DIM)
 
+        from mahjong_rl.outcome_vocab import (
+            terminal_label_to_class, yaku_ids_to_multihot, NUM_YAKU)
+
         # 1st pass: collect rows per branch
         d_rows: list[tuple] = []  # (table, row_index)
         c_rows: list[tuple] = []
@@ -417,7 +420,12 @@ class DecisionShardReader:
             has_best = False
             episode_ids = []
             player_ids = np.zeros(nd, dtype=np.int64)
+            round_ids = np.zeros(nd, dtype=np.int64)
             resp_ctx = np.zeros((nd, 3), dtype=np.float32)
+            # CQ-0256: semantic aux targets
+            terminal_classes = np.zeros(nd, dtype=np.int64)
+            yaku_multihot = np.zeros((nd, NUM_YAKU), dtype=np.float32)
+            is_winner = np.zeros(nd, dtype=np.float32)
 
             for i, (tbl, ri) in enumerate(d_rows):
                 obs[i] = _bytes_to_f32(_col(tbl, "observation", ri), obs_dim)
@@ -440,9 +448,19 @@ class DecisionShardReader:
                             has_best = True
                 episode_ids.append(_col(tbl, "episode_id", ri))
                 player_ids[i] = _col(tbl, "player_id", ri)
+                round_ids[i] = _col_safe(tbl, "round_id", ri, 0)
                 rc_bytes = _col_safe(tbl, "response_context", ri, None)
                 if rc_bytes:
                     resp_ctx[i] = np.frombuffer(rc_bytes, dtype=np.float32)
+                # CQ-0256: semantic targets
+                rtl = _col_safe(tbl, "round_terminal_label", ri, "")
+                terminal_classes[i] = terminal_label_to_class(rtl)
+                yids_json = _col_safe(tbl, "eventual_win_yaku_ids_json", ri, "")
+                if yids_json:
+                    yids = [int(x) for x in yids_json.split(",") if x]
+                    yaku_multihot[i] = yaku_ids_to_multihot(yids)
+                    if rtl in ("win", "win_menzen", "win_called"):
+                        is_winner[i] = 1.0
 
             d_result = {
                 "observations": obs, "legal_masks": masks, "actions": actions,
@@ -451,7 +469,11 @@ class DecisionShardReader:
                 "actor_types": actor_types, "teacher_top1": teacher_top1,
                 "teacher_best_mask": teacher_best_mask if has_best else None,
                 "episode_ids": episode_ids, "player_ids": player_ids,
-                "response_context": resp_ctx, "n": nd,
+                "round_ids": round_ids, "response_context": resp_ctx,
+                "terminal_classes": terminal_classes,
+                "yaku_multihot": yaku_multihot,
+                "is_winner": is_winner,
+                "n": nd,
             }
 
         # build call
@@ -477,9 +499,13 @@ class DecisionShardReader:
             teacher_top1_c = np.full(nc, -1, dtype=np.int64)
             episode_ids_c = []
             player_ids_c = np.zeros(nc, dtype=np.int64)
+            round_ids_c = np.zeros(nc, dtype=np.int64)
             resp_ctx_c = np.zeros((nc, 3), dtype=np.float32)
             cand_feats = np.zeros((nc, max_cands, CAND_FEAT_DIM), dtype=np.int64)
             cand_mask = np.zeros((nc, max_cands), dtype=np.float32)
+            terminal_classes_c = np.zeros(nc, dtype=np.int64)
+            yaku_multihot_c = np.zeros((nc, NUM_YAKU), dtype=np.float32)
+            is_winner_c = np.zeros(nc, dtype=np.float32)
 
             for i, (tbl, ri) in enumerate(c_rows):
                 obs[i] = _bytes_to_f32(_col(tbl, "observation", ri), obs_dim)
@@ -494,6 +520,7 @@ class DecisionShardReader:
                 teacher_top1_c[i] = t1 if t1 is not None else -1
                 episode_ids_c.append(_col(tbl, "episode_id", ri))
                 player_ids_c[i] = _col(tbl, "player_id", ri)
+                round_ids_c[i] = _col_safe(tbl, "round_id", ri, 0)
                 rc_bytes = _col_safe(tbl, "response_context", ri, None)
                 if rc_bytes:
                     resp_ctx_c[i] = np.frombuffer(rc_bytes, dtype=np.float32)
@@ -534,14 +561,28 @@ class DecisionShardReader:
                         cand_feats[i, j] = [at_idx, tile_1, seat_1, c0, c1, c2]
                         cand_mask[i, j] = 1.0
 
+                # CQ-0256: semantic targets
+                rtl = _col_safe(tbl, "round_terminal_label", ri, "")
+                terminal_classes_c[i] = terminal_label_to_class(rtl)
+                yids_json = _col_safe(tbl, "eventual_win_yaku_ids_json", ri, "")
+                if yids_json:
+                    yids = [int(x) for x in yids_json.split(",") if x]
+                    yaku_multihot_c[i] = yaku_ids_to_multihot(yids)
+                    if rtl in ("win", "win_menzen", "win_called"):
+                        is_winner_c[i] = 1.0
+
             c_result = {
                 "observations": obs, "selected_idx": selected_idx,
                 "rewards": rewards, "log_probs": log_probs_c,
                 "values": values_c, "terminateds": terminateds_c,
                 "step_ids": step_ids_c, "actor_types": actor_types_c,
                 "teacher_top1": teacher_top1_c, "episode_ids": episode_ids_c,
-                "player_ids": player_ids_c, "response_context": resp_ctx_c,
+                "player_ids": player_ids_c, "round_ids": round_ids_c,
+                "response_context": resp_ctx_c,
                 "cand_feats": cand_feats, "cand_mask": cand_mask,
+                "terminal_classes": terminal_classes_c,
+                "yaku_multihot": yaku_multihot_c,
+                "is_winner": is_winner_c,
                 "max_cands": max_cands, "n": nc,
             }
 

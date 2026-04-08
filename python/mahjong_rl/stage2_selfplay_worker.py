@@ -131,7 +131,8 @@ class Stage2SelfPlayWorker:
                 round_id = env.env_state.round_state.round_number
 
                 if env.decision_type == DecisionType.DISCARD:
-                    mask = env.get_legal_mask()
+                    # CQ-0271: snapshot-based discard
+                    mask, discard_snap = env.get_legal_discard_snapshot()
                     obs = env._make_observation()
                     features = self._encode_obs(obs, mask)
                     use_policy = seat_is_policy[player] and self._model is not None
@@ -142,7 +143,8 @@ class Stage2SelfPlayWorker:
                         actor_type = "policy"
                     else:
                         hand_ids = list(env.env_state.round_state.players[player].hand)
-                        action = baseline.select_discard(hand_ids, mask)
+                        mc = len(env.env_state.round_state.players[player].melds)
+                        action = baseline.select_discard(hand_ids, mask, meld_count=mc)
                         log_prob, value = self._infer_discard(features, mask, action)
                         actor_type = "baseline"
 
@@ -155,8 +157,9 @@ class Stage2SelfPlayWorker:
                         # CQ-0239: teacher info for discard
                         hand_for_teacher = list(
                             env.env_state.round_state.players[player].hand)
+                        mc_t = len(env.env_state.round_state.players[player].melds)
                         t_action, t_mask = baseline.select_discard_with_best_set(
-                            hand_for_teacher, mask)
+                            hand_for_teacher, mask, meld_count=mc_t)
                         t_best = [i for i in range(34) if t_mask[i] > 0.5]
 
                         sample = DecisionSample(
@@ -187,7 +190,8 @@ class Stage2SelfPlayWorker:
 
                     step_counter += 1
                     discard_count += 1
-                    _, rewards, terminated, _, _ = env.step_discard(action)
+                    _, rewards, terminated, _, _ = env.step_discard_with_snapshot(
+                        action, discard_snap)
                     if should_save and player in pending:
                         pending[player].reward = float(rewards[player])
                         pending[player].terminated = terminated
@@ -354,23 +358,21 @@ class Stage2SelfPlayWorker:
         is_abortive = end_reason == 4
         pid = sample.player_id
 
+        # CQ-0266: 5-class terminal labels
         if pid in winner_players:
-            sample.round_terminal_label = "win"
             wi = win_by_player.get(pid, {})
+            is_menzen = wi.get("is_menzen", True)
+            sample.round_terminal_label = "win_menzen" if is_menzen else "win_called"
             sample.eventual_win_yaku_ids = [int(y) for y in wi.get("yaku_ids", [])]
             sample.eventual_total_han = wi.get("total_han", -1)
             sample.eventual_fu = wi.get("fu", -1)
         elif is_ron and pid == loser_player:
-            sample.round_terminal_label = "ron_loss"
-        elif is_ron:
-            # ron 和了の第三者 (winner でも放銃者でもない)
-            sample.round_terminal_label = "ron_bystander"
-        elif is_tsumo and pid not in winner_players:
-            sample.round_terminal_label = "tsumo_loss"
-        elif is_draw:
-            sample.round_terminal_label = "ryukyoku_tenpai" if pid in tenpai_set else "ryukyoku_noten"
-        elif is_abortive:
-            sample.round_terminal_label = "abortive_draw"
+            sample.round_terminal_label = "deal_in"
+        elif is_draw and pid in tenpai_set:
+            sample.round_terminal_label = "draw_tenpai"
+        else:
+            # 被ツモ / ロン傍観 / 流局ノーテン / 途中流局
+            sample.round_terminal_label = "other_non_dealin"
 
     @staticmethod
     def _make_cand_records(candidates) -> list[CandidateRecord]:

@@ -144,6 +144,10 @@ class TestStage2aRunnerIntegration:
             "global_seed": 42,
             "phases": ["imitation", "selfplay", "learner"],
         }
+        config.feature_encoder = {
+            "shanten_hint": True,
+            "discard_ukeire_hint": True,
+        }
         config.selfplay = {
             "imitation_matches": 3,
             "num_matches": 3,

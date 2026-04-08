@@ -9,6 +9,10 @@ constexpr int kNumTileTypesShanten = 34;
 /// シャンテン数を計算する (通常形・七対子・国士の最小値)
 int compute_shanten(const std::array<int, kNumTileTypesShanten>& counts);
 
+/// シャンテン数を計算する (open hand 対応)
+/// @param meld_count 副露済み面子数。>0 のとき七対子・国士はスキップ
+int compute_shanten(const std::array<int, kNumTileTypesShanten>& counts, int meld_count);
+
 /// 打牌候補の一括分析結果
 struct DiscardAnalysis {
     std::array<int, 34> shanten_after;   ///< 打牌後シャンテン (非候補=-1)
@@ -20,9 +24,11 @@ struct DiscardAnalysis {
 /// 全打牌候補のシャンテン数・受け入れ枚数・shanten_sign を一括計算
 /// @param counts 34種の手牌カウント
 /// @param legal_mask 合法手マスク (>=1 で合法)。手牌にない牌種は自動スキップ。
+/// @param meld_count 副露済み面子数 (default 0)
 DiscardAnalysis analyze_discards(
     const std::array<int, 34>& counts,
-    const std::array<int, 34>& legal_mask);
+    const std::array<int, 34>& legal_mask,
+    int meld_count = 0);
 
 /// 最善打牌の選択結果
 struct BestDiscardResult {
@@ -33,9 +39,11 @@ struct BestDiscardResult {
 };
 
 /// 最善打牌を選択する (シャンテン最小 → 受け入れ最大)
+/// @param meld_count 副露済み面子数 (default 0)
 BestDiscardResult find_best_discard(
     const std::array<int, 34>& counts,
-    const std::array<int, 34>& legal_mask);
+    const std::array<int, 34>& legal_mask,
+    int meld_count = 0);
 
 /// 手牌形状ヒント (順子/塔子/嵌張の binary multihot)
 struct ShapeHint {

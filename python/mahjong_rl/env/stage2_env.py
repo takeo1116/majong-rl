@@ -146,6 +146,64 @@ class Stage2Env:
         actions = self._engine.get_legal_actions(self._env)
         return make_discard_mask_from_legal_actions(actions)
 
+    def get_legal_discard_snapshot(self) -> tuple[np.ndarray, list]:
+        """CQ-0271: legal mask と legal discard actions を同時に取得する
+
+        Returns:
+            (legal_mask, discard_actions): mask と concrete actions の snapshot
+        """
+        all_actions = self._engine.get_legal_actions(self._env)
+        discard_actions = [a for a in all_actions
+                           if a.type == ActionType.Discard]
+        mask = make_discard_mask_from_legal_actions(all_actions)
+        return mask, discard_actions
+
+    def step_discard_with_snapshot(
+        self, tile_type: int, discard_actions: list,
+    ) -> tuple:
+        """CQ-0271: snapshot から concrete action を解決して実行する
+
+        Args:
+            tile_type: policy/baseline が選択した牌種 (0-33)
+            discard_actions: get_legal_discard_snapshot() で取得した discard actions
+
+        Returns:
+            (observation, rewards, terminated, truncated, info)
+        """
+        if self._done:
+            raise RuntimeError("環境は終了済み。reset() を呼んでください")
+        if self._decision_type != DecisionType.DISCARD:
+            raise RuntimeError(
+                f"現在の decision_type は {self._decision_type}。"
+                f"step_discard_with_snapshot() は DISCARD 時のみ呼べます")
+
+        action = self._resolve_discard_from_snapshot(
+            tile_type, discard_actions)
+        return self._execute_and_advance(action)
+
+    @staticmethod
+    def _resolve_discard_from_snapshot(
+        tile_type: int, discard_actions: list,
+    ) -> 'Action':
+        """CQ-0271: snapshot から tile_type に対応する concrete Action を解決する"""
+        # 立直打牌を優先
+        for a in discard_actions:
+            if a.riichi and (a.tile // 4) == tile_type:
+                return a
+        for a in discard_actions:
+            if not a.riichi and (a.tile // 4) == tile_type:
+                return a
+        # 診断情報付きエラー
+        action_info = [(a.tile // 4, a.riichi) for a in discard_actions]
+        mask_types = sorted(set(a.tile // 4 for a in discard_actions))
+        raise ValueError(
+            f"CQ-0271 snapshot 不整合: tile_type={tile_type} は"
+            f" snapshot 内の合法打牌に存在しません。\n"
+            f"  legal discard tile_types: {mask_types}\n"
+            f"  discard_actions: {action_info}\n"
+            f"  snapshot size: {len(discard_actions)}"
+        )
+
     def _execute_and_advance(self, action: Action) -> tuple:
         """action を実行し、次の決定点まで進める"""
         result = self._engine.step(self._env, action)
@@ -257,7 +315,12 @@ class Stage2Env:
         return legal_actions[0]
 
     def _resolve_discard(self, tile_type: int) -> Action:
-        """TileType (0-33) から具体的な Discard Action を生成する"""
+        """TileType (0-33) から具体的な Discard Action を生成する
+
+        注意: この方法は legal actions を再取得するため、
+        snapshot と一致しない可能性がある。CQ-0271 以降は
+        step_discard_with_snapshot() の使用を推奨。
+        """
         legal_actions = self._engine.get_legal_actions(self._env)
         # 立直打牌を優先（テンパイ時自動立直）
         for a in legal_actions:
@@ -266,8 +329,16 @@ class Stage2Env:
         for a in legal_actions:
             if a.type == ActionType.Discard and not a.riichi and (a.tile // 4) == tile_type:
                 return a
+        # CQ-0271: 診断情報付きエラー
+        discard_types = sorted(set(
+            a.tile // 4 for a in legal_actions if a.type == ActionType.Discard))
+        rs = self._env.round_state
         raise ValueError(
-            f"tile_type {tile_type} は合法打牌ではありません")
+            f"tile_type {tile_type} は合法打牌ではありません。\n"
+            f"  legal discard tile_types: {discard_types}\n"
+            f"  current_player: {rs.current_player}\n"
+            f"  phase: {rs.phase}"
+        )
 
     def _make_observation(self):
         if self._observation_mode == "full":
