@@ -80,6 +80,11 @@ def _stage2a_selfplay_worker_fn(
             hint_ranges = {s: meta.feature_ranges[s]
                            for s in ("shanten_hint", "discard_ukeire_hint")
                            if s in meta.feature_ranges}
+            sa_cfg = model_config.get("semantic_aux", {})
+            sem_only = {}
+            if sa_cfg.get("tile_presence_flags_semantic_only", False):
+                if "tile_presence_flags" in meta.feature_ranges:
+                    sem_only["tile_presence_flags"] = meta.feature_ranges["tile_presence_flags"]
             model = Stage2aModel(
                 input_dim=input_dim,
                 discard_hidden_dims=model_config.get("discard_hidden_dims", [256, 128]),
@@ -90,6 +95,7 @@ def _stage2a_selfplay_worker_fn(
                 optional_scorer_hidden=model_config.get("optional_scorer_hidden", 32),
                 semantic_aux_config=model_config.get("semantic_aux"),
                 direct_hint_ranges=hint_ranges if hint_ranges else None,
+                semantic_only_ranges=sem_only if sem_only else None,
             )
             sd = torch.load(model_state_path, map_location="cpu", weights_only=True)
             model.load_state_dict(sd)
@@ -213,6 +219,11 @@ def _stage2a_eval_worker_fn(
         hint_ranges = {s: meta.feature_ranges[s]
                        for s in ("shanten_hint", "discard_ukeire_hint")
                        if s in meta.feature_ranges}
+        sa_cfg = model_config.get("semantic_aux", {})
+        sem_only = {}
+        if sa_cfg.get("tile_presence_flags_semantic_only", False):
+            if "tile_presence_flags" in meta.feature_ranges:
+                sem_only["tile_presence_flags"] = meta.feature_ranges["tile_presence_flags"]
         model = Stage2aModel(
             input_dim=input_dim,
             discard_hidden_dims=model_config.get("discard_hidden_dims", [256, 128]),
@@ -223,6 +234,7 @@ def _stage2a_eval_worker_fn(
             optional_scorer_hidden=model_config.get("optional_scorer_hidden", 32),
             semantic_aux_config=model_config.get("semantic_aux"),
             direct_hint_ranges=hint_ranges if hint_ranges else None,
+            semantic_only_ranges=sem_only if sem_only else None,
         )
         sd = torch.load(model_state_path, map_location="cpu", weights_only=True)
         model.load_state_dict(sd)

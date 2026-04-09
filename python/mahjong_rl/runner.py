@@ -1595,6 +1595,13 @@ class Stage1Runner:
         for src in ("shanten_hint", "discard_ukeire_hint"):
             if src in meta.feature_ranges:
                 hint_ranges[src] = meta.feature_ranges[src]
+        # CQ-0273: semantic-only routing for tile_presence_flags
+        sa_cfg = mc.get("semantic_aux", {})
+        semantic_only_ranges = {}
+        if sa_cfg.get("tile_presence_flags_semantic_only", False):
+            if "tile_presence_flags" in meta.feature_ranges:
+                semantic_only_ranges["tile_presence_flags"] = (
+                    meta.feature_ranges["tile_presence_flags"])
         return Stage2aModel(
             input_dim=input_dim,
             discard_hidden_dims=mc.get("discard_hidden_dims", [256, 128]),
@@ -1605,6 +1612,7 @@ class Stage1Runner:
             optional_scorer_hidden=mc.get("optional_scorer_hidden", 32),
             semantic_aux_config=mc.get("semantic_aux"),
             direct_hint_ranges=hint_ranges if hint_ranges else None,
+            semantic_only_ranges=semantic_only_ranges if semantic_only_ranges else None,
         )
 
     def _run_imitation_stage2a(self, run_dir: Path, encoder, profiler=None) -> dict:

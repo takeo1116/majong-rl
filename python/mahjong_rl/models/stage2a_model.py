@@ -94,6 +94,7 @@ class Stage2aModel(nn.Module):
         value_aux_dim: int = 0,
         semantic_aux_config: dict | None = None,
         direct_hint_ranges: dict[str, tuple[int, int]] | None = None,
+        semantic_only_ranges: dict[str, tuple[int, int]] | None = None,
     ):
         super().__init__()
         self._input_dim = input_dim
@@ -109,7 +110,17 @@ class Stage2aModel(nn.Module):
         excluded_dim = sum(
             e - s for s, e in self._direct_hint_ranges.values()
         ) if self._direct_hints_enabled else 0
-        trunk_input_dim = input_dim - excluded_dim
+
+        # CQ-0273: semantic-only features (value/semantic trunk に残すが policy trunk から除外)
+        self._semantic_only_ranges = semantic_only_ranges or {}
+        self._semantic_only_sources = sorted(self._semantic_only_ranges.keys())
+        self._semantic_only_enabled = len(self._semantic_only_sources) > 0
+        semantic_only_dim = sum(
+            e - s for s, e in self._semantic_only_ranges.values()
+        ) if self._semantic_only_enabled else 0
+
+        trunk_input_dim = input_dim - excluded_dim  # after hint exclusion
+        policy_trunk_dim = trunk_input_dim - semantic_only_dim  # further exclude for policy
 
         if self._direct_hints_enabled:
             num_sources = len(self._direct_hint_sources)
@@ -123,9 +134,9 @@ class Stage2aModel(nn.Module):
             )
             self.register_buffer("_tile_ids", torch.arange(34, dtype=torch.long))
 
-        # Discard trunk
+        # Discard trunk (uses policy_trunk_dim: hint + semantic_only excluded)
         discard_layers: list[nn.Module] = []
-        prev = trunk_input_dim
+        prev = policy_trunk_dim
         for h in discard_hidden_dims:
             discard_layers.append(nn.Linear(prev, h))
             discard_layers.append(nn.ReLU())
@@ -139,9 +150,9 @@ class Stage2aModel(nn.Module):
             self._context_gate = nn.Linear(prev, 34)
 
         # Optional trunk (input: x_state + response_context)
-        # Uses trunk_input_dim (hint excluded)
+        # Uses policy_trunk_dim (hint + semantic_only excluded)
         opt_layers: list[nn.Module] = []
-        prev_c = trunk_input_dim + RESPONSE_CONTEXT_DIM
+        prev_c = policy_trunk_dim + RESPONSE_CONTEXT_DIM
         for h in optional_hidden_dims:
             opt_layers.append(nn.Linear(prev_c, h))
             opt_layers.append(nn.ReLU())
@@ -186,8 +197,8 @@ class Stage2aModel(nn.Module):
 
             # expand discard / optional trunk input to accept semantic summary
             # rebuild first layer of each trunk to accept wider input
-            d_first_in = trunk_input_dim + self._semantic_summary_dim
-            o_first_in = trunk_input_dim + RESPONSE_CONTEXT_DIM + self._semantic_summary_dim
+            d_first_in = policy_trunk_dim + self._semantic_summary_dim
+            o_first_in = policy_trunk_dim + RESPONSE_CONTEXT_DIM + self._semantic_summary_dim
             # replace first linear layers
             d_first_hidden = discard_hidden_dims[0] if discard_hidden_dims else 128
             o_first_hidden = optional_hidden_dims[0] if optional_hidden_dims else 64
@@ -199,35 +210,54 @@ class Stage2aModel(nn.Module):
             self.optional_trunk = nn.Sequential(*old_o)
 
     def _split_features(self, features: torch.Tensor
-                        ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """CQ-0265: features を global (trunk 入力) と direct hints に分離する
+                        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """CQ-0265/0273: features を分離する
 
         Returns:
-            (global_features, direct_hints)
+            (policy_features, value_features, direct_hints)
+            policy_features: hint + semantic_only excluded
+            value_features: hint excluded only (semantic_only は含む)
             direct_hints: (B, 34, K) or None
         """
-        if not self._direct_hints_enabled:
-            return features, None
-
-        exclude_ranges = [
-            self._direct_hint_ranges[src]
-            for src in self._direct_hint_sources
-        ]
-        # hint parts
-        hint_parts = [features[:, s:e] for s, e in exclude_ranges]  # each (B, 34)
-
-        # global: keep everything except excluded ranges
         total_dim = features.size(-1)
-        excluded = set()
-        for s, e in exclude_ranges:
-            excluded.update(range(s, e))
-        keep = [i for i in range(total_dim) if i not in excluded]
-        keep_idx = torch.tensor(keep, device=features.device, dtype=torch.long)
-        global_features = features.index_select(1, keep_idx)
 
-        hints_stacked = torch.stack(hint_parts, dim=1)  # (B, K, 34)
-        direct_hints = hints_stacked.transpose(1, 2)     # (B, 34, K)
-        return global_features, direct_hints
+        # Build excluded index sets
+        hint_excluded = set()
+        for src in self._direct_hint_sources:
+            s, e = self._direct_hint_ranges[src]
+            hint_excluded.update(range(s, e))
+
+        semantic_only_excluded = set()
+        for src in self._semantic_only_sources:
+            s, e = self._semantic_only_ranges[src]
+            semantic_only_excluded.update(range(s, e))
+
+        # value_features: hint excluded only
+        value_keep = [i for i in range(total_dim) if i not in hint_excluded]
+        # policy_features: hint + semantic_only excluded
+        policy_keep = [i for i in range(total_dim)
+                       if i not in hint_excluded and i not in semantic_only_excluded]
+
+        if len(value_keep) == total_dim and len(policy_keep) == total_dim:
+            # nothing excluded
+            return features, features, None
+
+        device = features.device
+        value_idx = torch.tensor(value_keep, device=device, dtype=torch.long)
+        policy_idx = torch.tensor(policy_keep, device=device, dtype=torch.long)
+        value_features = features.index_select(1, value_idx)
+        policy_features = features.index_select(1, policy_idx)
+
+        # direct hints
+        direct_hints = None
+        if self._direct_hints_enabled:
+            hint_parts = [features[:, s:e]
+                          for src in self._direct_hint_sources
+                          for s, e in [self._direct_hint_ranges[src]]]
+            hints_stacked = torch.stack(hint_parts, dim=1)  # (B, K, 34)
+            direct_hints = hints_stacked.transpose(1, 2)     # (B, 34, K)
+
+        return policy_features, value_features, direct_hints
 
     def _apply_direct_hints(self, base_logits: torch.Tensor,
                              direct_hints: torch.Tensor,
@@ -340,19 +370,19 @@ class Stage2aModel(nn.Module):
         compute_value: bool = True,
     ) -> Stage2aOutput:
         """discard decision の forward"""
-        # CQ-0265: split features into global (trunk) + direct hints
-        global_features, direct_hints = self._split_features(features)
+        # CQ-0265/0273: split features
+        policy_features, value_features, direct_hints = self._split_features(features)
 
         # CQ-0256: semantic summary → policy input (always when enabled)
         semantic = None
-        policy_input = global_features
+        policy_input = policy_features
         h_v = None
         if self._semantic_aux_enabled:
             h_v = self._compute_value_hidden(
-                global_features, decision_family=0.0,
+                value_features, decision_family=0.0,
                 value_aux_features=value_aux_features)
             semantic = self._compute_semantic(h_v)
-            policy_input = torch.cat([global_features, semantic["semantic_summary"]], dim=-1)
+            policy_input = torch.cat([policy_features, semantic["semantic_summary"]], dim=-1)
 
         h_d = self.discard_trunk(policy_input)
         logits = self.discard_head(h_d)
@@ -369,7 +399,7 @@ class Stage2aModel(nn.Module):
                 values["round_delta"] = self.value_head(h_v)
             else:
                 value = self._compute_value(
-                    global_features, decision_family=0.0,
+                    value_features, decision_family=0.0,
                     value_aux_features=value_aux_features)
                 values["round_delta"] = value
 
@@ -400,12 +430,12 @@ class Stage2aModel(nn.Module):
         Returns:
             Stage2aOutput with discard_logits=None, optional_scores, values
         """
-        # CQ-0265: strip direct hints (optional/value/semantic don't use them)
-        global_features, _ = self._split_features(features)
+        # CQ-0265/0273: split features
+        policy_features, value_features, _ = self._split_features(features)
 
-        B_feat = global_features.size(0)
+        B_feat = policy_features.size(0)
         if response_context is None:
-            response_context = torch.zeros(B_feat, RESPONSE_CONTEXT_DIM, device=global_features.device)
+            response_context = torch.zeros(B_feat, RESPONSE_CONTEXT_DIM, device=policy_features.device)
 
         # CQ-0256: semantic summary → policy input (always when enabled)
         semantic = None
@@ -415,15 +445,15 @@ class Stage2aModel(nn.Module):
             opt_summary_pre = self._make_optional_summary(
                 cand_enc_pre, cand_mask, cand_features=cand_features)
             h_v = self._compute_value_hidden(
-                global_features, decision_family=1.0,
+                value_features, decision_family=1.0,
                 response_context=response_context,
                 optional_summary=opt_summary_pre,
                 value_aux_features=value_aux_features)
             semantic = self._compute_semantic(h_v)
-            opt_input = torch.cat([global_features, response_context,
+            opt_input = torch.cat([policy_features, response_context,
                                     semantic["semantic_summary"]], dim=-1)
         else:
-            opt_input = torch.cat([global_features, response_context], dim=-1)
+            opt_input = torch.cat([policy_features, response_context], dim=-1)
         h_c = self.optional_trunk(opt_input)  # (B, optional_trunk_dim)
 
         # Candidate encoding
@@ -447,7 +477,7 @@ class Stage2aModel(nn.Module):
                 opt_summary = self._make_optional_summary(
                     cand_enc, cand_mask, cand_features=cand_features)
                 value = self._compute_value(
-                    global_features, decision_family=1.0,
+                    value_features, decision_family=1.0,
                     response_context=response_context,
                     optional_summary=opt_summary,
                     value_aux_features=value_aux_features)

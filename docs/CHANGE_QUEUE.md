@@ -53,54 +53,78 @@
 
 ## 変更要求一覧
 
-### CQ-0272
+### CQ-0273
 - Status: [Proposed]
 - Type: RL
 - Priority: High
-- Title: tile_presence_flags を feature_encoder config で on/off 切替可能にする
+- Title: tile_presence_flags を semantic/value trunk 限定入力にする
 
 #### 背景
-`CQ-0270` で追加した `tile_presence_flags` は現在 always-on で encoder に含まれている。  
-`exp_016` では `yakuflags` あり条件の policy が `exp_015` baseline より悪化した一方で、特徴量アイデア自体を棄却するには早い。  
-次の `exp_017` では
+`CQ-0270` で追加した self tile-presence flags
 
-- `yakuflags なし`
-- `yakuflags あり`
-- trunk 幅そのまま / 拡張
+- `self_has_honor`
+- `self_has_terminal`
+- `self_has_simple`
+- `self_has_man`
+- `self_has_pin`
+- `self_has_sou`
 
-を同一コードベースで比較したい。
+は、`exp_016` では shared encoder input への常時追加としては baseline 更新に失敗した。  
+一方 `exp_017` では、
+
+- `yakuflags on + narrow` は悪い
+- `yakuflags on + wide` では policy と diagnostics がかなり回復
+- 特に `Tanyao` の `mean_p / hit@0.2` は大きく改善
+
+という結果になり、特徴量アイデア自体は有望だが、**raw feature を policy trunk まで直接流しているのが重い**可能性が高くなった。
+
+現状の Stage2a では、
+
+- `discard_trunk`
+- `optional_trunk`
+- `value_trunk`
+
+が分かれており、`terminal / yaku / value` は value 側でまとまっている。  
+このため、次は tile_presence_flags を **semantic/value 側には入れるが、discard/optional の raw policy 入力には直接入れない** 条件を試したい。
 
 #### 要求内容
-`FlatFeatureEncoder` の `tile_presence_flags` を config flag 化する。
+Stage2a で `tile_presence_flags` を semantic/value trunk 限定で使えるようにする。
 
-- `feature_encoder.tile_presence_flags.enabled: true/false` を追加する
-- `false` のとき
-  - `tile_presence_flags` を encode 出力に含めない
-  - `metadata.feature_ranges` にも出さない
-  - output dim も旧 `exp_015` 相当に戻る
-- `true` のときは現行 `CQ-0270` と同じ動作にする
-- full / partial 両 path で self 基準を維持する
-- runner / tests / model input dim 計算がこの flag に追従するようにする
+具体的には:
+
+- encoder は従来どおり `tile_presence_flags` を出してよい
+- ただし model 側で
+  - `value_trunk` には tile_presence_flags を含む full feature を入れる
+  - `discard_trunk` と `optional_trunk` には tile_presence_flags を除いた feature を入れる
+- semantic summary 経由の影響は従来どおり許す
+  - つまり policy は raw flag を見ないが、semantic summary 経由では影響を受けうる
+
+切替は config でできるようにする。
+
+推奨:
+
+- `model.semantic_aux.tile_presence_flags_semantic_only: true/false`
+  - `false`: 現行どおり raw で全 trunk に入る
+  - `true`: value/semantic 側のみ raw 入力に残し、discard/optional からは除外
 
 #### 関連文書
-- RL_SPEC.md: feature_encoder / Stage2a 実験条件に関係
-- その他: `experiments/Stage02_CallUnlock/exp_015/report.md`
-- その他: `experiments/Stage02_CallUnlock/exp_016/runbook.md`
+- RL_SPEC.md
+- `experiments/Stage02_CallUnlock/exp_016/report.md`
+- `experiments/Stage02_CallUnlock/exp_017/report.md`
+- `reference/stage2/stage2a_semantic_aux_trunk_design.md`
 
 #### 受け入れ条件
-- `tile_presence_flags=false` で `exp_015` 相当の observation dim になる
-- `tile_presence_flags=true` で現行 `exp_016` 相当の observation dim になる
-- `feature_ranges` に `tile_presence_flags` が出るのは enabled 時のみ
-- full / partial encode が両設定で壊れない
-- Stage2a config validation / model build / learner tests が通る
-- `exp_017` で `yakuflags` on/off の条件を config override だけで切り替えられる
+- `tile_presence_flags_semantic_only=false` で現行 `CQ-0270/0272` と同一挙動になる
+- `tile_presence_flags_semantic_only=true` のとき:
+  - `value_trunk` 入力には `tile_presence_flags` が残る
+  - `discard_trunk` / `optional_trunk` の raw 入力からは `tile_presence_flags` が除外される
+  - semantic summary の経路は壊れない
+- full / partial とも feature range の意味は変えない
+- config summary / notes / model feature dump から mode が確認できる
+- model smoke / runner / learner の既存テストが通る
 
 #### 実装メモ
-`exp_017` では
-
-- baseline (`tile_presence_flags=false`)
-- yakuflags (`tile_presence_flags=true`)
-
-を trunk 幅変更あり/なしで比較する予定。
+- 今回の狙いは「特徴量を削除すること」ではなく、「raw policy trunk への直接流入を止めること」
+- `exp_018` ではこの mode を narrow / wide で比較する想定
 
 ---

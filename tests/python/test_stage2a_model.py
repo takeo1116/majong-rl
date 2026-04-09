@@ -723,3 +723,118 @@ class TestImitationDiagnosticsPreloaded:
         assert metrics["semantic_aux_enabled"] is True
         assert metrics["terminal_loss"] is not None
         assert metrics["timing"]["diagnostics_sec"] >= 0
+
+
+# ========== CQ-0273: semantic_only routing ==========
+
+class TestSemanticOnlyRouting:
+    """tile_presence_flags を semantic/value trunk 限定にする"""
+
+    def test_default_no_change(self):
+        """semantic_only_ranges=None → 現行と同じ dim"""
+        m = Stage2aModel(input_dim=100, discard_hidden_dims=[32],
+                          optional_hidden_dims=[32])
+        x = torch.randn(2, 100)
+        mask = torch.ones(2, 34)
+        out = m.forward_discard(x, mask)
+        assert out.discard_logits.shape == (2, 34)
+
+    def test_semantic_only_discard_smaller_input(self):
+        """semantic_only=true → discard first layer input が 6 小さい"""
+        # Without semantic_only
+        m1 = Stage2aModel(input_dim=100, discard_hidden_dims=[32],
+                           optional_hidden_dims=[32])
+        d1_in = m1.discard_trunk[0].in_features
+
+        # With semantic_only (6 dim excluded from policy)
+        m2 = Stage2aModel(input_dim=100, discard_hidden_dims=[32],
+                           optional_hidden_dims=[32],
+                           semantic_only_ranges={"tp": (94, 100)})
+        d2_in = m2.discard_trunk[0].in_features
+        assert d1_in - d2_in == 6
+
+    def test_semantic_only_value_unchanged(self):
+        """semantic_only=true → value trunk input は変わらない"""
+        m1 = Stage2aModel(input_dim=100, discard_hidden_dims=[32],
+                           optional_hidden_dims=[32], value_hidden_dims=[32])
+        v1_in = m1.value_trunk[0].in_features
+
+        m2 = Stage2aModel(input_dim=100, discard_hidden_dims=[32],
+                           optional_hidden_dims=[32], value_hidden_dims=[32],
+                           semantic_only_ranges={"tp": (94, 100)})
+        v2_in = m2.value_trunk[0].in_features
+        assert v1_in == v2_in
+
+    def test_semantic_only_optional_smaller_input(self):
+        """semantic_only=true → optional first layer input も小さい"""
+        m1 = Stage2aModel(input_dim=100, discard_hidden_dims=[32],
+                           optional_hidden_dims=[32])
+        o1_in = m1.optional_trunk[0].in_features
+
+        m2 = Stage2aModel(input_dim=100, discard_hidden_dims=[32],
+                           optional_hidden_dims=[32],
+                           semantic_only_ranges={"tp": (94, 100)})
+        o2_in = m2.optional_trunk[0].in_features
+        assert o1_in - o2_in == 6
+
+    def test_discard_forward_smoke(self):
+        """semantic_only + semantic_aux で discard forward が通る"""
+        m = Stage2aModel(
+            input_dim=100, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+            semantic_aux_config={"enabled": True, "policy_projection_dim": 8},
+            semantic_only_ranges={"tp": (94, 100)})
+        x = torch.randn(2, 100)
+        mask = torch.ones(2, 34)
+        out = m.forward_discard(x, mask)
+        assert out.discard_logits.shape == (2, 34)
+        assert out.semantic is not None
+
+    def test_optional_forward_smoke(self):
+        """semantic_only + semantic_aux で optional forward が通る"""
+        m = Stage2aModel(
+            input_dim=100, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+            semantic_aux_config={"enabled": True, "policy_projection_dim": 8},
+            semantic_only_ranges={"tp": (94, 100)})
+        x = torch.randn(2, 100)
+        cf = torch.zeros(2, 3, 6, dtype=torch.long)
+        cm = torch.ones(2, 3)
+        out = m.forward_optional(x, cf, cm)
+        assert out.optional_scores.shape == (2, 3)
+        assert out.semantic is not None
+
+    def test_hint_change_affects_discard(self):
+        """semantic_only の features を変えても discard logits は変わらない"""
+        m = Stage2aModel(
+            input_dim=100, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+            semantic_only_ranges={"tp": (94, 100)})
+        m.eval()
+        x1 = torch.randn(1, 100)
+        x2 = x1.clone()
+        x2[0, 94:100] = torch.randn(6)  # change semantic_only features
+        mask = torch.ones(1, 34)
+        with torch.no_grad():
+            o1 = m.forward_discard(x1, mask, compute_value=False)
+            o2 = m.forward_discard(x2, mask, compute_value=False)
+        # policy trunk doesn't see these features → logits identical
+        assert torch.allclose(o1.discard_logits, o2.discard_logits)
+
+    def test_hint_change_affects_value(self):
+        """semantic_only の features を変えると value が変わる"""
+        m = Stage2aModel(
+            input_dim=100, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+            semantic_only_ranges={"tp": (94, 100)})
+        m.eval()
+        x1 = torch.randn(1, 100)
+        x2 = x1.clone()
+        x2[0, 94:100] = torch.randn(6) * 10  # large change
+        mask = torch.ones(1, 34)
+        with torch.no_grad():
+            o1 = m.forward_discard(x1, mask, compute_value=True)
+            o2 = m.forward_discard(x2, mask, compute_value=True)
+        # value trunk sees these features → values differ
+        assert not torch.allclose(
+            o1.values["round_delta"], o2.values["round_delta"])
