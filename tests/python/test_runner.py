@@ -1912,10 +1912,14 @@ class TestImitationMultiProcess:
         assert imi_stats["num_workers"] == 2
         assert imi_stats["shard_count"] >= 2
         # seed_strategy が記録されている (CQ-0083)
+        # imitation の base_seed は selfplay.imitation_seed_start → seed_start → 0
+        # (global_seed ではない)
         ss = imi_stats["seed_strategy"]
         assert ss is not None
         assert "base_seed" in ss
-        assert ss["base_seed"] == 42
+        expected_base = config.selfplay.get(
+            "imitation_seed_start", config.selfplay.get("seed_start", 0))
+        assert ss["base_seed"] == expected_base
         assert "method" in ss
 
     def test_notes_records_imitation_parallel_info(self, tmp_path: Path):
