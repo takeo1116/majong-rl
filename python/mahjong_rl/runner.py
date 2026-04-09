@@ -3073,6 +3073,13 @@ class Stage1Runner:
                 "context_gate_enabled": pdh_cfg.get(
                     "context_gate", {}).get("enabled", False),
             },
+            # CQ-0273: semantic_aux routing info
+            "semantic_aux": {
+                "enabled": model_cfg.get("semantic_aux", {}).get("enabled", False),
+                "tile_presence_flags_semantic_only": model_cfg.get(
+                    "semantic_aux", {}).get(
+                    "tile_presence_flags_semantic_only", False),
+            },
         }
 
         # プロファイル情報 (CQ-0098)
@@ -3501,6 +3508,10 @@ class Stage1Runner:
         lines.append(f"- encoder: {enc_cfg.get('name', '?')} "
                      f"({_flag_str}, "
                      f"input_dim={result.get('input_dim', '?')})")
+        # CQ-0273: semantic_only routing info in notes
+        _sa_cfg = self._config.model.get("semantic_aux", {})
+        if _sa_cfg.get("tile_presence_flags_semantic_only", False):
+            lines.append("- tile_presence_flags_semantic_only=on")
 
         # デバイス情報
         resolved = result.get("resolved_devices", {})

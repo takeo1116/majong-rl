@@ -838,3 +838,26 @@ class TestSemanticOnlyRouting:
         # value trunk sees these features → values differ
         assert not torch.allclose(
             o1.values["round_delta"], o2.values["round_delta"])
+
+    def test_semantic_only_checkpoint_roundtrip(self):
+        """semantic_only model の state_dict を save/load できる"""
+        import tempfile
+        m1 = Stage2aModel(
+            input_dim=100, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+            semantic_aux_config={"enabled": True, "policy_projection_dim": 8},
+            semantic_only_ranges={"tp": (94, 100)})
+        path = tempfile.mktemp(suffix=".pt")
+        torch.save(m1.state_dict(), path)
+        # reconstruct with same config
+        m2 = Stage2aModel(
+            input_dim=100, discard_hidden_dims=[32],
+            optional_hidden_dims=[32], value_hidden_dims=[32],
+            semantic_aux_config={"enabled": True, "policy_projection_dim": 8},
+            semantic_only_ranges={"tp": (94, 100)})
+        m2.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+        # forward should work
+        x = torch.randn(1, 100)
+        mask = torch.ones(1, 34)
+        out = m2.forward_discard(x, mask)
+        assert out.discard_logits.shape == (1, 34)

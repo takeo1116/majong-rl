@@ -73,7 +73,17 @@ def main():
 
     # model
     from mahjong_rl.models.stage2a_model import Stage2aModel
-    sa_config = mc.get("semantic_aux")
+    sa_config = mc.get("semantic_aux") or {}
+    meta = enc.metadata()
+    # CQ-0265: direct hint ranges
+    hint_ranges = {s: meta.feature_ranges[s]
+                   for s in ("shanten_hint", "discard_ukeire_hint")
+                   if s in meta.feature_ranges}
+    # CQ-0273: semantic-only ranges
+    sem_only = {}
+    if sa_config.get("tile_presence_flags_semantic_only", False):
+        if "tile_presence_flags" in meta.feature_ranges:
+            sem_only["tile_presence_flags"] = meta.feature_ranges["tile_presence_flags"]
     model = Stage2aModel(
         input_dim=input_dim,
         discard_hidden_dims=mc.get("discard_hidden_dims", [256, 128]),
@@ -82,7 +92,9 @@ def main():
         value_hidden_dims=mc.get("value_hidden_dims", [128, 64]),
         candidate_dim=mc.get("candidate_dim", 16),
         optional_scorer_hidden=mc.get("optional_scorer_hidden", 32),
-        semantic_aux_config=sa_config,
+        semantic_aux_config=sa_config if sa_config else None,
+        direct_hint_ranges=hint_ranges if hint_ranges else None,
+        semantic_only_ranges=sem_only if sem_only else None,
     )
 
     device = torch.device(args.device)

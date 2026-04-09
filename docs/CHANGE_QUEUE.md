@@ -54,7 +54,7 @@
 ## 変更要求一覧
 
 ### CQ-0273
-- Status: [Proposed]
+- Status: [Implemented]
 - Type: RL
 - Priority: High
 - Title: tile_presence_flags を semantic/value trunk 限定入力にする
