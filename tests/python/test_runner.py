@@ -2393,7 +2393,7 @@ class TestShantenHintIntegration:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("shanten_hint") is True
-        assert ef.get("input_dim") == 501  # full(467) + 34
+        assert ef.get("input_dim") == 495  # full(461) + 34
 
         # notes に encoder 情報が含まれる (CQ-0121)
         notes = (run_dir / "notes.md").read_text()
@@ -2412,7 +2412,7 @@ class TestShantenHintIntegration:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("shanten_hint") is False
-        assert ef.get("input_dim") == 467  # full (CQ-0264: +4 menzen)
+        assert ef.get("input_dim") == 461  # full (CQ-0264: +4 menzen)
 
 
 @pytest.mark.smoke
@@ -2955,7 +2955,7 @@ class TestEncoderFeatureWiring:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("discard_ukeire_hint") is True
-        assert ef.get("input_dim") == 501  # full(467) + 34
+        assert ef.get("input_dim") == 495  # full(461) + 34
 
     def test_current_shanten_on(self, tmp_path: Path):
         """current_shanten=on で run 完走し summary に記録される"""
@@ -2971,7 +2971,7 @@ class TestEncoderFeatureWiring:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("current_shanten") is True
-        assert ef.get("input_dim") == 468  # full(467) + 1
+        assert ef.get("input_dim") == 462  # full(461) + 1
 
     def test_shape_hint_on(self, tmp_path: Path):
         """shape_hint=on で run 完走し summary に記録される"""
@@ -2987,7 +2987,7 @@ class TestEncoderFeatureWiring:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("shape_hint") is True
-        assert ef.get("input_dim") == 533  # full(467) + 66
+        assert ef.get("input_dim") == 527  # full(461) + 66
 
     def test_all_new_features_on(self, tmp_path: Path):
         """全新オプション有効で run 完走"""
@@ -3007,8 +3007,8 @@ class TestEncoderFeatureWiring:
         assert ef.get("discard_ukeire_hint") is True
         assert ef.get("current_shanten") is True
         assert ef.get("shape_hint") is True
-        # full(467) + 34 + 1 + 66 = 560
-        assert ef.get("input_dim") == 568
+        # full(461) + 34 + 1 + 66 = 560
+        assert ef.get("input_dim") == 562
 
     def test_default_off_backward_compat(self, tmp_path: Path):
         """新オプション既定 off で従来の次元を維持"""
@@ -3026,7 +3026,7 @@ class TestEncoderFeatureWiring:
         assert ef.get("current_shanten") is False
         assert ef.get("shape_hint") is False
         assert ef.get("turn_context") is False
-        assert ef.get("input_dim") == 467  # CQ-0267: +4 menzen
+        assert ef.get("input_dim") == 461  # CQ-0267: +4 menzen
 
     def test_turn_context_on(self, tmp_path: Path):
         """turn_context=on で run 完走し summary に記録される (CQ-0177)"""
@@ -3042,7 +3042,7 @@ class TestEncoderFeatureWiring:
             summary = json.load(f)
         ef = summary.get("encoder_features", {})
         assert ef.get("turn_context") is True
-        assert ef.get("input_dim") == 471  # full(467) + 4
+        assert ef.get("input_dim") == 465  # full(461) + 4
 
 
 @pytest.mark.smoke

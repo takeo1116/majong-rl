@@ -52,3 +52,55 @@
 ---
 
 ## 変更要求一覧
+
+### CQ-0272
+- Status: [Proposed]
+- Type: RL
+- Priority: High
+- Title: tile_presence_flags を feature_encoder config で on/off 切替可能にする
+
+#### 背景
+`CQ-0270` で追加した `tile_presence_flags` は現在 always-on で encoder に含まれている。  
+`exp_016` では `yakuflags` あり条件の policy が `exp_015` baseline より悪化した一方で、特徴量アイデア自体を棄却するには早い。  
+次の `exp_017` では
+
+- `yakuflags なし`
+- `yakuflags あり`
+- trunk 幅そのまま / 拡張
+
+を同一コードベースで比較したい。
+
+#### 要求内容
+`FlatFeatureEncoder` の `tile_presence_flags` を config flag 化する。
+
+- `feature_encoder.tile_presence_flags.enabled: true/false` を追加する
+- `false` のとき
+  - `tile_presence_flags` を encode 出力に含めない
+  - `metadata.feature_ranges` にも出さない
+  - output dim も旧 `exp_015` 相当に戻る
+- `true` のときは現行 `CQ-0270` と同じ動作にする
+- full / partial 両 path で self 基準を維持する
+- runner / tests / model input dim 計算がこの flag に追従するようにする
+
+#### 関連文書
+- RL_SPEC.md: feature_encoder / Stage2a 実験条件に関係
+- その他: `experiments/Stage02_CallUnlock/exp_015/report.md`
+- その他: `experiments/Stage02_CallUnlock/exp_016/runbook.md`
+
+#### 受け入れ条件
+- `tile_presence_flags=false` で `exp_015` 相当の observation dim になる
+- `tile_presence_flags=true` で現行 `exp_016` 相当の observation dim になる
+- `feature_ranges` に `tile_presence_flags` が出るのは enabled 時のみ
+- full / partial encode が両設定で壊れない
+- Stage2a config validation / model build / learner tests が通る
+- `exp_017` で `yakuflags` on/off の条件を config override だけで切り替えられる
+
+#### 実装メモ
+`exp_017` では
+
+- baseline (`tile_presence_flags=false`)
+- yakuflags (`tile_presence_flags=true`)
+
+を trunk 幅変更あり/なしで比較する予定。
+
+---

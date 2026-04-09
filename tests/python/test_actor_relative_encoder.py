@@ -322,7 +322,7 @@ class TestPartialRegression:
         obs = make_partial_observation(env, player)
         enc = FlatFeatureEncoder(observation_mode="partial")
         feat = enc.encode(obs)
-        assert feat.shape == (361,)
+        assert feat.shape == (355,)
 
     def test_partial_hand_nonnegative(self):
         e = GameEngine()
@@ -489,7 +489,7 @@ class TestMetadataUpdate:
     def test_full_dim_includes_menzen(self):
         enc = FlatFeatureEncoder(observation_mode="full")
         meta = enc.metadata()
-        assert meta.output_shape == (467,)
+        assert meta.output_shape == (461,)
 
     def test_menzen_in_feature_ranges(self):
         enc = FlatFeatureEncoder(observation_mode="full")
@@ -527,4 +527,4 @@ class TestMetadataUpdate:
     def test_partial_dim_unchanged(self):
         enc = FlatFeatureEncoder(observation_mode="partial")
         meta = enc.metadata()
-        assert meta.output_shape == (361,)
+        assert meta.output_shape == (355,)

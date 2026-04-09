@@ -12,7 +12,7 @@ from mahjong_rl.shard import LearningSample, ShardReader, ShardWriter
 from mahjong_rl.learner import Learner
 
 
-def _write_dummy_shards(shard_dir: Path, n: int = 100, obs_dim: int = 467):
+def _write_dummy_shards(shard_dir: Path, n: int = 100, obs_dim: int = 461):
     """ダミーの shard データを書き出す"""
     writer = ShardWriter(shard_dir, max_samples=10000)
     for i in range(n):
@@ -56,7 +56,7 @@ class TestLearner:
 
     def test_train_one_epoch(self, tmp_path: Path):
         """shard 読み込み → 1 epoch 学習が通る"""
-        obs_dim = 467
+        obs_dim = 461
         shard_dir = tmp_path / "shards"
         _write_dummy_shards(shard_dir, n=100, obs_dim=obs_dim)
 

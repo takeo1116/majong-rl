@@ -67,6 +67,7 @@ def main():
         opponent_current_shanten=_parse_encoder_flag(ec, "opponent_current_shanten"),
         opponent_tenpai_flag=_parse_encoder_flag(ec, "opponent_tenpai_flag"),
         danger_mask=_parse_encoder_flag(ec, "danger_mask"),
+        tile_presence_flags=_parse_encoder_flag(ec, "tile_presence_flags"),
     )
     input_dim = int(np.prod(enc.metadata().output_shape))
 

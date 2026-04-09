@@ -325,7 +325,7 @@ class TestStage2aRealShardPPO:
         from mahjong_rl.encoders import FlatFeatureEncoder
 
         # 1. Real data generation with model
-        obs_dim = 467  # full observation (CQ-0264: +4 menzen)
+        obs_dim = 461  # full observation (CQ-0264: +4 menzen)
         encoder = FlatFeatureEncoder(observation_mode="full")
         model = Stage2aModel(input_dim=obs_dim, discard_hidden_dims=[32],
                               optional_hidden_dims=[32])

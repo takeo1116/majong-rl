@@ -108,7 +108,8 @@ class FlatFeatureEncoder(FeatureEncoder):
                  turn_context: bool = False,
                  opponent_current_shanten: bool = False,
                  opponent_tenpai_flag: bool = False,
-                 danger_mask: bool = False):
+                 danger_mask: bool = False,
+                 tile_presence_flags: bool = False):
         """
         Args:
             observation_mode: "full", "partial", "both"
@@ -120,6 +121,7 @@ class FlatFeatureEncoder(FeatureEncoder):
             opponent_current_shanten: True で相手3家のシャンテンを追加 (CQ-0213, full-only)
             opponent_tenpai_flag: True で相手3家のテンパイフラグを追加 (CQ-0213, full-only)
             danger_mask: True で相手3家の danger_mask を追加 (CQ-0213, full-only)
+            tile_presence_flags: True で self tile-presence flags を追加 (CQ-0270/0272)
         """
         self._observation_mode = observation_mode
         self._shanten_hint = shanten_hint
@@ -127,6 +129,7 @@ class FlatFeatureEncoder(FeatureEncoder):
         self._current_shanten_input = current_shanten_input
         self._shape_hint = shape_hint
         self._turn_context = turn_context
+        self._tile_presence_flags = tile_presence_flags
         # CQ-0246: scratch buffers for encode (re-zeroed each call)
         self._scratch_hand = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
         self._scratch_discard = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
@@ -177,9 +180,10 @@ class FlatFeatureEncoder(FeatureEncoder):
         dim += self._SELF_TENPAI_FLAG_DIM
         ranges["remaining_draws_norm"] = (dim, dim + self._REMAINING_DRAWS_DIM)
         dim += self._REMAINING_DRAWS_DIM
-        # CQ-0270: tile presence flags (always on)
-        ranges["tile_presence_flags"] = (dim, dim + self._TILE_PRESENCE_DIM)
-        dim += self._TILE_PRESENCE_DIM
+        # CQ-0270/0272: tile presence flags (configurable)
+        if self._tile_presence_flags:
+            ranges["tile_presence_flags"] = (dim, dim + self._TILE_PRESENCE_DIM)
+            dim += self._TILE_PRESENCE_DIM
         if self._shape_hint:
             ranges["shape_hint"] = (dim, dim + self._SHAPE_HINT_DIM)
             dim += self._SHAPE_HINT_DIM
@@ -299,8 +303,9 @@ class FlatFeatureEncoder(FeatureEncoder):
             hand_counts_for_hint, meld_count=meld_count))
         features.append(self._compute_remaining_draws_norm(obs.remaining_draws))
 
-        # CQ-0270: tile presence flags (always on, self = hand + melds)
-        features.append(self._compute_tile_presence_flags(obs.hand, obs.melds))
+        # CQ-0270/0272: tile presence flags (configurable)
+        if self._tile_presence_flags:
+            features.append(self._compute_tile_presence_flags(obs.hand, obs.melds))
 
         # 手牌形状ヒント (CQ-0170)
         if self._shape_hint:
@@ -415,9 +420,10 @@ class FlatFeatureEncoder(FeatureEncoder):
             hand_counts_current, meld_count=meld_count))
         features.append(self._compute_remaining_draws_norm(obs.remaining_draws))
 
-        # CQ-0270: tile presence flags (always on, self = hand + melds)
-        features.append(self._compute_tile_presence_flags(
-            obs.hands[current_player], obs.melds[current_player]))
+        # CQ-0270/0272: tile presence flags (configurable)
+        if self._tile_presence_flags:
+            features.append(self._compute_tile_presence_flags(
+                obs.hands[current_player], obs.melds[current_player]))
 
         # 手牌形状ヒント (CQ-0170)
         if self._shape_hint:

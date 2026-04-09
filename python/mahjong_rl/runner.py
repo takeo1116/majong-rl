@@ -149,6 +149,7 @@ def _rebuild_encoder(encoder_config: dict, obs_mode: str):
         opponent_current_shanten=_parse_encoder_flag(encoder_config, "opponent_current_shanten"),
         opponent_tenpai_flag=_parse_encoder_flag(encoder_config, "opponent_tenpai_flag"),
         danger_mask=_parse_encoder_flag(encoder_config, "danger_mask"),
+        tile_presence_flags=_parse_encoder_flag(encoder_config, "tile_presence_flags"),
     )
 
 
@@ -2729,6 +2730,7 @@ class Stage1Runner:
             opponent_current_shanten=_parse_encoder_flag(enc_cfg, "opponent_current_shanten"),
             opponent_tenpai_flag=_parse_encoder_flag(enc_cfg, "opponent_tenpai_flag"),
             danger_mask=_parse_encoder_flag(enc_cfg, "danger_mask"),
+            tile_presence_flags=_parse_encoder_flag(enc_cfg, "tile_presence_flags"),
         )
 
     def _create_model(self, encoder):
@@ -3029,6 +3031,7 @@ class Stage1Runner:
             "opponent_current_shanten": _parse_encoder_flag(enc_cfg, "opponent_current_shanten"),
             "opponent_tenpai_flag": _parse_encoder_flag(enc_cfg, "opponent_tenpai_flag"),
             "danger_mask": _parse_encoder_flag(enc_cfg, "danger_mask"),
+            "tile_presence_flags": _parse_encoder_flag(enc_cfg, "tile_presence_flags"),
             "input_dim": result.get("input_dim"),
         }
 
@@ -3484,6 +3487,7 @@ class Stage1Runner:
             "opponent_current_shanten": _parse_encoder_flag(enc_cfg, "opponent_current_shanten"),
             "opponent_tenpai_flag": _parse_encoder_flag(enc_cfg, "opponent_tenpai_flag"),
             "danger_mask": _parse_encoder_flag(enc_cfg, "danger_mask"),
+            "tile_presence_flags": _parse_encoder_flag(enc_cfg, "tile_presence_flags"),
         }
         _flag_str = ", ".join(f"{k}={'on' if v else 'off'}" for k, v in _flags.items())
         lines.append(f"- encoder: {enc_cfg.get('name', '?')} "

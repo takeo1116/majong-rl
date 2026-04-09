@@ -52,7 +52,7 @@ class TestFlatEncoderPartial:
     def test_partial_dim(self, partial_obs):
         enc = FlatFeatureEncoder(observation_mode="partial")
         result = enc.encode(partial_obs)
-        assert result.shape == (361,)
+        assert result.shape == (355,)
 
     def test_hand_counts_nonnegative(self, partial_obs):
         enc = FlatFeatureEncoder(observation_mode="partial")
@@ -80,7 +80,7 @@ class TestFlatEncoderFull:
     def test_full_dim(self, full_obs):
         enc = FlatFeatureEncoder(observation_mode="full")
         result = enc.encode(full_obs)
-        assert result.shape == (467,)  # CQ-0264: +4 menzen
+        assert result.shape == (461,)  # CQ-0264: +4 menzen
 
     def test_all_hands_present(self, full_obs):
         """Full モードでは全4家の手牌が含まれる"""
@@ -175,7 +175,7 @@ class TestMetadata:
     def test_flat_partial_metadata(self):
         enc = FlatFeatureEncoder(observation_mode="partial")
         meta = enc.metadata()
-        assert meta.output_shape == (361,)
+        assert meta.output_shape == (355,)
         assert meta.dtype == np.float32
         assert meta.observation_mode == "partial"
         assert meta.name == "FlatFeatureEncoder"
@@ -183,7 +183,7 @@ class TestMetadata:
     def test_flat_full_metadata(self):
         enc = FlatFeatureEncoder(observation_mode="full")
         meta = enc.metadata()
-        assert meta.output_shape == (467,)
+        assert meta.output_shape == (461,)
 
     def test_channel_partial_metadata(self):
         enc = ChannelTensorEncoder(observation_mode="partial")
@@ -200,7 +200,7 @@ class TestMetadata:
 
     def test_output_dim_flat(self):
         enc = FlatFeatureEncoder(observation_mode="partial")
-        assert enc.output_dim == 361
+        assert enc.output_dim == 355
 
     def test_output_dim_channel(self):
         enc = ChannelTensorEncoder(observation_mode="partial")
@@ -237,12 +237,12 @@ class TestBothMode:
     def test_flat_both_accepts_partial(self, partial_obs):
         enc = FlatFeatureEncoder(observation_mode="both")
         result = enc.encode(partial_obs)
-        assert result.shape == (361,)
+        assert result.shape == (355,)
 
     def test_flat_both_accepts_full(self, full_obs):
         enc = FlatFeatureEncoder(observation_mode="both")
         result = enc.encode(full_obs)
-        assert result.shape == (467,)
+        assert result.shape == (461,)
 
     def test_channel_both_accepts_partial(self, partial_obs):
         enc = ChannelTensorEncoder(observation_mode="both")
@@ -259,24 +259,24 @@ class TestShantenHint:
     """シャンテン補助特徴 on/off テスト (CQ-0120)"""
 
     def test_off_preserves_partial_dim(self):
-        """off 時 partial=361 を維持"""
+        """off 時 partial=355 を維持"""
         enc = FlatFeatureEncoder(observation_mode="partial", shanten_hint=False)
-        assert enc.metadata().output_shape == (361,)
+        assert enc.metadata().output_shape == (355,)
 
     def test_off_preserves_full_dim(self):
-        """off 時 full=467 を維持"""
+        """off 時 full=461 を維持"""
         enc = FlatFeatureEncoder(observation_mode="full", shanten_hint=False)
-        assert enc.metadata().output_shape == (467,)
+        assert enc.metadata().output_shape == (461,)
 
     def test_on_adds_34_partial(self):
         """on 時 partial=387"""
         enc = FlatFeatureEncoder(observation_mode="partial", shanten_hint=True)
-        assert enc.metadata().output_shape == (395,)
+        assert enc.metadata().output_shape == (389,)
 
     def test_on_adds_34_full(self):
         """on 時 full=489"""
         enc = FlatFeatureEncoder(observation_mode="full", shanten_hint=True)
-        assert enc.metadata().output_shape == (501,)
+        assert enc.metadata().output_shape == (495,)
 
     def test_metadata_matches_output_partial(self, partial_obs):
         """on 時 metadata.output_shape と encode() 結果 shape が一致 (partial)"""
@@ -423,24 +423,24 @@ class TestDiscardUkeireHint:
     """打牌候補受け入れ枚数テスト (CQ-0168)"""
 
     def test_off_preserves_partial_dim(self):
-        """off 時 partial=361 を維持"""
+        """off 時 partial=355 を維持"""
         enc = FlatFeatureEncoder(observation_mode="partial", discard_ukeire_hint=False)
-        assert enc.metadata().output_shape == (361,)
+        assert enc.metadata().output_shape == (355,)
 
     def test_off_preserves_full_dim(self):
-        """off 時 full=467 を維持"""
+        """off 時 full=461 を維持"""
         enc = FlatFeatureEncoder(observation_mode="full", discard_ukeire_hint=False)
-        assert enc.metadata().output_shape == (467,)
+        assert enc.metadata().output_shape == (461,)
 
     def test_on_adds_34_partial(self):
-        """on 時 partial=361+34=387"""
+        """on 時 partial=355+34=387"""
         enc = FlatFeatureEncoder(observation_mode="partial", discard_ukeire_hint=True)
-        assert enc.metadata().output_shape == (395,)
+        assert enc.metadata().output_shape == (389,)
 
     def test_on_adds_34_full(self):
-        """on 時 full=467+34=493"""
+        """on 時 full=461+34=493"""
         enc = FlatFeatureEncoder(observation_mode="full", discard_ukeire_hint=True)
-        assert enc.metadata().output_shape == (501,)
+        assert enc.metadata().output_shape == (495,)
 
     def test_metadata_matches_output_partial(self, partial_obs):
         """metadata と encode 結果の shape が一致"""
@@ -497,27 +497,27 @@ class TestDiscardUkeireHint:
             shanten_hint=True,
             discard_ukeire_hint=True,
         )
-        # 361 + 34 (shanten_hint) + 34 (discard_ukeire) = 421
-        assert enc.metadata().output_shape == (429,)
+        # 355 + 34 (shanten_hint) + 34 (discard_ukeire) = 421
+        assert enc.metadata().output_shape == (423,)
 
 
 class TestCurrentShantenInput:
     """policy 用 current_shanten テスト (CQ-0169)"""
 
     def test_off_preserves_partial_dim(self):
-        """off 時 partial=361 を維持"""
+        """off 時 partial=355 を維持"""
         enc = FlatFeatureEncoder(observation_mode="partial", current_shanten_input=False)
-        assert enc.metadata().output_shape == (361,)
+        assert enc.metadata().output_shape == (355,)
 
     def test_on_adds_1_partial(self):
-        """on 時 partial=362"""
+        """on 時 partial=356"""
         enc = FlatFeatureEncoder(observation_mode="partial", current_shanten_input=True)
-        assert enc.metadata().output_shape == (362,)
+        assert enc.metadata().output_shape == (356,)
 
     def test_on_adds_1_full(self):
         """on 時 full=456"""
         enc = FlatFeatureEncoder(observation_mode="full", current_shanten_input=True)
-        assert enc.metadata().output_shape == (468,)
+        assert enc.metadata().output_shape == (462,)
 
     def test_metadata_matches_output_partial(self, partial_obs):
         """metadata と encode 結果の shape が一致"""
@@ -559,19 +559,19 @@ class TestShapeHint:
     """手牌形状ヒントテスト (CQ-0170)"""
 
     def test_off_preserves_partial_dim(self):
-        """off 時 partial=361 を維持"""
+        """off 時 partial=355 を維持"""
         enc = FlatFeatureEncoder(observation_mode="partial", shape_hint=False)
-        assert enc.metadata().output_shape == (361,)
+        assert enc.metadata().output_shape == (355,)
 
     def test_on_adds_66_partial(self):
-        """on 時 partial=361+66=419"""
+        """on 時 partial=355+66=419"""
         enc = FlatFeatureEncoder(observation_mode="partial", shape_hint=True)
-        assert enc.metadata().output_shape == (427,)
+        assert enc.metadata().output_shape == (421,)
 
     def test_on_adds_66_full(self):
-        """on 時 full=467+66=525"""
+        """on 時 full=461+66=525"""
         enc = FlatFeatureEncoder(observation_mode="full", shape_hint=True)
-        assert enc.metadata().output_shape == (533,)
+        assert enc.metadata().output_shape == (527,)
 
     def test_metadata_matches_output_partial(self, partial_obs):
         """metadata と encode 結果の shape が一致"""
@@ -659,8 +659,8 @@ class TestShapeHint:
             current_shanten_input=True,
             shape_hint=True,
         )
-        # 361 + 34 + 34 + 1 + 66 = 488
-        assert enc.metadata().output_shape == (496,)
+        # 355 + 34 + 34 + 1 + 66 = 488
+        assert enc.metadata().output_shape == (490,)
 
     def test_combined_all_features_full(self):
         """全オプション併用時の次元 (full)"""
@@ -671,8 +671,8 @@ class TestShapeHint:
             current_shanten_input=True,
             shape_hint=True,
         )
-        # 467 + 34 + 34 + 1 + 66 = 594
-        assert enc.metadata().output_shape == (602,)
+        # 461 + 34 + 34 + 1 + 66 = 594
+        assert enc.metadata().output_shape == (596,)
 
 
 class TestDiscardUkeireLegalMask:
@@ -950,15 +950,15 @@ class TestTurnContext:
 
     def test_off_preserves_partial_dim(self):
         enc = FlatFeatureEncoder(observation_mode="partial", turn_context=False)
-        assert enc.metadata().output_shape == (361,)
+        assert enc.metadata().output_shape == (355,)
 
     def test_on_adds_4_partial(self):
         enc = FlatFeatureEncoder(observation_mode="partial", turn_context=True)
-        assert enc.metadata().output_shape == (365,)
+        assert enc.metadata().output_shape == (359,)
 
     def test_on_adds_4_full(self):
         enc = FlatFeatureEncoder(observation_mode="full", turn_context=True)
-        assert enc.metadata().output_shape == (471,)
+        assert enc.metadata().output_shape == (465,)
 
     def test_metadata_matches_output_partial(self, partial_obs):
         enc = FlatFeatureEncoder(observation_mode="partial", turn_context=True)
@@ -1012,8 +1012,8 @@ class TestTurnContext:
             shape_hint=True,
             turn_context=True,
         )
-        # 361 + 34 + 34 + 1 + 66 + 4 = 492
-        assert enc.metadata().output_shape == (500,)
+        # 355 + 34 + 34 + 1 + 66 + 4 = 492
+        assert enc.metadata().output_shape == (494,)
 
 
 class TestOpponentFeatures:
@@ -1031,7 +1031,7 @@ class TestOpponentFeatures:
         result = enc.encode(full_obs)
         assert result.shape == meta.output_shape
         # 459 + 3 + 3 + 34*3 = 567
-        assert meta.output_shape == (575,)
+        assert meta.output_shape == (569,)
 
     def test_full_feature_ranges(self, full_obs):
         """feature_ranges に新 feature が登録される"""
@@ -1058,7 +1058,7 @@ class TestOpponentFeatures:
         )
         meta = enc.metadata()
         # partial base = 353, opponent features は含まれない
-        assert meta.output_shape == (361,)
+        assert meta.output_shape == (355,)
         fr = meta.feature_ranges
         assert "opponent_current_shanten" not in fr
         assert "danger_mask_kamicha" not in fr
@@ -1108,7 +1108,7 @@ class TestOpponentFeatures:
     def test_off_preserves_dim(self):
         """opponent features off で既存次元維持"""
         enc = FlatFeatureEncoder(observation_mode="full")
-        assert enc.metadata().output_shape == (467,)
+        assert enc.metadata().output_shape == (461,)
 
     def test_danger_mask_seat_order(self, full_obs):
         """CQ-0214: danger_mask の seat 順が shimo(+1), toimen(+2), kamicha(+3)"""
@@ -1268,40 +1268,66 @@ class TestTilePresenceFlags:
         flags = FlatFeatureEncoder._compute_tile_presence_flags([], [])
         np.testing.assert_array_equal(flags, [0, 0, 0, 0, 0, 0])
 
-    def test_metadata_range(self):
-        """feature_ranges に tile_presence_flags がある"""
-        enc = FlatFeatureEncoder(observation_mode="full")
-        meta = enc.metadata()
-        assert "tile_presence_flags" in meta.feature_ranges
-        s, e = meta.feature_ranges["tile_presence_flags"]
+    def test_off_no_range(self):
+        """CQ-0272: False で feature_ranges に出ない"""
+        enc = FlatFeatureEncoder(observation_mode="full", tile_presence_flags=False)
+        assert "tile_presence_flags" not in enc.metadata().feature_ranges
+
+    def test_on_has_range(self):
+        """CQ-0272: True で feature_ranges に出る"""
+        enc = FlatFeatureEncoder(observation_mode="full", tile_presence_flags=True)
+        assert "tile_presence_flags" in enc.metadata().feature_ranges
+        s, e = enc.metadata().feature_ranges["tile_presence_flags"]
         assert e - s == 6
 
-    def test_full_partial_dim(self):
-        """dim 更新"""
+    def test_dim_difference(self):
+        """CQ-0272: on/off で dim が 6 違う"""
+        enc_off = FlatFeatureEncoder(observation_mode="full", tile_presence_flags=False)
+        enc_on = FlatFeatureEncoder(observation_mode="full", tile_presence_flags=True)
+        diff = enc_on.metadata().output_shape[0] - enc_off.metadata().output_shape[0]
+        assert diff == 6
+        # partial too
+        enc_off_p = FlatFeatureEncoder(observation_mode="partial", tile_presence_flags=False)
+        enc_on_p = FlatFeatureEncoder(observation_mode="partial", tile_presence_flags=True)
+        diff_p = enc_on_p.metadata().output_shape[0] - enc_off_p.metadata().output_shape[0]
+        assert diff_p == 6
+
+    def test_default_off_dim(self):
+        """CQ-0272: default False → exp_015 相当 dim"""
         enc_f = FlatFeatureEncoder(observation_mode="full")
         enc_p = FlatFeatureEncoder(observation_mode="partial")
+        assert enc_f.metadata().output_shape == (461,)
+        assert enc_p.metadata().output_shape == (355,)
+
+    def test_on_dim(self):
+        """CQ-0272: True → exp_016 相当 dim"""
+        enc_f = FlatFeatureEncoder(observation_mode="full", tile_presence_flags=True)
+        enc_p = FlatFeatureEncoder(observation_mode="partial", tile_presence_flags=True)
         assert enc_f.metadata().output_shape == (467,)
         assert enc_p.metadata().output_shape == (361,)
 
-    def test_encode_full_no_crash(self, full_obs):
-        """full encode が crash しない"""
-        enc = FlatFeatureEncoder(observation_mode="full")
+    def test_encode_full_on(self, full_obs):
+        """True で full encode に flags が入る"""
+        enc = FlatFeatureEncoder(observation_mode="full", tile_presence_flags=True)
         feat = enc.encode(full_obs)
         assert feat.shape == enc.metadata().output_shape
-        # tile_presence_flags range
         s, e = enc.metadata().feature_ranges["tile_presence_flags"]
         tp = feat[s:e]
         assert tp.shape == (6,)
         for v in tp:
             assert v in (0.0, 1.0)
 
-    def test_encode_partial_no_crash(self, partial_obs):
-        """partial encode が crash しない"""
-        enc = FlatFeatureEncoder(observation_mode="partial")
+    def test_encode_partial_on(self, partial_obs):
+        """True で partial encode に flags が入る"""
+        enc = FlatFeatureEncoder(observation_mode="partial", tile_presence_flags=True)
         feat = enc.encode(partial_obs)
         assert feat.shape == enc.metadata().output_shape
         s, e = enc.metadata().feature_ranges["tile_presence_flags"]
         tp = feat[s:e]
         assert tp.shape == (6,)
-        for v in tp:
-            assert v in (0.0, 1.0)
+
+    def test_encode_full_off(self, full_obs):
+        """False で full encode に flags が入らない"""
+        enc = FlatFeatureEncoder(observation_mode="full", tile_presence_flags=False)
+        feat = enc.encode(full_obs)
+        assert feat.shape == (461,)

@@ -68,6 +68,7 @@ def _stage2a_selfplay_worker_fn(
             opponent_current_shanten=_parse_encoder_flag(encoder_config, "opponent_current_shanten"),
             opponent_tenpai_flag=_parse_encoder_flag(encoder_config, "opponent_tenpai_flag"),
             danger_mask=_parse_encoder_flag(encoder_config, "danger_mask"),
+            tile_presence_flags=_parse_encoder_flag(encoder_config, "tile_presence_flags"),
         )
 
         # model 再構築 (selfplay 用)
@@ -204,6 +205,7 @@ def _stage2a_eval_worker_fn(
             opponent_current_shanten=_parse_encoder_flag(encoder_config, "opponent_current_shanten"),
             opponent_tenpai_flag=_parse_encoder_flag(encoder_config, "opponent_tenpai_flag"),
             danger_mask=_parse_encoder_flag(encoder_config, "danger_mask"),
+            tile_presence_flags=_parse_encoder_flag(encoder_config, "tile_presence_flags"),
         )
 
         meta = enc.metadata()
