@@ -30,6 +30,7 @@ def _write_dummy_shards(shard_dir: Path, n: int = 100, obs_dim: int = 461):
             worker_id="dummy_worker",
             episode_id="dummy_ep",
             step_id=i,
+            sample_semantics_version=2,
         ))
     writer.close()
 

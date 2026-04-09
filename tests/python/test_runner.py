@@ -1326,7 +1326,10 @@ class TestEvalMultiProcess:
 
         run_dir = Path(result["run_dir"])
         partials_dir = run_dir / "eval" / "partials"
-        partials = sorted(partials_dir.glob("worker_*.json"))
+        # sidecar ファイルを除外して partial のみ取得
+        partials = sorted(
+            p for p in partials_dir.glob("worker_*.json")
+            if "sidecar" not in p.name)
         assert len(partials) >= 2
 
         for p_path in partials:
@@ -1351,7 +1354,9 @@ class TestEvalMultiProcess:
 
         run_dir = Path(result["run_dir"])
         partials_dir = run_dir / "eval" / "partials"
-        partials = sorted(partials_dir.glob("worker_*.json"))
+        partials = sorted(
+            p for p in partials_dir.glob("worker_*.json")
+            if "sidecar" not in p.name)
 
         worker_seeds = set()
         for p_path in partials:
