@@ -54,7 +54,7 @@ class DecisionSample:
     round_id: int = 0
     step_id: int = 0
     actor_type: str = "policy"
-    sample_semantics_version: int = 2
+    sample_semantics_version: int = 3  # CQ-0279: v3 = CQ-0274 同 player transition reward
 
     # discard 用
     action: int = -1                # TileType (discard のみ)
@@ -309,8 +309,10 @@ class DecisionShardReader:
                     round_id=table.column("round_id")[i].as_py(),
                     step_id=table.column("step_id")[i].as_py(),
                     actor_type=table.column("actor_type")[i].as_py(),
-                    sample_semantics_version=table.column(
-                        "sample_semantics_version")[i].as_py(),
+                    sample_semantics_version=(
+                        int(table.column("sample_semantics_version")[i].as_py())
+                        if "sample_semantics_version" in table.column_names
+                        else 0),  # CQ-0279: legacy shard 0 扱い (learner で fail-fast)
                     action=table.column("action")[i].as_py(),
                     legal_mask=mask if dt == "discard" else None,
                     selected_candidate_index=table.column(
@@ -422,6 +424,8 @@ class DecisionShardReader:
             player_ids = np.zeros(nd, dtype=np.int64)
             round_ids = np.zeros(nd, dtype=np.int64)
             resp_ctx = np.zeros((nd, 3), dtype=np.float32)
+            # CQ-0279: sample_semantics_version (旧 shard column 欠如時は 0)
+            sample_versions = np.zeros(nd, dtype=np.int64)
             # CQ-0256: semantic aux targets
             terminal_classes = np.zeros(nd, dtype=np.int64)
             yaku_multihot = np.zeros((nd, NUM_YAKU), dtype=np.float32)
@@ -449,6 +453,9 @@ class DecisionShardReader:
                 episode_ids.append(_col(tbl, "episode_id", ri))
                 player_ids[i] = _col(tbl, "player_id", ri)
                 round_ids[i] = _col_safe(tbl, "round_id", ri, 0)
+                # CQ-0279: sample_semantics_version (column 欠如→ 0 = legacy)
+                sample_versions[i] = int(
+                    _col_safe(tbl, "sample_semantics_version", ri, 0))
                 rc_bytes = _col_safe(tbl, "response_context", ri, None)
                 if rc_bytes:
                     resp_ctx[i] = np.frombuffer(rc_bytes, dtype=np.float32)
@@ -473,6 +480,7 @@ class DecisionShardReader:
                 "terminal_classes": terminal_classes,
                 "yaku_multihot": yaku_multihot,
                 "is_winner": is_winner,
+                "sample_semantics_versions": sample_versions,  # CQ-0279
                 "n": nd,
             }
 
@@ -506,6 +514,8 @@ class DecisionShardReader:
             terminal_classes_c = np.zeros(nc, dtype=np.int64)
             yaku_multihot_c = np.zeros((nc, NUM_YAKU), dtype=np.float32)
             is_winner_c = np.zeros(nc, dtype=np.float32)
+            # CQ-0279: sample_semantics_version
+            sample_versions_c = np.zeros(nc, dtype=np.int64)
 
             for i, (tbl, ri) in enumerate(c_rows):
                 obs[i] = _bytes_to_f32(_col(tbl, "observation", ri), obs_dim)
@@ -521,6 +531,9 @@ class DecisionShardReader:
                 episode_ids_c.append(_col(tbl, "episode_id", ri))
                 player_ids_c[i] = _col(tbl, "player_id", ri)
                 round_ids_c[i] = _col_safe(tbl, "round_id", ri, 0)
+                # CQ-0279: sample_semantics_version
+                sample_versions_c[i] = int(
+                    _col_safe(tbl, "sample_semantics_version", ri, 0))
                 rc_bytes = _col_safe(tbl, "response_context", ri, None)
                 if rc_bytes:
                     resp_ctx_c[i] = np.frombuffer(rc_bytes, dtype=np.float32)
@@ -583,6 +596,7 @@ class DecisionShardReader:
                 "terminal_classes": terminal_classes_c,
                 "yaku_multihot": yaku_multihot_c,
                 "is_winner": is_winner_c,
+                "sample_semantics_versions": sample_versions_c,  # CQ-0279
                 "max_cands": max_cands, "n": nc,
             }
 

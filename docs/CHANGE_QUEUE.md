@@ -121,7 +121,7 @@ Stage2a selfplay の policy sampling を config seed / temperature に従わせ�
 ---
 
 ### CQ-0279
-- Status: [Proposed]
+- Status: [Implemented]
 - Type: RL | IO | Test
 - Priority: High
 - Title: Stage2a reward semantics 修正後の sample_semantics_version を v3 に上げて fail-fast する
@@ -166,5 +166,28 @@ Stage2a の現行 reward semantics を `sample_semantics_version=3` として明
 - CQ-0274 は reward semantics の修正なので、version bump は後追いだが必須
 - `DecisionShardReader.read_as_tensors()` と `read_all()` のどちらの learner path でも検出できるようにする
 - 実験ディレクトリ内の過去 shard を自動変換しない。必要なら再生成する
+
+実装結果:
+- 変更ファイル:
+  - `python/mahjong_rl/call_shard.py`
+    - `DecisionSample.sample_semantics_version` default を `2` → `3`
+    - `DecisionShardReader.read_as_tensors()` の discard / call 両 dict に
+      `sample_semantics_versions` (int64 array) を追加。column 欠如時は 0
+    - `DecisionShardReader.read_all()` の `sample_semantics_version` 取得を
+      `_col_safe` 風に修正し、column 欠如時は 0 に倒す (旧 shard 互換)
+  - `python/mahjong_rl/stage2a_learner.py`
+    - `Stage2aLearner.REQUIRED_SAMPLE_SEMANTICS_VERSION = 3`
+    - `_check_sample_semantics_version()` classmethod で fail-fast
+    - `train()` の入口で discard / call の両 tensor dict を検証
+    - PPO path の `read_all()` 後にも min(sample_semantics_version) で fail-fast
+    - error message に detected version / required (3) / CQ-0274 言及 / 再生成指示
+  - `tests/python/test_sample_semantics_v3.py` (新規)
+- Stage2a selfplay (`Stage2SelfPlayWorker`) は `DecisionSample` の default を
+  使うため、自動的に v3 shard を吐く (worker の追加変更なし)
+- Stage1 `LearningSample` (default v=1) は今回 scope 外で変更なし
+- 既存 Stage2a tests は default 利用なので自動的に v3 になり影響なし
+- テスト 14 件 (default 3 / selfplay v3 / read_as_tensors versions /
+  imitation v2 reject / PPO v2 reject / v3 pass / mixed reject / error
+  message / Stage1 unaffected)
 
 ---

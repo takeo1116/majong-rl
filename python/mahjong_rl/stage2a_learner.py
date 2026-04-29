@@ -175,6 +175,35 @@ class Stage2aLearner:
         _logger.info(f"[CUDA mem] {label}: {snap}")
         return snap
 
+    REQUIRED_SAMPLE_SEMANTICS_VERSION = 3  # CQ-0279
+
+    @classmethod
+    def _check_sample_semantics_version(
+        cls, branch_data: dict | None, branch_name: str,
+    ) -> None:
+        """CQ-0279: shard sample_semantics_version を検証する
+
+        v3 未満が含まれていたら ValueError で fail-fast。
+        CQ-0274 で reward semantics が変わったため、旧 shard を学習に使うと
+        return / advantage の意味が崩れる。
+        """
+        if branch_data is None or branch_data.get("n", 0) == 0:
+            return
+        versions = branch_data.get("sample_semantics_versions")
+        if versions is None or len(versions) == 0:
+            return
+        min_ver = int(np.asarray(versions).min())
+        required = cls.REQUIRED_SAMPLE_SEMANTICS_VERSION
+        if min_ver < required:
+            raise ValueError(
+                f"Stage2a {branch_name} shard に "
+                f"sample_semantics_version={min_ver} の sample が含まれます "
+                f"(required: {required})。"
+                f" CQ-0274 前の旧 reward semantics shard である可能性が高く、"
+                f" return / advantage の意味が崩れるため fail-fast します。"
+                f" Stage2a selfplay で shard を再生成してください。"
+            )
+
     def train(self, shard_dir: Path, num_epochs: int | None = None,
               filter_actor_type: str | None = None) -> dict:
         """CQ-0251: tensor ベースで shard を読み込んで学習"""
@@ -185,6 +214,10 @@ class Stage2aLearner:
         c = data["call"]
         nd = d["n"] if d else 0
         nc = c["n"] if c else 0
+
+        # CQ-0279: legacy shard fail-fast (read_as_tensors 経路)
+        self._check_sample_semantics_version(d, "discard")
+        self._check_sample_semantics_version(c, "call")
 
         # CQ-0250: unsafe mixed PPO guard
         if (self._mode == "ppo" and self._mixed_ppo_mode == "mixed"
@@ -214,6 +247,19 @@ class Stage2aLearner:
             if filter_actor_type:
                 all_samples = [s for s in all_samples
                                if s.actor_type == filter_actor_type]
+            # CQ-0279: read_all 経路でも fail-fast
+            if all_samples:
+                min_ver = min(s.sample_semantics_version for s in all_samples)
+                required = self.REQUIRED_SAMPLE_SEMANTICS_VERSION
+                if min_ver < required:
+                    raise ValueError(
+                        f"Stage2a shard (read_all) に "
+                        f"sample_semantics_version={min_ver} の sample が含まれます "
+                        f"(required: {required})。"
+                        f" CQ-0274 前の旧 reward semantics shard である可能性が高く、"
+                        f" return / advantage の意味が崩れるため fail-fast します。"
+                        f" Stage2a selfplay で shard を再生成してください。"
+                    )
             d_samples = [s for s in all_samples if s.decision_type == "discard"]
             c_samples = [s for s in all_samples if s.decision_type == "call"]
             return self._train_ppo(d_samples, c_samples, epochs)
