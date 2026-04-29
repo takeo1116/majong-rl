@@ -237,3 +237,243 @@ class TestSelfplayMatchSeedReproducibility:
         d2 = [s.action for s in s2 if s.decision_type == "discard"]
         # 配牌が変わるため少なくとも一部が異なる
         assert d1 != d2
+
+
+# ========== CQ-0278 follow-up: parallel temperature 伝播 ==========
+
+
+class TestParallelTemperatureSignature:
+    """run_stage2a_selfplay_parallel / _stage2a_selfplay_worker_fn が
+    temperature を受け取れる"""
+
+    def test_run_parallel_has_temperature_param(self):
+        from mahjong_rl.stage2a_parallel import run_stage2a_selfplay_parallel
+        import inspect
+        sig = inspect.signature(run_stage2a_selfplay_parallel)
+        assert "temperature" in sig.parameters
+        # default は 1.0
+        assert sig.parameters["temperature"].default == 1.0
+
+    def test_worker_fn_has_temperature_param(self):
+        from mahjong_rl.stage2a_parallel import _stage2a_selfplay_worker_fn
+        import inspect
+        sig = inspect.signature(_stage2a_selfplay_worker_fn)
+        assert "temperature" in sig.parameters
+        assert sig.parameters["temperature"].default == 1.0
+
+
+class TestParallelWorkerConfigBuild:
+    """parallel worker fn が worker_config に temperature を入れて
+    Stage2SelfPlayWorker を作る"""
+
+    def test_subprocess_passes_temperature_to_worker(self, tmp_path, monkeypatch):
+        """subprocess を起動せず Stage2SelfPlayWorker への config を捕捉"""
+        captured: dict = {}
+
+        original_worker_cls = None
+
+        from mahjong_rl import stage2a_parallel as sap
+        from mahjong_rl import stage2_selfplay_worker as ssw
+
+        original_worker_cls = ssw.Stage2SelfPlayWorker
+
+        class FakeWorker:
+            def __init__(self, config, output_dir, observation_mode,
+                         encoder, model, device, policy_ratio,
+                         save_baseline_actions):
+                captured["config"] = config
+
+            def generate(self, num_matches, base_seed,
+                         experiment_id, run_id, worker_id):
+                return {"num_matches": num_matches, "total_steps": 0}
+
+        # subprocess を経由しない: monkeypatch で Stage2SelfPlayWorker を差し替え
+        monkeypatch.setattr(
+            "mahjong_rl.stage2_selfplay_worker.Stage2SelfPlayWorker",
+            FakeWorker)
+
+        # encoder rebuild は本物を使う (model state path None で軽く)
+        # _stage2a_selfplay_worker_fn を直接呼ぶ
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        result_q = ctx.Queue()
+        error_q = ctx.Queue()
+
+        # ただし subprocess を起こさず、関数を同 process で呼んで内部 import を踏む。
+        # _stage2a_selfplay_worker_fn は引数を順序で受け取るのでそのまま呼べる。
+        sap._stage2a_selfplay_worker_fn(
+            0, str(tmp_path / "worker_0"), "full", {},
+            None, {}, 1, 0,
+            "exp", "run",
+            result_q, error_q,
+            "cpu", 1.0, False, 1, None, 0.42,
+        )
+        assert "config" in captured
+        cfg = captured["config"]
+        # selfplay 配下に temperature が入る
+        assert "selfplay" in cfg
+        assert cfg["selfplay"]["temperature"] == pytest.approx(0.42)
+
+    def test_subprocess_default_temperature_is_1(self, tmp_path, monkeypatch):
+        """temperature 引数を渡さなければ default 1.0 が伝わる"""
+        captured: dict = {}
+
+        from mahjong_rl import stage2a_parallel as sap
+
+        class FakeWorker:
+            def __init__(self, config, output_dir, observation_mode,
+                         encoder, model, device, policy_ratio,
+                         save_baseline_actions):
+                captured["config"] = config
+
+            def generate(self, num_matches, base_seed,
+                         experiment_id, run_id, worker_id):
+                return {"num_matches": num_matches, "total_steps": 0}
+
+        monkeypatch.setattr(
+            "mahjong_rl.stage2_selfplay_worker.Stage2SelfPlayWorker",
+            FakeWorker)
+
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        result_q = ctx.Queue()
+        error_q = ctx.Queue()
+
+        # temperature を引数で渡さない (default 1.0)
+        sap._stage2a_selfplay_worker_fn(
+            0, str(tmp_path / "worker_0"), "full", {},
+            None, {}, 1, 0,
+            "exp", "run",
+            result_q, error_q,
+        )
+        cfg = captured["config"]
+        assert cfg["selfplay"]["temperature"] == pytest.approx(1.0)
+
+    def test_run_parallel_passes_temperature(self, tmp_path, monkeypatch):
+        """run_stage2a_selfplay_parallel が temperature を worker_fn に渡す"""
+        from mahjong_rl import stage2a_parallel as sap
+
+        captured_args: list = []
+
+        class FakeProcess:
+            def __init__(self, target, args):
+                captured_args.append(args)
+                self._args = args
+
+            def start(self):
+                pass
+
+            def join(self, timeout=None):
+                pass
+
+            def is_alive(self):
+                return False
+
+            @property
+            def exitcode(self):
+                return 0
+
+        class FakeContext:
+            def Process(self, target, args):
+                return FakeProcess(target, args)
+
+            def Queue(self):
+                class Q:
+                    def empty(self):
+                        return True
+                    def get_nowait(self):
+                        raise Exception("empty")
+                    def put(self, x):
+                        pass
+                return Q()
+
+        monkeypatch.setattr(sap.mp, "get_context", lambda name: FakeContext())
+
+        sap.run_stage2a_selfplay_parallel(
+            output_dir=tmp_path,
+            num_workers=2,
+            num_matches=2,
+            base_seed=42,
+            obs_mode="full",
+            encoder_config={},
+            model_state_path=None,
+            model_config={},
+            temperature=0.31,
+        )
+        assert len(captured_args) == 2
+        # _stage2a_selfplay_worker_fn の引数列の最後 ([..., reward_config_dict, temperature])
+        # signature: (i, ..., num_threads, reward_config_dict, temperature)
+        for args in captured_args:
+            # 最後の要素が temperature
+            assert args[-1] == pytest.approx(0.31)
+
+
+class TestRunnerPassesTemperature:
+    """runner.py の Stage2a parallel selfplay 呼び出しが
+    sp_cfg.temperature を渡すこと"""
+
+    def test_runner_passes_temperature_to_parallel(self, tmp_path, monkeypatch):
+        """runner._run_selfplay_stage2a_single (parallel path) が
+        run_stage2a_selfplay_parallel に temperature を渡す"""
+        from mahjong_rl import stage2a_parallel as sap
+
+        captured: dict = {}
+
+        def fake_run_parallel(*args, **kwargs):
+            captured.update(kwargs)
+            return {"total_steps": 0, "num_matches": 0,
+                    "discard_count": 0, "call_count": 0,
+                    "num_rounds": 0, "tsumo_count": 0,
+                    "ron_count": 0, "ryukyoku_count": 0,
+                    "policy_wins": 0, "policy_deal_ins": 0,
+                    "policy_draws": 0, "policy_win_by_tsumo": 0,
+                    "policy_win_by_ron": 0,
+                    "total_matches": 0,
+                    "num_workers": 1}
+
+        monkeypatch.setattr(sap, "run_stage2a_selfplay_parallel", fake_run_parallel)
+        # runner.py で `from mahjong_rl.stage2a_parallel import ...` を踏むため
+        import mahjong_rl.runner as runner_mod
+        # 動作上 import 後に local 名前空間に取り込まれているので、
+        # その local 参照も差し替える
+        runner_mod.run_stage2a_selfplay_parallel = fake_run_parallel  # type: ignore
+
+        from mahjong_rl.runner import Stage1Runner
+        from mahjong_rl.experiment import ExperimentConfig
+
+        config = ExperimentConfig()
+        config.experiment = {
+            "name": "test_temp_propagation",
+            "stage": "stage2a",
+            "observation_mode": "full",
+            "global_seed": 42,
+            "phases": ["selfplay"],
+        }
+        config.feature_encoder = {
+            "shanten_hint": True,
+            "discard_ukeire_hint": True,
+        }
+        config.selfplay = {
+            "num_matches": 2, "seed_start": 0,
+            "num_workers": 2,
+            "temperature": 0.55,  # CQ-0278 follow-up: 渡るか確認
+        }
+        config.imitation = {"num_matches": 2}
+        config.model = {"discard_hidden_dims": [16],
+                         "optional_hidden_dims": [16],
+                         "candidate_dim": 8}
+        config.training = {"algorithm": "ppo", "lr": 1e-3,
+                            "batch_size": 8, "epochs": 1}
+        config.evaluation = {"num_matches": 0}
+
+        runner = Stage1Runner(config=config, base_dir=tmp_path)
+        try:
+            runner.run()
+        except Exception:
+            # downstream phases が動かなくてもよい。
+            # selfplay parallel 呼び出し時の kwargs だけ確認したい。
+            pass
+
+        assert "temperature" in captured, (
+            f"runner が temperature kwarg を渡していない: keys={list(captured.keys())}")
+        assert captured["temperature"] == pytest.approx(0.55)

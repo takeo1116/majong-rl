@@ -1653,6 +1653,7 @@ class Stage1Runner:
                 inference_device=sp_cfg.get("inference_device", "cpu"),
                 num_threads=sp_cfg.get("worker_num_threads", 1),
                 reward_config_dict=dict(self._config.reward),  # CQ-0276
+                temperature=float(sp_cfg.get("temperature", 1.0)),  # CQ-0278
             )
         else:
             worker = Stage2SelfPlayWorker(
@@ -1760,6 +1761,8 @@ class Stage1Runner:
                     inference_device=self._config.selfplay.get("inference_device", "cpu"),
                     num_threads=self._config.selfplay.get("worker_num_threads", 1),
                     reward_config_dict=dict(self._config.reward),  # CQ-0276
+                    temperature=float(self._config.selfplay.get(
+                        "temperature", 1.0)),  # CQ-0278
                 )
             else:
                 from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
@@ -1896,6 +1899,7 @@ class Stage1Runner:
                 policy_ratio=sp_cfg.get("policy_ratio", 1.0),
                 save_baseline_actions=sp_cfg.get("save_baseline_actions", False),
                 reward_config_dict=dict(self._config.reward),  # CQ-0276
+                temperature=float(sp_cfg.get("temperature", 1.0)),  # CQ-0278
             )
         else:
             from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker

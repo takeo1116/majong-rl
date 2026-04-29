@@ -47,6 +47,7 @@ def _stage2a_selfplay_worker_fn(
     save_baseline_actions: bool = False,
     num_threads: int = 1,
     reward_config_dict: dict | None = None,
+    temperature: float = 1.0,
 ):
     """subprocess で Stage2a selfplay を実行"""
     try:
@@ -102,9 +103,11 @@ def _stage2a_selfplay_worker_fn(
             model.load_state_dict(sd)
 
         # CQ-0276: reward_config を worker config に伝播
-        worker_config = {}
+        # CQ-0278 follow-up: temperature も worker config に伝播
+        worker_config: dict = {}
         if reward_config_dict:
             worker_config["reward"] = reward_config_dict
+        worker_config["selfplay"] = {"temperature": float(temperature)}
         worker = Stage2SelfPlayWorker(
             config=worker_config,
             output_dir=output_dir,
@@ -143,6 +146,7 @@ def run_stage2a_selfplay_parallel(
     save_baseline_actions: bool = False,
     num_threads: int = 1,
     reward_config_dict: dict | None = None,
+    temperature: float = 1.0,
 ) -> dict:
     """Stage2a selfplay を multi-process で実行"""
     output_dir = Path(output_dir)
@@ -165,7 +169,7 @@ def run_stage2a_selfplay_parallel(
                   model_state_path, model_config, wm, worker_seed,
                   experiment_id, run_id, result_queue, error_queue,
                   inference_device, policy_ratio, save_baseline_actions,
-                  num_threads, reward_config_dict),
+                  num_threads, reward_config_dict, temperature),
         )
         p.start()
         processes.append(p)

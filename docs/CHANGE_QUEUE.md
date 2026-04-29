@@ -106,11 +106,17 @@ Stage2a selfplay の policy sampling を config seed / temperature に従わせ�
     - `__init__` で `config["selfplay"]["temperature"]` または `config["temperature"]` を読み `self._temperature` に保持 (default 1.0)
     - `generate()` の match loop で `env.reset(seed)` の直後に `torch.manual_seed(seed)`、CUDA 利用時は `torch.cuda.manual_seed_all(seed)` も呼ぶ
     - `_policy_discard()` / `_policy_call()` の `temperature=1.0` 固定を `self._temperature` に置換
-  - `tests/python/test_stage2a_selfplay_rng.py` (新規)
+  - `python/mahjong_rl/stage2a_parallel.py` (follow-up)
+    - `_stage2a_selfplay_worker_fn` / `run_stage2a_selfplay_parallel` に `temperature` 引数追加 (default 1.0)
+    - subprocess で `worker_config["selfplay"] = {"temperature": ...}` を組み立てて Stage2SelfPlayWorker に渡す
+  - `python/mahjong_rl/runner.py` (follow-up)
+    - 全 Stage2a parallel selfplay 呼び出し (selfplay / multi-chunk imitation 両方) で
+      `temperature=float(sp_cfg.get("temperature", 1.0))` を渡す
+  - `tests/python/test_stage2a_selfplay_rng.py` (新規 + follow-up テスト追加)
 - 既存 seat assignment の `np.random.RandomState(seed)` は維持
 - Stage1 selfplay は変更なし
 - temperature 未指定時は default 1.0 で現行互換
-- テスト 11 件 (config 5 / monkeypatch sampler 2 / torch reproducibility 2 / generate reproducibility 2)
+- テスト 17 件 (config 5 / monkeypatch sampler 2 / torch reproducibility 2 / generate reproducibility 2 / parallel signature 2 / parallel worker config 2 / runner kwarg 1 / parallel run kwarg 1)
 
 ---
 
