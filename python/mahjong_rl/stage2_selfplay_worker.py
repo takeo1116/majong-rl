@@ -79,6 +79,16 @@ class Stage2SelfPlayWorker:
         # CQ-0276: reward_config 伝播
         self._reward_config = build_reward_policy_config(
             config.get("reward") if isinstance(config, dict) else None)
+        # CQ-0278: selfplay temperature を config から読む
+        # runner._as_dict() 由来 (config["selfplay"]["temperature"]) と
+        # flat / worker_config 由来 (config["temperature"]) の両方を許容
+        self._temperature = 1.0
+        if isinstance(config, dict):
+            sp = config.get("selfplay")
+            if isinstance(sp, dict) and "temperature" in sp:
+                self._temperature = float(sp["temperature"])
+            elif "temperature" in config:
+                self._temperature = float(config["temperature"])
         if model is not None:
             self._model = model.to(self._device)
             self._model.eval()
@@ -134,6 +144,10 @@ class Stage2SelfPlayWorker:
         for match_idx in range(num_matches):
             seed = base_seed + match_idx
             env.reset(seed)
+            # CQ-0278: policy sampling 再現性のため torch RNG を match seed で固定
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
             episode_id = f"match_{seed}"
 
             # CQ-0236: seat assignment
@@ -436,7 +450,8 @@ class Stage2SelfPlayWorker:
             self._mask_buf[0].copy_(torch.from_numpy(mask))
             out = self._model.forward_discard(self._feat_buf, self._mask_buf)
             action, lp = select_discard_sample(
-                out.discard_logits[0], self._mask_buf[0], temperature=1.0)
+                out.discard_logits[0], self._mask_buf[0],
+                temperature=self._temperature)
             val = out.values["round_delta"][0, 0].item()
         return action, lp, val
 
@@ -464,7 +479,8 @@ class Stage2SelfPlayWorker:
             out = self._model.forward_optional(
                 self._feat_buf, cand_feats, cand_mask, response_context=rc_t)
             idx, lp = select_optional_sample(
-                out.optional_scores[0], cand_mask[0], temperature=1.0)
+                out.optional_scores[0], cand_mask[0],
+                temperature=self._temperature)
             val = out.values["round_delta"][0, 0].item()
         return idx, lp, val
 
