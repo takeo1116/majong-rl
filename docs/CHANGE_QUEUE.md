@@ -207,7 +207,7 @@ Stage2a PPO は discard / call samples を結合し、`step_id` 順に並べて 
 ---
 
 ### CQ-0276
-- Status: [Proposed]
+- Status: [Implemented]
 - Type: RL | IO | Test
 - Priority: Medium
 - Title: Stage2a selfplay / eval に reward_config を伝播する
@@ -261,10 +261,22 @@ Stage2a の selfplay / imitation data generation / eval に `reward_config` を�
 - 直近 Stage2a 実験では reward section が明示されていないため、過去結果への直接影響は限定的かもしれない
 - ただし CQ-0274 修正後に reward 分布を評価するため、報酬スケールの伝播は明確にしておくべき
 
+実装結果:
+- 変更ファイル:
+  - `python/mahjong_rl/stage2_selfplay_worker.py` (`build_reward_policy_config`, worker._reward_config, Stage2Env 渡し)
+  - `python/mahjong_rl/stage2a_evaluator.py` (`reward_config` param, Stage2Env 渡し)
+  - `python/mahjong_rl/stage2a_parallel.py` (`reward_config_dict` を worker fn / parallel runner 両方に追加)
+  - `python/mahjong_rl/runner.py` (selfplay/eval/imitation 全 stage2a 経路に `reward_config_dict=dict(self._config.reward)` を渡す)
+  - `tests/python/test_reward_config_propagation.py` (新規)
+- single-process 経路: `Stage2SelfPlayWorker(config=self._as_dict(), ...)` 経由で `config["reward"]` が届く
+- multi-process 経路: 明示的に `reward_config_dict` 引数で渡す
+- reward_config 未指定時は `_reward_config = None` で Stage2Env の default 挙動維持
+- テスト 11 件 (build helper 4 / worker 3 / evaluator 3 / parallel sig 1)
+
 ---
 
 ### CQ-0277
-- Status: [Proposed]
+- Status: [Implemented]
 - Type: RL | Training | Test
 - Priority: Medium
 - Title: terminal player-round 正規化を discard/call 横断で一貫させる
@@ -315,5 +327,16 @@ terminal player-round 正規化を discard/call 横断の同一母集団で計�
 - CQ-0275 の branch 元順 scatter と同じ補助構造を使うと実装しやすい
 - CQ-0275 / CQ-0274 を先に直した後で対応してよい
 - これは `CQ-0268` の意図をより厳密に満たす修正であり、feature 追加ではない
+
+実装結果:
+- 変更ファイル:
+  - `python/mahjong_rl/stage2a_learner.py` (`_compute_terminal_weights_cross_branch` static helper 追加)
+  - `tests/python/test_terminal_weights_cross_branch.py` (新規)
+- 旧 `_compute_terminal_weights` は CQ-0268 の単 branch 用として残し、後方互換テスト維持
+- PPO path: discard / call の (episode_id, round_id, player_id) を結合し、Counter で横断 count → branch 元順に scatter
+- Imitation tensor path: 同様に cross-branch を `if d:` / `if c:` ブロック後に一括計算
+- 片 branch のみのケースは旧 `_compute_terminal_weights` と一致 (`test_discard_only_matches_legacy`, `test_call_only_matches_legacy` で確認)
+- `_compute_semantic_aux_loss` の `tl = (tl_per * terminal_weights).sum()` は維持 (loss scale を変えない)
+- テスト 7 件 (cross-branch 6 / PPO smoke 1)
 
 ---

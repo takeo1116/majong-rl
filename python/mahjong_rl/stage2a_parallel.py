@@ -46,6 +46,7 @@ def _stage2a_selfplay_worker_fn(
     policy_ratio: float = 1.0,
     save_baseline_actions: bool = False,
     num_threads: int = 1,
+    reward_config_dict: dict | None = None,
 ):
     """subprocess で Stage2a selfplay を実行"""
     try:
@@ -100,8 +101,12 @@ def _stage2a_selfplay_worker_fn(
             sd = torch.load(model_state_path, map_location="cpu", weights_only=True)
             model.load_state_dict(sd)
 
+        # CQ-0276: reward_config を worker config に伝播
+        worker_config = {}
+        if reward_config_dict:
+            worker_config["reward"] = reward_config_dict
         worker = Stage2SelfPlayWorker(
-            config={},
+            config=worker_config,
             output_dir=output_dir,
             observation_mode=obs_mode,
             encoder=enc,
@@ -137,6 +142,7 @@ def run_stage2a_selfplay_parallel(
     policy_ratio: float = 1.0,
     save_baseline_actions: bool = False,
     num_threads: int = 1,
+    reward_config_dict: dict | None = None,
 ) -> dict:
     """Stage2a selfplay を multi-process で実行"""
     output_dir = Path(output_dir)
@@ -159,7 +165,7 @@ def run_stage2a_selfplay_parallel(
                   model_state_path, model_config, wm, worker_seed,
                   experiment_id, run_id, result_queue, error_queue,
                   inference_device, policy_ratio, save_baseline_actions,
-                  num_threads),
+                  num_threads, reward_config_dict),
         )
         p.start()
         processes.append(p)
@@ -189,6 +195,7 @@ def _stage2a_eval_worker_fn(
     error_queue: mp.Queue,
     inference_device: str = "cpu",
     num_threads: int = 1,
+    reward_config_dict: dict | None = None,
 ):
     """subprocess で Stage2a eval を実行"""
     try:
@@ -239,10 +246,14 @@ def _stage2a_eval_worker_fn(
         sd = torch.load(model_state_path, map_location="cpu", weights_only=True)
         model.load_state_dict(sd)
 
+        # CQ-0276: reward_config を eval にも伝播
+        from mahjong_rl.stage2_selfplay_worker import build_reward_policy_config
+        eval_reward_config = build_reward_policy_config(reward_config_dict)
         evaluator = Stage2aEvaluator(
             model=model, encoder=enc,
             observation_mode=obs_mode,
             device=device,
+            reward_config=eval_reward_config,
         )
         metrics = evaluator.evaluate(
             num_matches=num_matches,
@@ -266,6 +277,7 @@ def run_stage2a_eval_parallel(
     policy_seat: int = 0,
     inference_device: str = "cpu",
     num_threads: int = 1,
+    reward_config_dict: dict | None = None,
 ) -> dict:
     """Stage2a eval を multi-process で実行"""
     if eval_mode == "rotation":
@@ -284,6 +296,7 @@ def run_stage2a_eval_parallel(
                 policy_seat=seat,
                 inference_device=inference_device,
                 num_threads=num_threads,
+                reward_config_dict=reward_config_dict,
             )
             all_results.append(r)
         # 集約
@@ -315,7 +328,7 @@ def run_stage2a_eval_parallel(
             args=(i, obs_mode, encoder_config, model_state_path,
                   model_config, wm, seed_start + offset, policy_seat,
                   result_queue, error_queue, inference_device,
-                  num_threads),
+                  num_threads, reward_config_dict),
         )
         p.start()
         processes.append(p)

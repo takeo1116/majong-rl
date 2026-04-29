@@ -22,6 +22,20 @@ from mahjong_rl.call_shard import (
 from mahjong_rl.baseline.call_policy import RuleBasedCallPolicy
 
 
+def build_reward_policy_config(reward_cfg: dict | None):
+    """CQ-0276: dict から RewardPolicyConfig を構築する
+
+    Stage1 selfplay_worker と同じ責務を持つ。
+    reward_cfg が None / 空のときは None を返す (Stage2Env default 維持)。
+    """
+    if not reward_cfg:
+        return None
+    from mahjong_rl import RewardPolicyConfig
+    cfg = RewardPolicyConfig()
+    cfg.point_delta_scale = float(reward_cfg.get("point_delta_scale", 1.0))
+    return cfg
+
+
 def make_response_context(env_state, current_player: int) -> np.ndarray:
     """response decision 用の response_context ベクトルを作る
 
@@ -62,6 +76,9 @@ class Stage2SelfPlayWorker:
         self._device = device or torch.device("cpu")
         self._policy_ratio = policy_ratio
         self._save_baseline_actions = save_baseline_actions
+        # CQ-0276: reward_config 伝播
+        self._reward_config = build_reward_policy_config(
+            config.get("reward") if isinstance(config, dict) else None)
         if model is not None:
             self._model = model.to(self._device)
             self._model.eval()
@@ -94,7 +111,8 @@ class Stage2SelfPlayWorker:
     ) -> dict:
         """指定数の半荘を自動プレイし、shard を書き出す"""
         writer = DecisionShardWriter(self._output_dir, max_samples=10000)
-        env = Stage2Env(observation_mode=self._obs_mode)
+        env = Stage2Env(observation_mode=self._obs_mode,
+                         reward_config=self._reward_config)
         from mahjong_rl.baseline.rule_based import RuleBasedBaseline
         baseline = RuleBasedBaseline()
 

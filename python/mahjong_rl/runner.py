@@ -1652,6 +1652,7 @@ class Stage1Runner:
                 run_id=str(run_dir),
                 inference_device=sp_cfg.get("inference_device", "cpu"),
                 num_threads=sp_cfg.get("worker_num_threads", 1),
+                reward_config_dict=dict(self._config.reward),  # CQ-0276
             )
         else:
             worker = Stage2SelfPlayWorker(
@@ -1758,6 +1759,7 @@ class Stage1Runner:
                     run_id=str(run_dir),
                     inference_device=self._config.selfplay.get("inference_device", "cpu"),
                     num_threads=self._config.selfplay.get("worker_num_threads", 1),
+                    reward_config_dict=dict(self._config.reward),  # CQ-0276
                 )
             else:
                 from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
@@ -1893,6 +1895,7 @@ class Stage1Runner:
                 num_threads=sp_cfg.get("worker_num_threads", 1),
                 policy_ratio=sp_cfg.get("policy_ratio", 1.0),
                 save_baseline_actions=sp_cfg.get("save_baseline_actions", False),
+                reward_config_dict=dict(self._config.reward),  # CQ-0276
             )
         else:
             from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
@@ -2139,6 +2142,7 @@ class Stage1Runner:
                 policy_seat=eval_cfg.get("policy_seat", 0),
                 inference_device=eval_cfg.get("inference_device", "cpu"),
                 num_threads=eval_cfg.get("worker_num_threads", 1),
+                reward_config_dict=dict(self._config.reward),  # CQ-0276
             )
         else:
             from mahjong_rl.stage2a_evaluator import Stage2aEvaluator
@@ -2147,10 +2151,15 @@ class Stage1Runner:
                 input_dim = int(np.prod(encoder.metadata().output_shape))
                 model_cfg = self._config.model
                 s2_model = self._create_stage2a_model(encoder)
+            # CQ-0276: reward_config を eval にも伝播
+            from mahjong_rl.stage2_selfplay_worker import build_reward_policy_config
+            eval_reward_config = build_reward_policy_config(
+                dict(self._config.reward))
             evaluator = Stage2aEvaluator(
                 model=s2_model, encoder=encoder,
                 observation_mode=obs_mode,
                 device=torch.device("cpu"),
+                reward_config=eval_reward_config,
             )
 
             if eval_mode == "rotation":

@@ -107,6 +107,55 @@ class Stage2aLearner:
             weights[i] = 1.0 / counts[keys[i]]
         return weights
 
+    @staticmethod
+    def _compute_terminal_weights_cross_branch(
+        d_episode_ids, d_round_ids, d_player_ids,
+        c_episode_ids, c_round_ids, c_player_ids,
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """CQ-0277: discard/call 横断で player-round 正規化重みを計算する
+
+        同じ (episode_id, round_id, player_id) に属する row が discard と call に
+        分かれていても、合計 weight が 1.0 になるように、両 branch を結合した
+        母集団でカウントしてから branch 元順で返す。
+
+        片方 branch が空の場合は、もう片方の branch だけで CQ-0268 と同じ結果に
+        なる (片 branch のみのケース後方互換)。
+
+        Returns:
+            (d_weights, c_weights): それぞれ branch 元順、空 branch は None
+        """
+        from collections import Counter
+        nd = len(d_episode_ids) if d_episode_ids is not None else 0
+        nc = len(c_episode_ids) if c_episode_ids is not None else 0
+
+        def _key(eid, rid, pid):
+            eid_s = eid if isinstance(eid, str) else str(eid)
+            return (eid_s, int(rid), int(pid))
+
+        d_keys = []
+        for i in range(nd):
+            d_keys.append(_key(d_episode_ids[i], d_round_ids[i], d_player_ids[i]))
+        c_keys = []
+        for i in range(nc):
+            c_keys.append(_key(c_episode_ids[i], c_round_ids[i], c_player_ids[i]))
+
+        # 横断 count
+        counts = Counter(d_keys)
+        counts.update(c_keys)
+
+        d_w = None
+        if nd > 0:
+            d_w = torch.zeros(nd, dtype=torch.float32, device=device)
+            for i, k in enumerate(d_keys):
+                d_w[i] = 1.0 / counts[k]
+        c_w = None
+        if nc > 0:
+            c_w = torch.zeros(nc, dtype=torch.float32, device=device)
+            for i, k in enumerate(c_keys):
+                c_w[i] = 1.0 / counts[k]
+        return d_w, c_w
+
     def _log_cuda_memory(self, label: str) -> dict | None:
         """CQ-0255: CUDA memory debug ログ (enabled 時のみ)"""
         if not self._cuda_mem_debug:
@@ -258,10 +307,6 @@ class Stage2aLearner:
             d_term_cls = torch.tensor(d["terminal_classes"], dtype=torch.long, device=self._device) if "terminal_classes" in d else None
             d_yaku_mh = torch.tensor(d["yaku_multihot"], dtype=torch.float32, device=self._device) if "yaku_multihot" in d else None
             d_is_winner = torch.tensor(d["is_winner"], dtype=torch.float32, device=self._device) if "is_winner" in d else None
-            # CQ-0268: terminal player-round weights
-            d_term_weights = self._compute_terminal_weights(
-                d["episode_ids"], d.get("round_ids", np.zeros(nd, dtype=np.int64)),
-                d["player_ids"], nd, self._device) if self._semantic_aux_enabled else None
 
         c_obs = c_cf = c_cm = c_rc = c_targets = c_returns_t = None
         c_rewards = c_term_cls = c_yaku_mh = c_is_winner = c_term_weights = None
@@ -280,10 +325,20 @@ class Stage2aLearner:
             c_term_cls = torch.tensor(c["terminal_classes"], dtype=torch.long, device=self._device) if "terminal_classes" in c else None
             c_yaku_mh = torch.tensor(c["yaku_multihot"], dtype=torch.float32, device=self._device) if "yaku_multihot" in c else None
             c_is_winner = torch.tensor(c["is_winner"], dtype=torch.float32, device=self._device) if "is_winner" in c else None
-            # CQ-0268: terminal player-round weights
-            c_term_weights = self._compute_terminal_weights(
-                c["episode_ids"], c.get("round_ids", np.zeros(nc, dtype=np.int64)),
-                c["player_ids"], nc, self._device) if self._semantic_aux_enabled else None
+
+        # CQ-0277: terminal player-round weights (discard/call 横断)
+        if self._semantic_aux_enabled:
+            d_eps = d["episode_ids"] if d else None
+            d_rds = (d.get("round_ids", np.zeros(nd, dtype=np.int64))
+                     if d else None)
+            d_pids = d["player_ids"] if d else None
+            c_eps = c["episode_ids"] if c else None
+            c_rds = (c.get("round_ids", np.zeros(nc, dtype=np.int64))
+                     if c else None)
+            c_pids = c["player_ids"] if c else None
+            d_term_weights, c_term_weights = (
+                self._compute_terminal_weights_cross_branch(
+                    d_eps, d_rds, d_pids, c_eps, c_rds, c_pids, self._device))
 
         self._log_cuda_memory("imitation_preload")
         sem_tl_list, sem_yl_list = [], []
@@ -788,21 +843,18 @@ class Stage2aLearner:
                      for s in call_samples],
                     dtype=torch.float32, device=self._device)
 
-        # CQ-0268: terminal player-round weights for PPO
+        # CQ-0268/0277: terminal player-round weights (discard/call 横断)
         d_term_weights = c_term_weights = None
         if self._semantic_aux_enabled:
-            if discard_samples:
-                d_term_weights = self._compute_terminal_weights(
-                    [s.episode_id for s in discard_samples],
-                    [s.round_id for s in discard_samples],
-                    [s.player_id for s in discard_samples],
-                    len(discard_samples), self._device)
-            if call_samples:
-                c_term_weights = self._compute_terminal_weights(
-                    [s.episode_id for s in call_samples],
-                    [s.round_id for s in call_samples],
-                    [s.player_id for s in call_samples],
-                    len(call_samples), self._device)
+            d_eps = [s.episode_id for s in discard_samples] if discard_samples else None
+            d_rds = [s.round_id for s in discard_samples] if discard_samples else None
+            d_pids = [s.player_id for s in discard_samples] if discard_samples else None
+            c_eps = [s.episode_id for s in call_samples] if call_samples else None
+            c_rds = [s.round_id for s in call_samples] if call_samples else None
+            c_pids = [s.player_id for s in call_samples] if call_samples else None
+            d_term_weights, c_term_weights = (
+                self._compute_terminal_weights_cross_branch(
+                    d_eps, d_rds, d_pids, c_eps, c_rds, c_pids, self._device))
 
         all_sem_tl: list[float] = []
         all_sem_yl: list[float] = []

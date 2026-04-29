@@ -29,11 +29,13 @@ class Stage2aEvaluator:
         encoder,
         observation_mode: str = "full",
         device=None,
+        reward_config=None,
     ):
         self._model = model
         self._encoder = encoder
         self._obs_mode = observation_mode
         self._device = device or torch.device("cpu")
+        self._reward_config = reward_config  # CQ-0276
         self._model.to(self._device)
         self._model.eval()
         self._baseline = RuleBasedBaseline()
@@ -61,7 +63,8 @@ class Stage2aEvaluator:
         Returns:
             eval metrics dict
         """
-        env = Stage2Env(observation_mode=self._obs_mode)
+        env = Stage2Env(observation_mode=self._obs_mode,
+                         reward_config=self._reward_config)
         scores: list[int] = []
         ranks: list[int] = []
         wins = 0
