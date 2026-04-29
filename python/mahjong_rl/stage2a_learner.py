@@ -741,52 +741,17 @@ class Stage2aLearner:
         all_anchor_kl_optional: list[float] = []
         num_updates = 0
 
-        # mixed trajectory grouped GAE: step_id 順で GAE 計算
-        # 元の shard 順 (step_id) を保った全 sample 列を構築
-        all_indexed: list[tuple[int, str, DecisionSample]] = []
-        for s in discard_samples:
-            all_indexed.append((s.step_id, "discard", s))
-        for s in call_samples:
-            all_indexed.append((s.step_id, "call", s))
-        all_indexed.sort(key=lambda x: x[0])  # step_id 順
-
-        all_sorted = [s for _, _, s in all_indexed]
-        all_ret, all_adv = self._compute_returns_advantages(all_sorted)
-
-        # CQ-0250: advantage を全体で一度だけ正規化 (minibatch 依存にしない)
-        if all_adv.numel() > 1:
-            all_adv = (all_adv - all_adv.mean()) / (all_adv.std() + 1e-8)
-        if self._advantage_clip is not None:
-            all_adv = all_adv.clamp(-self._advantage_clip, self._advantage_clip)
-
-        # CQ-0249: per-sample weight from actor_type
+        # CQ-0275: branch 元順を保つように scatter する
         is_mixed = self._mixed_ppo_mode == "mixed"
-        d_weight_list: list[float] = []
-        c_weight_list: list[float] = []
-
-        # index mapping: sorted position → discard/call branch position
-        d_ret_list, d_adv_list = [], []
-        c_ret_list, c_adv_list = [], []
-        for i, (_, dtype, s) in enumerate(all_indexed):
-            w = (self._baseline_sample_weight
-                 if is_mixed and s.actor_type == "baseline" else 1.0)
-            if dtype == "discard":
-                d_ret_list.append(all_ret[i])
-                d_adv_list.append(all_adv[i])
-                d_weight_list.append(w)
-            else:
-                c_ret_list.append(all_ret[i])
-                c_adv_list.append(all_adv[i])
-                c_weight_list.append(w)
-
-        d_ret = torch.stack(d_ret_list) if d_ret_list else None
-        d_adv = torch.stack(d_adv_list) if d_adv_list else None
-        d_weights = torch.tensor(d_weight_list, dtype=torch.float32,
-                                  device=self._device) if d_weight_list else None
-        c_ret = torch.stack(c_ret_list) if c_ret_list else None
-        c_adv = torch.stack(c_adv_list) if c_adv_list else None
-        c_weights = torch.tensor(c_weight_list, dtype=torch.float32,
-                                  device=self._device) if c_weight_list else None
+        ppo_targets = self._compute_ppo_branch_targets(
+            discard_samples, call_samples, is_mixed=is_mixed)
+        d_ret = ppo_targets["d_ret"]
+        d_adv = ppo_targets["d_adv"]
+        d_weights = ppo_targets["d_weights"]
+        c_ret = ppo_targets["c_ret"]
+        c_adv = ppo_targets["c_adv"]
+        c_weights = ppo_targets["c_weights"]
+        all_sorted = ppo_targets["all_sorted"]
 
         # CQ-0256: semantic aux targets for PPO
         d_term_cls = d_yaku_mh = d_is_winner = None
@@ -1044,6 +1009,65 @@ class Stage2aLearner:
 
         self._model.train()
         return diag
+
+    def _compute_ppo_branch_targets(
+        self,
+        discard_samples: list[DecisionSample],
+        call_samples: list[DecisionSample],
+        is_mixed: bool = False,
+    ) -> dict:
+        """CQ-0275: PPO の advantage / return / weight を branch 元順で返す
+
+        all_indexed を (step_id, branch, branch_idx, sample) で持ち、
+        step_id 順 GAE 計算結果を branch 元 index 位置に scatter する。
+        """
+        nd = len(discard_samples)
+        nc = len(call_samples)
+
+        # all_indexed: (step_id, branch, branch_idx, sample)
+        all_indexed: list[tuple[int, str, int, DecisionSample]] = []
+        for i, s in enumerate(discard_samples):
+            all_indexed.append((s.step_id, "discard", i, s))
+        for i, s in enumerate(call_samples):
+            all_indexed.append((s.step_id, "call", i, s))
+        all_indexed.sort(key=lambda x: x[0])  # step_id 順
+
+        all_sorted = [s for _, _, _, s in all_indexed]
+        all_ret, all_adv = self._compute_returns_advantages(all_sorted)
+
+        # CQ-0250: advantage を全体で一度だけ正規化
+        if all_adv.numel() > 1:
+            all_adv = (all_adv - all_adv.mean()) / (all_adv.std() + 1e-8)
+        if self._advantage_clip is not None:
+            all_adv = all_adv.clamp(-self._advantage_clip, self._advantage_clip)
+
+        # branch 元順 tensor を初期化
+        device = self._device
+        d_ret_t = torch.zeros(nd, dtype=torch.float32, device=device) if nd > 0 else None
+        d_adv_t = torch.zeros(nd, dtype=torch.float32, device=device) if nd > 0 else None
+        d_weights_t = torch.ones(nd, dtype=torch.float32, device=device) if nd > 0 else None
+        c_ret_t = torch.zeros(nc, dtype=torch.float32, device=device) if nc > 0 else None
+        c_adv_t = torch.zeros(nc, dtype=torch.float32, device=device) if nc > 0 else None
+        c_weights_t = torch.ones(nc, dtype=torch.float32, device=device) if nc > 0 else None
+
+        # CQ-0275: sorted_idx の値を branch_idx 位置に scatter
+        for sorted_idx, (_, branch, branch_idx, s) in enumerate(all_indexed):
+            w = (self._baseline_sample_weight
+                 if is_mixed and s.actor_type == "baseline" else 1.0)
+            if branch == "discard":
+                d_ret_t[branch_idx] = all_ret[sorted_idx]
+                d_adv_t[branch_idx] = all_adv[sorted_idx]
+                d_weights_t[branch_idx] = w
+            else:
+                c_ret_t[branch_idx] = all_ret[sorted_idx]
+                c_adv_t[branch_idx] = all_adv[sorted_idx]
+                c_weights_t[branch_idx] = w
+
+        return {
+            "d_ret": d_ret_t, "d_adv": d_adv_t, "d_weights": d_weights_t,
+            "c_ret": c_ret_t, "c_adv": c_adv_t, "c_weights": c_weights_t,
+            "all_adv": all_adv, "all_sorted": all_sorted,
+        }
 
     def _compute_returns_advantages(self, samples):
         """CQ-0237: same-player grouped GAE"""

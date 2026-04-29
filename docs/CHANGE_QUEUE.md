@@ -53,78 +53,267 @@
 
 ## 変更要求一覧
 
-### CQ-0273
+### CQ-0274
 - Status: [Implemented]
-- Type: RL
+- Type: RL | Training | Test
 - Priority: High
-- Title: tile_presence_flags を semantic/value trunk 限定入力にする
+- Title: Stage2a selfplay の reward backfill を same-player transition 累積に修正する
 
 #### 背景
-`CQ-0270` で追加した self tile-presence flags
+Stage2a learner は same-player trajectory 単位で return / advantage を計算している。
 
-- `self_has_honor`
-- `self_has_terminal`
-- `self_has_simple`
-- `self_has_man`
-- `self_has_pin`
-- `self_has_sou`
+- group key: `(episode_id, player_id)`
+- 各 sample の reward は「その player の前回 decision から次の same-player decision までに発生した累積報酬」であるべき
 
-は、`exp_016` では shared encoder input への常時追加としては baseline 更新に失敗した。  
-一方 `exp_017` では、
+しかし現在の `Stage2SelfPlayWorker` では、`env.step_discard_with_snapshot()` / `env.step_response()` 後の reward を **action owner の pending sample にだけ**代入している。
 
-- `yakuflags on + narrow` は悪い
-- `yakuflags on + wide` では policy と diagnostics がかなり回復
-- 特に `Tanyao` の `mean_p / hit@0.2` は大きく改善
+一方 Stage1 `SelfPlayWorker` では、各 env step の `rewards[p]` を 4 人全員の pending transition に累積している。
 
-という結果になり、特徴量アイデア自体は有望だが、**raw feature を policy trunk まで直接流しているのが重い**可能性が高くなった。
+この差により Stage2a では、
 
-現状の Stage2a では、
+- 他家ツモ時の被ツモ失点
+- 他家ロン時の傍観者または放銃者以外への点数変動
+- 自分の decision 後、次の自分の decision までに他家 action / auto advance で発生した点数変動
 
-- `discard_trunk`
-- `optional_trunk`
-- `value_trunk`
+が、自分の直前 decision sample に乗らない可能性がある。
 
-が分かれており、`terminal / yaku / value` は value 側でまとまっている。  
-このため、次は tile_presence_flags を **semantic/value 側には入れるが、discard/optional の raw policy 入力には直接入れない** 条件を試したい。
+これは RL 理論上の設計変更ではなく、既存の same-player transition semantics に対する実装不整合であり、Stage1 から Stage2a への機能デグレとみなす。
 
 #### 要求内容
-Stage2a で `tile_presence_flags` を semantic/value trunk 限定で使えるようにする。
+`Stage2SelfPlayWorker` の reward backfill を、Stage1 と同じ発想の cumulative transition reward に修正する。
 
 具体的には:
 
-- encoder は従来どおり `tile_presence_flags` を出してよい
-- ただし model 側で
-  - `value_trunk` には tile_presence_flags を含む full feature を入れる
-  - `discard_trunk` と `optional_trunk` には tile_presence_flags を除いた feature を入れる
-- semantic summary 経由の影響は従来どおり許す
-  - つまり policy は raw flag を見ないが、semantic summary 経由では影響を受けうる
-
-切替は config でできるようにする。
-
-推奨:
-
-- `model.semantic_aux.tile_presence_flags_semantic_only: true/false`
-  - `false`: 現行どおり raw で全 trunk に入る
-  - `true`: value/semantic 側のみ raw 入力に残し、discard/optional からは除外
+- env step 後に得た `rewards[p]` を、pending に存在する全 player `p` の sample に累積する
+- action owner の新規 pending sample は、当該 action によって発生した reward も受け取れるようにする
+- reward は代入ではなく累積とする
+  - 現状の `pending[player].reward = float(rewards[player])` ではなく、pending sample ごとに `+=` する
+- round end / match end / auto advance をまたぐ reward も、same-player transition に沿って欠落なく入るようにする
+- `terminated` / `round_over` / outcome label backfill の既存挙動は維持する
+- baseline / policy 混在時も、保存対象 sample だけに対して正しく累積する
+  - 保存していない baseline seat の pending は存在しなくてよい
+  - 保存している sample については actor_type に関係なく reward を累積する
 
 #### 関連文書
 - RL_SPEC.md
-- `experiments/Stage02_CallUnlock/exp_016/report.md`
-- `experiments/Stage02_CallUnlock/exp_017/report.md`
-- `reference/stage2/stage2a_semantic_aux_trunk_design.md`
+- PROJECT.md
+- `python/mahjong_rl/stage2_selfplay_worker.py`
+- `python/mahjong_rl/stage2a_learner.py`
+- `python/mahjong_rl/selfplay_worker.py`
+- `experiments/Stage02_CallUnlock/exp_015/report.md`
+- `experiments/Stage02_CallUnlock/exp_019/report.md`
 
 #### 受け入れ条件
-- `tile_presence_flags_semantic_only=false` で現行 `CQ-0270/0272` と同一挙動になる
-- `tile_presence_flags_semantic_only=true` のとき:
-  - `value_trunk` 入力には `tile_presence_flags` が残る
-  - `discard_trunk` / `optional_trunk` の raw 入力からは `tile_presence_flags` が除外される
-  - semantic summary の経路は壊れない
-- full / partial とも feature range の意味は変えない
-- config summary / notes / model feature dump から mode が確認できる
-- model smoke / runner / learner の既存テストが通る
+- Stage2a worker で、1 env step の `rewards[p]` が pending 中の全保存対象 player sample に累積される
+- action owner の sample も、自身の action で即時発生した reward を受け取る
+- 他家ツモで、被ツモ者の pending sample に失点 reward が入ることをテストで確認する
+- ロンで、放銃者の pending sample に失点 reward が入ることをテストで確認する
+- 流局 / 途中流局で、pending sample が round_over と reward を保ったまま flush されることを確認する
+- reward が代入で上書きされず、複数 step 分が累積されることを単体テストで確認する
+- 既存の Stage2a selfplay / learner / runner smoke test が通る
+- 修正後の shard reward 分布を確認できる簡易診断を残す、またはテストで旧挙動との差を明示する
 
 #### 実装メモ
-- 今回の狙いは「特徴量を削除すること」ではなく、「raw policy trunk への直接流入を止めること」
-- `exp_018` ではこの mode を narrow / wide で比較する想定
+- Stage1 `SelfPlayWorker` の CQ-0210/0211 実装が参考になる
+- 修正後は `exp_015 A2` 相当条件を再実験し、PPO retain / final improvement を見直す
+- この修正が入るまでは、PPO hyperparameter tuning より reward semantics の修復を優先する
+
+実装結果:
+- 変更ファイル: `python/mahjong_rl/stage2_selfplay_worker.py`, `tests/python/test_stage2a_reward_backfill.py`
+- `Stage2SelfPlayWorker._accumulate_pending_rewards()` static helper 追加
+  - pending 中の全 player sample に `+=` で reward 累積
+  - terminated フラグも同時に立てる
+- discard step / response step 後の `pending[player].reward = ...` 代入を helper 呼び出しに置換
+- テスト: 単体 8 件 + smoke 2 件、全 10 件 passed
+- CQ-0276 (reward_config 伝播) と CQ-0277 (terminal weight 横断化) は据置き
+
+---
+
+### CQ-0275
+- Status: [Implemented]
+- Type: RL | Training | Test
+- Priority: High
+- Title: Stage2a PPO の advantage / return を branch 元順へ正しく scatter する
+
+#### 背景
+Stage2a PPO は discard / call samples を結合し、`step_id` 順に並べて same-player grouped GAE を計算している。
+
+現在の実装では、
+
+- `discard_samples` を順に `all_indexed` へ追加
+- `call_samples` を順に `all_indexed` へ追加
+- `all_indexed.sort(key=lambda x: x[0])` で `step_id` 順に並べる
+- sort 後の順に `d_adv_list` / `c_adv_list` へ append する
+
+という流れになっている。
+
+しかし、その後の PPO epoch では `discard_samples[i]` / `call_samples[i]` の **元の branch 順**に対して `d_adv[i]` / `c_adv[i]` を参照する。
+
+実際の Stage2a shard では、`read_all()` の順序も discard branch 内の順序も call branch 内の順序も `step_id` 昇順とは限らない。  
+そのため、現在は別 sample の advantage / return を使って policy / value を更新している可能性が高い。
+
+これは PPO の性能と安定性に直接影響する重大な実装不整合である。
+
+#### 要求内容
+`Stage2aLearner._train_ppo()` で、GAE 計算後の advantage / return / sample weight を元の branch sample 順へ正しく戻す。
+
+具体的には:
+
+- `all_indexed` に `(step_id, branch, branch_idx, sample)` のように branch 元 index を保持する
+- `all_sorted` で GAE を計算した後、
+  - `d_ret[branch_idx] = all_ret[sorted_idx]`
+  - `d_adv[branch_idx] = all_adv[sorted_idx]`
+  - `d_weights[branch_idx] = weight`
+  - call 側も同様
+  のように scatter する
+- `d_ret` / `d_adv` / `d_weights` は `discard_samples` の元順と一致する tensor にする
+- `c_ret` / `c_adv` / `c_weights` は `call_samples` の元順と一致する tensor にする
+- semantic target tensor は現在どおり branch 元順で作ってよい
+- GAE 自体は引き続き `(episode_id, player_id)` の same-player trajectory で計算する
+
+#### 関連文書
+- RL_SPEC.md
+- `python/mahjong_rl/stage2a_learner.py`
+- `python/mahjong_rl/stage2_selfplay_worker.py`
+- `experiments/Stage02_CallUnlock/exp_015/report.md`
+- `experiments/Stage02_CallUnlock/exp_019/report.md`
+
+#### 受け入れ条件
+- branch 内 `step_id` が非単調な discard/call sample を使った単体テストで、各 sample に正しい advantage / return が割り当たる
+- discard と call が interleaved した trajectory でも、same-player grouped GAE の手計算と一致する
+- `discard_samples[i]` の `reward/value/terminated` に基づく return が `d_ret[i]` に入ることをテストで確認する
+- call 側も同様に `c_ret[i]` / `c_adv[i]` が元 sample と一致する
+- mixed PPO の baseline / policy sample weight も元 sample 順と一致する
+- 既存 Stage2a PPO smoke test が通る
+
+#### 実装メモ
+- これはハイパーパラメータ調整ではなく、PPO target の sample alignment 修正である
+- `read_all()` や writer 側の保存順を前提にしない実装にする
+- `step_id` は GAE の時系列順決定にのみ使い、branch tensor の index には使わない
+
+実装結果:
+- 変更ファイル: `python/mahjong_rl/stage2a_learner.py`, `tests/python/test_ppo_branch_targets.py`
+- `Stage2aLearner._compute_ppo_branch_targets(discard_samples, call_samples, is_mixed)` helper 追加
+  - all_indexed を `(step_id, branch, branch_idx, sample)` で持つ
+  - step_id 順に sort してから `_compute_returns_advantages()` で GAE
+  - sorted index → branch_idx 位置に scatter
+  - mixed PPO の baseline_sample_weight も branch 元順
+  - all_sorted / all_adv も返し、既存 mixed_ppo diagnostics と互換
+- `_train_ppo` 内のサンプル順 append ロジックを helper 呼び出しに置換
+- テスト: scatter 整合 6 件、全 passed
+- 既存 PPO smoke / Stage2a model 全 98 件 passed
+- CQ-0277 terminal weight 横断化は据置き
+
+---
+
+### CQ-0276
+- Status: [Proposed]
+- Type: RL | IO | Test
+- Priority: Medium
+- Title: Stage2a selfplay / eval に reward_config を伝播する
+
+#### 背景
+`Stage2Env` は `reward_config: RewardPolicyConfig | None` を受け取り、指定された場合は engine state に反映できる。
+
+しかし現在の `Stage2SelfPlayWorker.generate()` は常に
+
+```python
+Stage2Env(observation_mode=self._obs_mode)
+```
+
+で環境を作っており、`config.reward` を `RewardPolicyConfig` に変換して渡していない。
+
+また Stage2a parallel worker では `Stage2SelfPlayWorker(config={...})` ではなく `config={}` で worker を作っているため、仮に worker 側で reward config を読むようにしても、parallel path では設定が落ちる。
+
+Stage1 では `reward.point_delta_scale` が selfplay / eval に伝播するテストがあり、報酬スケールの再現性を守っている。  
+Stage2a でも同じ性質を保つべきである。
+
+#### 要求内容
+Stage2a の selfplay / imitation data generation / eval に `reward_config` を正しく伝播する。
+
+具体的には:
+
+- `Stage2SelfPlayWorker` が `config.reward` から `RewardPolicyConfig` を構築する
+- `Stage2SelfPlayWorker.generate()` が `Stage2Env(..., reward_config=...)` を使う
+- single-process runner path では `self._as_dict()` の `reward` が反映される
+- multi-process `run_stage2a_selfplay_parallel()` にも reward config を渡せるようにする
+- subprocess worker function が受け取った reward config を `Stage2SelfPlayWorker` に渡す
+- Stage2a evaluator も必要なら同じ reward config を受け取れるようにする
+  - evaluation の score/rank そのものは engine score から計算するため、主影響は reward-return 診断と selfplay shard 側
+
+#### 関連文書
+- RL_SPEC.md
+- `python/mahjong_rl/env/stage2_env.py`
+- `python/mahjong_rl/stage2_selfplay_worker.py`
+- `python/mahjong_rl/stage2a_parallel.py`
+- `python/mahjong_rl/stage2a_evaluator.py`
+- `python/mahjong_rl/runner.py`
+- `python/mahjong_rl/selfplay_worker.py`
+
+#### 受け入れ条件
+- Stage2a selfplay で `reward.point_delta_scale=0.0001` を指定した場合、shard reward が scale 済みになる
+- single-process path と multi-process path の両方で reward scale が反映される
+- `Stage2Env` に `RewardPolicyConfig` が渡っていることをテストで確認する
+- reward config 未指定時は現行 default と互換になる
+- Stage1 の reward config 伝播挙動は壊さない
+
+#### 実装メモ
+- 直近 Stage2a 実験では reward section が明示されていないため、過去結果への直接影響は限定的かもしれない
+- ただし CQ-0274 修正後に reward 分布を評価するため、報酬スケールの伝播は明確にしておくべき
+
+---
+
+### CQ-0277
+- Status: [Proposed]
+- Type: RL | Training | Test
+- Priority: Medium
+- Title: terminal player-round 正規化を discard/call 横断で一貫させる
+
+#### 背景
+`CQ-0268` では terminal semantic loss の duplicated-label bias を抑えるため、同じ `(episode_id, round_id, player_id)` に属する row の terminal weight 合計を 1.0 にする player-round 正規化を導入した。
+
+しかし現在の Stage2a learner では、
+
+- discard samples だけで terminal weights を計算
+- call samples だけで terminal weights を計算
+
+している。
+
+そのため、同じ player-round に discard と call の両方が存在する場合、terminal loss の合計が branch ごとに最大 1.0 ずつ入り、意図した「player-round 全体で合計 1.0」にならない。
+
+また `_compute_semantic_aux_loss()` は `terminal_weights` が渡された場合に `tl = (tl_per * terminal_weights).sum()` としており、batch 内の weight 合計に loss scale が依存する。
+
+これは policy PPO 本体ほど直接的なバグではないが、semantic aux の実効スケールと class balance を揺らし、terminal/value/semantic summary を通じて policy に影響しうる。
+
+#### 要求内容
+terminal player-round 正規化を discard/call 横断の同一母集団で計算し、loss scale を安定させる。
+
+具体的には:
+
+- PPO path では discard/call を結合した全 sample に対して `(episode_id, round_id, player_id)` count を計算する
+- imitation tensor path でも可能な限り discard/call 横断で count を計算する
+- 各 branch には元 sample 順に対応する terminal weight を渡す
+- 同じ player-round に discard と call が混在しても、weight 合計が全体で 1.0 になる
+- weighted terminal loss の reduction を明確にする
+  - 現行の `sum()` を維持するなら、batch ごとの実効 loss scale が意図どおりか診断する
+  - 必要なら `sum / weight_sum` などへ変更するが、既存 `terminal_loss_coef` との関係を明記する
+
+#### 関連文書
+- RL_SPEC.md
+- `python/mahjong_rl/stage2a_learner.py`
+- `tests/python/test_terminal_weights.py`
+- `experiments/Stage02_CallUnlock/exp_015/report.md`
+
+#### 受け入れ条件
+- 同じ `(episode_id, round_id, player_id)` に discard 3件 + call 2件がある場合、5件の terminal weights 合計が 1.0 になる
+- discard/call が別 branch に分かれていても、各 branch に渡る weights は元 sample と一致する
+- 別 round / 別 player / 別 episode は別 group として扱われる
+- weighted terminal loss の scale に関するテストを追加する
+- 既存 semantic aux / terminal weight tests が通る
+
+#### 実装メモ
+- CQ-0275 の branch 元順 scatter と同じ補助構造を使うと実装しやすい
+- CQ-0275 / CQ-0274 を先に直した後で対応してよい
+- これは `CQ-0268` の意図をより厳密に満たす修正であり、feature 追加ではない
 
 ---

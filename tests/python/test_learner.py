@@ -241,6 +241,7 @@ class TestBaselineImitation:
                 experiment_id="test", run_id="run", worker_id="w",
                 episode_id="ep", step_id=i,
                 actor_type="baseline" if i < 30 else "policy",
+            sample_semantics_version=2,
             ))
         writer.close()
 
@@ -269,6 +270,7 @@ class TestBaselineImitation:
                 experiment_id="test", run_id="run", worker_id="w",
                 episode_id="ep", step_id=i,
                 actor_type="baseline",
+            sample_semantics_version=2,
             ))
         writer.close()
 
@@ -322,6 +324,7 @@ class TestImitationFilter:
                 experiment_id="test", run_id="run", worker_id="w",
                 episode_id="ep", step_id=i,
                 actor_type="baseline",
+            sample_semantics_version=2,
             ))
         writer.close()
 
@@ -506,6 +509,7 @@ def _write_shards_with_best_mask(
             step_id=i,
             actor_type="baseline",
             teacher_best_mask=tbm,
+        sample_semantics_version=2,
         ))
     writer.close()
 
@@ -614,6 +618,7 @@ class TestImitationReproMetrics:
             experiment_id="test", run_id="run", worker_id="w0",
             episode_id="ep", step_id=0,
             teacher_best_mask=tbm,
+        sample_semantics_version=2,
         ))
         writer1.close()
 
@@ -628,6 +633,7 @@ class TestImitationReproMetrics:
             experiment_id="test", run_id="run", worker_id="w0",
             shard_id="shard_0001",
             episode_id="ep", step_id=1,
+        sample_semantics_version=2,
         ))
         writer2.close()
 
@@ -937,6 +943,7 @@ def _write_shards_with_shanten_delta(
             episode_id="dummy_ep",
             step_id=i,
             shanten_delta=sd,
+        sample_semantics_version=2,
         ))
     writer.close()
 
@@ -1052,6 +1059,7 @@ class TestShantenConditionedDiag:
                 episode_id="dummy_ep",
                 step_id=i,
                 shanten_delta=sd,
+            sample_semantics_version=2,
             ))
         writer1.close()
 
@@ -1074,6 +1082,7 @@ class TestShantenConditionedDiag:
                 worker_id="dummy_worker",
                 episode_id="dummy_ep",
                 step_id=30 + i,
+            sample_semantics_version=2,
             ))
         writer2.close()
 
@@ -1225,6 +1234,7 @@ def _write_shards_with_turn_number(
             turn_number=tn,
             point_delta_reward=pdr,
             shanten_delta_reward=sdr_val,
+        sample_semantics_version=2,
         ))
     writer.close()
 
@@ -1424,6 +1434,7 @@ def _write_shards_with_post_riichi(
             point_delta_reward=pdr,
             shanten_delta_reward=sdr_val,
             is_post_riichi_discard=is_pr,
+        sample_semantics_version=2,
         ))
     writer.close()
 
@@ -1876,6 +1887,7 @@ def _write_mixed_shards(shard_dir: Path, n: int = 80, obs_dim: int = 100,
             step_id=i,
             actor_type="baseline" if is_bl else "policy",
             is_post_riichi_discard=is_pr,
+        sample_semantics_version=2,
         ))
     writer.close()
 
@@ -1992,6 +2004,7 @@ class TestTeacherAgreement:
                 episode_id="ep0", step_id=i,
                 actor_type="baseline" if is_bl else "policy",
                 teacher_best_mask=tbm,
+            sample_semantics_version=2,
             ))
         writer.close()
 

@@ -192,9 +192,9 @@ class Stage2SelfPlayWorker:
                     discard_count += 1
                     _, rewards, terminated, _, _ = env.step_discard_with_snapshot(
                         action, discard_snap)
-                    if should_save and player in pending:
-                        pending[player].reward = float(rewards[player])
-                        pending[player].terminated = terminated
+                    # CQ-0274: pending 中の全保存対象 player に reward を累積
+                    self._accumulate_pending_rewards(
+                        pending, rewards, terminated=terminated)
 
                 elif env.decision_type == DecisionType.RESPONSE:
                     obs = env._make_observation()
@@ -258,9 +258,9 @@ class Stage2SelfPlayWorker:
                     step_counter += 1
                     call_count += 1
                     _, rewards, terminated, _, _ = env.step_response(idx)
-                    if should_save and player in pending:
-                        pending[player].reward = float(rewards[player])
-                        pending[player].terminated = terminated
+                    # CQ-0274: pending 中の全保存対象 player に reward を累積
+                    self._accumulate_pending_rewards(
+                        pending, rewards, terminated=terminated)
 
                 total_steps += 1
 
@@ -341,6 +341,27 @@ class Stage2SelfPlayWorker:
             return [False, False, False, False]
         rng = np.random.RandomState(seed)
         return [rng.random() < self._policy_ratio for _ in range(4)]
+
+    @staticmethod
+    def _accumulate_pending_rewards(
+        pending: dict, rewards, terminated: bool = False,
+    ) -> None:
+        """CQ-0274: pending 中の全保存対象 player の sample に reward を累積する
+
+        Stage1 SelfPlayWorker と同じ same-player transition 累積の発想。
+        action owner だけでなく、env step 中に発生した他家の得失点も
+        全 pending sample に乗る。
+
+        Args:
+            pending: dict[player_id, DecisionSample]
+            rewards: 4 player 分の reward 配列 (numpy / list / Tensor)
+            terminated: match end フラグ
+        """
+        for p, sample in pending.items():
+            if 0 <= p < len(rewards):
+                sample.reward += float(rewards[p])
+            if terminated:
+                sample.terminated = True
 
     @staticmethod
     def _backfill_single(sample: DecisionSample, outcome: dict) -> None:
