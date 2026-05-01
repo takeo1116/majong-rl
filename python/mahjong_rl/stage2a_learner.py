@@ -905,9 +905,13 @@ class Stage2aLearner:
         all_sem_tl: list[float] = []
         all_sem_yl: list[float] = []
 
+        # CQ-0281: branch別 diagnostics buffer
+        d_diag_bufs: list[dict] = []
+        c_diag_bufs: list[dict] = []
+
         for _ in range(epochs):
             if discard_samples:
-                pl, vl, ent, rats, akl, stl, syl = self._ppo_discard_epoch(
+                pl, vl, ent, rats, akl, stl, syl, dbuf = self._ppo_discard_epoch(
                     discard_samples, d_ret, d_adv, d_weights,
                     terminal_classes_t=d_term_cls,
                     yaku_multihot_t=d_yaku_mh,
@@ -920,10 +924,11 @@ class Stage2aLearner:
                 all_anchor_kl_discard.extend(akl)
                 all_sem_tl.extend(stl)
                 all_sem_yl.extend(syl)
+                d_diag_bufs.append(dbuf)
                 num_updates += len(pl)
 
             if call_samples:
-                pl, vl, ent, rats, akl, stl, syl = self._ppo_call_epoch(
+                pl, vl, ent, rats, akl, stl, syl, dbuf = self._ppo_call_epoch(
                     call_samples, c_ret, c_adv, c_weights,
                     terminal_classes_t=c_term_cls,
                     yaku_multihot_t=c_yaku_mh,
@@ -936,6 +941,7 @@ class Stage2aLearner:
                 all_anchor_kl_optional.extend(akl)
                 all_sem_tl.extend(stl)
                 all_sem_yl.extend(syl)
+                c_diag_bufs.append(dbuf)
                 num_updates += len(pl)
 
         # diagnostics
@@ -957,6 +963,56 @@ class Stage2aLearner:
             all_adv_np = np.concatenate(adv_parts).astype(np.float64)
             ppo_diag["advantage_mean"] = float(np.mean(all_adv_np))
             ppo_diag["advantage_std"] = float(np.std(all_adv_np))
+
+        # CQ-0281: 拡張 diagnostics (log_ratio quantiles / advantage sign /
+        # cross stats / max_prob quantiles / branch 別)
+        def _flatten_buf(bufs: list[dict], key: str) -> np.ndarray | None:
+            parts = []
+            for b in bufs:
+                for t in b.get(key, []):
+                    parts.append(t.numpy().astype(np.float64))
+            if not parts:
+                return None
+            return np.concatenate(parts)
+
+        d_lr = _flatten_buf(d_diag_bufs, "log_ratios")
+        d_adv_b = _flatten_buf(d_diag_bufs, "advantages")
+        d_mp = _flatten_buf(d_diag_bufs, "max_probs")
+        d_w = _flatten_buf(d_diag_bufs, "weights")
+        c_lr = _flatten_buf(c_diag_bufs, "log_ratios")
+        c_adv_b = _flatten_buf(c_diag_bufs, "advantages")
+        c_mp = _flatten_buf(c_diag_bufs, "max_probs")
+        c_w = _flatten_buf(c_diag_bufs, "weights")
+
+        # branch 別
+        if d_lr is not None and len(d_lr) > 0:
+            ppo_diag["discard"] = self._compute_ppo_diag_stats(
+                d_lr, d_adv_b, d_mp, d_w, self._clip_epsilon)
+        if c_lr is not None and len(c_lr) > 0:
+            ppo_diag["call"] = self._compute_ppo_diag_stats(
+                c_lr, c_adv_b, c_mp, c_w, self._clip_epsilon)
+
+        # top-level aggregate (discard + call 結合)
+        all_lr_parts = [x for x in (d_lr, c_lr) if x is not None and len(x) > 0]
+        all_adv_b_parts = [x for x in (d_adv_b, c_adv_b)
+                           if x is not None and len(x) > 0]
+        all_mp_parts = [x for x in (d_mp, c_mp) if x is not None and len(x) > 0]
+        all_w_parts = [x for x in (d_w, c_w) if x is not None and len(x) > 0]
+        if all_lr_parts or all_adv_b_parts or all_mp_parts:
+            top_lr = np.concatenate(all_lr_parts) if all_lr_parts else None
+            top_adv = (np.concatenate(all_adv_b_parts)
+                       if all_adv_b_parts else None)
+            top_mp = np.concatenate(all_mp_parts) if all_mp_parts else None
+            top_w = (np.concatenate(all_w_parts)
+                     if (all_w_parts and len(all_w_parts) == len(all_lr_parts))
+                     else None)
+            top_stats = self._compute_ppo_diag_stats(
+                top_lr, top_adv, top_mp, top_w, self._clip_epsilon)
+            # 既存 key (ratio_mean / ratio_std / clip_fraction /
+            # advantage_mean / advantage_std) は上書きしない
+            for k, v in top_stats.items():
+                if k not in ppo_diag:
+                    ppo_diag[k] = v
         # CQ-0240: anchor KL diagnostics
         if all_anchor_kl_discard:
             ppo_diag["anchor_kl_discard"] = float(np.mean(all_anchor_kl_discard))
@@ -1252,6 +1308,151 @@ class Stage2aLearner:
                                 delta=self._huber_delta)
         return (value - target).pow(2)
 
+    # ====================================================================
+    # CQ-0281: PPO diagnostics helpers
+    # ====================================================================
+
+    @staticmethod
+    def _safe_np_quantiles(values, quantiles):
+        """空配列に安全な quantile 計算
+
+        Args:
+            values: 1D ndarray (np.float64 推奨) もしくは None / 空
+            quantiles: 0..1 の percentile を 0..1 で
+
+        Returns:
+            dict: {f"p{int(q*100):02d}": float | None}
+        """
+        out: dict = {}
+        if values is None or len(values) == 0:
+            for q in quantiles:
+                out[f"p{int(q * 100):02d}"] = None
+            return out
+        for q in quantiles:
+            out[f"p{int(q * 100):02d}"] = float(np.quantile(values, q))
+        return out
+
+    @staticmethod
+    def _weighted_mean(values, weights):
+        """重み付き平均。空 / weight 合計 0 なら None"""
+        if values is None or len(values) == 0:
+            return None
+        if weights is None:
+            return float(np.mean(values))
+        ws = float(np.sum(weights))
+        if ws <= 0:
+            return None
+        return float(np.sum(values * weights) / ws)
+
+    @staticmethod
+    def _weighted_fraction(mask, weights):
+        """重み付き fraction (mask は 0/1 or bool)"""
+        if mask is None or len(mask) == 0:
+            return None
+        m = np.asarray(mask, dtype=np.float64)
+        if weights is None:
+            return float(m.mean())
+        w = np.asarray(weights, dtype=np.float64)
+        ws = float(w.sum())
+        if ws <= 0:
+            return None
+        return float((m * w).sum() / ws)
+
+    @classmethod
+    def _compute_ppo_diag_stats(
+        cls,
+        log_ratios: np.ndarray | None,
+        advantages: np.ndarray | None,
+        max_probs: np.ndarray | None,
+        weights: np.ndarray | None,
+        clip_epsilon: float,
+    ) -> dict:
+        """CQ-0281: PPO diagnostics 統計を計算する
+
+        log_ratio / advantage / max_prob から log_ratio quantile / advantage
+        sign fraction / cross stats / max_prob quantile などを生成する。
+
+        集計方針:
+            - mean / std / fraction: weights があれば weighted、無ければ unweighted
+            - quantile: unweighted (重み付き quantile は scope 外)
+            - num_adv_pos / num_adv_neg は raw count
+            - 空配列や片符号のみのケースでは安全に None を返す
+        """
+        d: dict = {}
+        if log_ratios is not None and len(log_ratios) > 0:
+            lr = np.asarray(log_ratios, dtype=np.float64)
+            ratio = np.exp(lr)
+            d["log_ratio_mean"] = cls._weighted_mean(lr, weights)
+            d["log_ratio_std"] = float(np.std(lr))  # unweighted
+            d["log_ratio_min"] = float(np.min(lr))
+            d["log_ratio_max"] = float(np.max(lr))
+            qs = cls._safe_np_quantiles(lr, [0.01, 0.05, 0.50, 0.95, 0.99])
+            for k, v in qs.items():
+                d[f"log_ratio_{k}"] = v
+            qsr = cls._safe_np_quantiles(ratio, [0.01, 0.05, 0.50, 0.95, 0.99])
+            for k, v in qsr.items():
+                d[f"ratio_{k}"] = v
+            d["ratio_max"] = float(np.max(ratio))
+            d["clip_fraction"] = cls._weighted_fraction(
+                np.abs(ratio - 1.0) > clip_epsilon, weights)
+
+        if advantages is not None and len(advantages) > 0:
+            a = np.asarray(advantages, dtype=np.float64)
+            pos_mask = a > 0
+            neg_mask = a < 0
+            zero_mask = a == 0
+            d["advantage_pos_frac"] = cls._weighted_fraction(pos_mask, weights)
+            d["advantage_neg_frac"] = cls._weighted_fraction(neg_mask, weights)
+            d["advantage_zero_frac"] = cls._weighted_fraction(zero_mask, weights)
+            d["advantage_abs_mean"] = cls._weighted_mean(np.abs(a), weights)
+            qsa = cls._safe_np_quantiles(a, [0.01, 0.05, 0.50, 0.95, 0.99])
+            for k, v in qsa.items():
+                d[f"advantage_{k}"] = v
+            d["num_adv_pos"] = int(pos_mask.sum())
+            d["num_adv_neg"] = int(neg_mask.sum())
+
+            # cross stats: advantage × log_ratio
+            if log_ratios is not None and len(log_ratios) == len(a):
+                lr = np.asarray(log_ratios, dtype=np.float64)
+                ratio = np.exp(lr)
+                clipped = np.abs(ratio - 1.0) > clip_epsilon
+                w_pos = (weights[pos_mask] if (weights is not None
+                                                and pos_mask.any()) else None)
+                w_neg = (weights[neg_mask] if (weights is not None
+                                                and neg_mask.any()) else None)
+                if pos_mask.any():
+                    d["log_ratio_mean_adv_pos"] = cls._weighted_mean(
+                        lr[pos_mask], w_pos)
+                    d["ratio_mean_adv_pos"] = cls._weighted_mean(
+                        ratio[pos_mask], w_pos)
+                    d["clip_fraction_adv_pos"] = cls._weighted_fraction(
+                        clipped[pos_mask], w_pos)
+                else:
+                    d["log_ratio_mean_adv_pos"] = None
+                    d["ratio_mean_adv_pos"] = None
+                    d["clip_fraction_adv_pos"] = None
+                if neg_mask.any():
+                    d["log_ratio_mean_adv_neg"] = cls._weighted_mean(
+                        lr[neg_mask], w_neg)
+                    d["ratio_mean_adv_neg"] = cls._weighted_mean(
+                        ratio[neg_mask], w_neg)
+                    d["clip_fraction_adv_neg"] = cls._weighted_fraction(
+                        clipped[neg_mask], w_neg)
+                else:
+                    d["log_ratio_mean_adv_neg"] = None
+                    d["ratio_mean_adv_neg"] = None
+                    d["clip_fraction_adv_neg"] = None
+
+        if max_probs is not None and len(max_probs) > 0:
+            mp = np.asarray(max_probs, dtype=np.float64)
+            d["max_prob_mean"] = cls._weighted_mean(mp, weights)
+            qsm = cls._safe_np_quantiles(mp, [0.50, 0.90, 0.95, 0.99])
+            d["max_prob_p50"] = qsm["p50"]
+            d["max_prob_p90"] = qsm["p90"]
+            d["max_prob_p95"] = qsm["p95"]
+            d["max_prob_p99"] = qsm["p99"]
+        return d
+
     def _ppo_discard_epoch(self, samples, returns_t, advantages_t,
                            weights_t=None,
                            terminal_classes_t=None, yaku_multihot_t=None,
@@ -1259,6 +1460,11 @@ class Stage2aLearner:
         """discard PPO の 1 epoch (CQ-0249: weighted mean)"""
         policy_losses, value_losses, entropies = [], [], []
         all_ratios = []
+        # CQ-0281: 追加 diagnostics 用バッファ
+        all_log_ratios: list[torch.Tensor] = []
+        all_batch_adv: list[torch.Tensor] = []
+        all_max_probs: list[torch.Tensor] = []
+        all_batch_w: list[torch.Tensor] = []
         _anchor_kls: list[float] = []
         _sem_tl: list[float] = []
         _sem_yl: list[float] = []
@@ -1299,12 +1505,19 @@ class Stage2aLearner:
             ent_per = -(probs * log_probs).sum(dim=-1)
             entropy = (ent_per * batch_w).sum() / w_sum
 
-            ratio = torch.exp(action_log_probs - old_log_probs)
+            log_ratio = action_log_probs - old_log_probs
+            ratio = torch.exp(log_ratio)
             surr1 = ratio * batch_advantages
             surr2 = torch.clamp(ratio, 1 - self._clip_epsilon,
                                 1 + self._clip_epsilon) * batch_advantages
             surr_min = -torch.min(surr1, surr2)
             policy_loss = (surr_min * batch_w).sum() / w_sum
+
+            # CQ-0281: max_prob = legal mask 適用後 softmax の sample-wise max
+            with torch.no_grad():
+                masked_logits = out.discard_logits + (1.0 - masks) * (-1e9)
+                masked_probs = torch.softmax(masked_logits, dim=-1)
+                max_prob = masked_probs.max(dim=-1).values
 
             value = out.values["round_delta"].squeeze(-1)
             vl_per = self._compute_value_loss_per_sample(value, batch_returns)
@@ -1338,12 +1551,23 @@ class Stage2aLearner:
             policy_losses.append(policy_loss.item())
             value_losses.append(value_loss.item())
             entropies.append(entropy.item())
+            # CQ-0281: detach + cpu で集計用に回収 (GPU tensor を長く保持しない)
             all_ratios.append(ratio.detach().cpu())
+            all_log_ratios.append(log_ratio.detach().cpu())
+            all_batch_adv.append(batch_advantages.detach().cpu())
+            all_max_probs.append(max_prob.detach().cpu())
+            all_batch_w.append(batch_w.detach().cpu())
             if self._anchor_enabled and self._anchor_model is not None:
                 _anchor_kls.append(akl_val)
 
+        diag_buffer = {
+            "log_ratios": all_log_ratios,
+            "advantages": all_batch_adv,
+            "max_probs": all_max_probs,
+            "weights": all_batch_w,
+        }
         return (policy_losses, value_losses, entropies, all_ratios,
-                _anchor_kls, _sem_tl, _sem_yl)
+                _anchor_kls, _sem_tl, _sem_yl, diag_buffer)
 
     def _ppo_call_epoch(self, samples, returns_t, advantages_t,
                         weights_t=None,
@@ -1352,6 +1576,11 @@ class Stage2aLearner:
         """optional PPO の 1 epoch (CQ-0249: weighted mean)"""
         policy_losses, value_losses, entropies = [], [], []
         all_ratios = []
+        # CQ-0281: 追加 diagnostics 用バッファ
+        all_log_ratios: list[torch.Tensor] = []
+        all_batch_adv: list[torch.Tensor] = []
+        all_max_probs: list[torch.Tensor] = []
+        all_batch_w: list[torch.Tensor] = []
         _anchor_kls: list[float] = []
         _sem_tl: list[float] = []
         _sem_yl: list[float] = []
@@ -1402,12 +1631,19 @@ class Stage2aLearner:
             ent_per = -(probs * log_probs).sum(dim=-1)
             entropy = (ent_per * batch_w).sum() / w_sum
 
-            ratio = torch.exp(action_log_probs - old_log_probs)
+            log_ratio = action_log_probs - old_log_probs
+            ratio = torch.exp(log_ratio)
             surr1 = ratio * batch_advantages
             surr2 = torch.clamp(ratio, 1 - self._clip_epsilon,
                                 1 + self._clip_epsilon) * batch_advantages
             surr_min = -torch.min(surr1, surr2)
             policy_loss = (surr_min * batch_w).sum() / w_sum
+
+            # CQ-0281: max_prob = candidate mask 適用後 softmax の sample-wise max
+            with torch.no_grad():
+                masked_scores = out.optional_scores + (1.0 - cand_mask) * (-1e9)
+                masked_probs = torch.softmax(masked_scores, dim=-1)
+                max_prob = masked_probs.max(dim=-1).values
 
             value = out.values["round_delta"].squeeze(-1)
             vl_per = self._compute_value_loss_per_sample(value, batch_returns)
@@ -1443,9 +1679,20 @@ class Stage2aLearner:
             policy_losses.append(policy_loss.item())
             value_losses.append(value_loss.item())
             entropies.append(entropy.item())
+            # CQ-0281: detach + cpu で集計用に回収
             all_ratios.append(ratio.detach().cpu())
+            all_log_ratios.append(log_ratio.detach().cpu())
+            all_batch_adv.append(batch_advantages.detach().cpu())
+            all_max_probs.append(max_prob.detach().cpu())
+            all_batch_w.append(batch_w.detach().cpu())
             if self._anchor_enabled and self._anchor_model is not None:
                 _anchor_kls.append(akl_val)
 
+        diag_buffer = {
+            "log_ratios": all_log_ratios,
+            "advantages": all_batch_adv,
+            "max_probs": all_max_probs,
+            "weights": all_batch_w,
+        }
         return (policy_losses, value_losses, entropies, all_ratios,
-                _anchor_kls, _sem_tl, _sem_yl)
+                _anchor_kls, _sem_tl, _sem_yl, diag_buffer)
