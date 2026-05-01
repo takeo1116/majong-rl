@@ -79,6 +79,10 @@ class Stage2aLearner:
         rml = tc.get("rule_mix_learner", {})
         self._baseline_sample_weight = rml.get("baseline_sample_weight", 1.0)
         self._mixed_ppo_mode = rml.get("ppo_mode", "separated")
+        # CQ-0282: mixed PPO は baseline actor sample が PPO ratio を off-policy 化
+        # しうるため、明示 opt-in が無いと train() で fail-fast する。
+        self._allow_mixed_offpolicy_baseline = bool(
+            rml.get("allow_mixed_offpolicy_baseline", False))
         # CQ-0256: semantic aux
         sa = tc.get("semantic_aux", {})
         self._semantic_aux_enabled = sa.get("enabled", False)
@@ -233,9 +237,34 @@ class Stage2aLearner:
                     f" (rule_mix_learner.ppo_mode={self._mixed_ppo_mode!r})"
                 )
 
+        # CQ-0282: mixed PPO + baseline_sample_weight > 0 は明示 opt-in が無ければ
+        # fail-fast。baseline actor sample は learned policy から sample されて
+        # いないため、PPO ratio が off-policy になる (exp_022 collapse の主因候補)。
+        if (self._mode == "ppo" and self._mixed_ppo_mode == "mixed"
+                and self._baseline_sample_weight > 0.0
+                and not filter_actor_type
+                and not self._allow_mixed_offpolicy_baseline):
+            raise ValueError(
+                "Stage02a mixed PPO: baseline actor sample is not sampled from "
+                "learned policy. PPO ratio may be off-policy and lead to "
+                "ratio explosion / late-cycle collapse (see exp_022). "
+                "Use ppo_mode='separated' unless explicitly intended. "
+                "If you really want mixed PPO, set "
+                "training.rule_mix_learner.allow_mixed_offpolicy_baseline=true. "
+                f"(ppo_mode={self._mixed_ppo_mode!r}, "
+                f"baseline_sample_weight={self._baseline_sample_weight})"
+            )
+
         if nd + nc == 0:
             return {"mode": self._mode, "total_steps": 0,
-                    "policy_loss": 0.0, "value_loss": 0.0, "num_updates": 0}
+                    "policy_loss": 0.0, "value_loss": 0.0, "num_updates": 0,
+                    "ppo_mode": (
+                        "separated" if filter_actor_type == "policy"
+                        else self._mixed_ppo_mode),
+                    "executed": False,
+                    "used_policy_samples": 0,
+                    "used_baseline_samples": 0,
+                    "excluded_baseline_samples": 0}
 
         epochs = num_epochs or self._epochs
 
@@ -244,10 +273,7 @@ class Stage2aLearner:
         else:
             # PPO は sample list path を安全に使う (candidate semantics 維持)
             all_samples = reader.read_all()
-            if filter_actor_type:
-                all_samples = [s for s in all_samples
-                               if s.actor_type == filter_actor_type]
-            # CQ-0279: read_all 経路でも fail-fast
+            # CQ-0279: read_all 経路でも fail-fast (filter 前)
             if all_samples:
                 min_ver = min(s.sample_semantics_version for s in all_samples)
                 required = self.REQUIRED_SAMPLE_SEMANTICS_VERSION
@@ -260,9 +286,32 @@ class Stage2aLearner:
                         f" return / advantage の意味が崩れるため fail-fast します。"
                         f" Stage2a selfplay で shard を再生成してください。"
                     )
+            # CQ-0282: filter 前に actor_type 別件数を集計
+            n_policy_total = sum(1 for s in all_samples
+                                 if s.actor_type == "policy")
+            n_baseline_total = sum(1 for s in all_samples
+                                   if s.actor_type == "baseline")
+            if filter_actor_type:
+                all_samples = [s for s in all_samples
+                               if s.actor_type == filter_actor_type]
             d_samples = [s for s in all_samples if s.decision_type == "discard"]
             c_samples = [s for s in all_samples if s.decision_type == "call"]
-            return self._train_ppo(d_samples, c_samples, epochs)
+            result = self._train_ppo(d_samples, c_samples, epochs)
+            # CQ-0282: separated/mixed の運用 metadata を summary に残す
+            ppo_mode_eff = ("separated" if filter_actor_type == "policy"
+                            else self._mixed_ppo_mode)
+            result["ppo_mode"] = ppo_mode_eff
+            result["executed"] = True
+            if ppo_mode_eff == "separated":
+                result["used_policy_samples"] = n_policy_total
+                result["used_baseline_samples"] = 0
+                result["excluded_baseline_samples"] = n_baseline_total
+            else:
+                # mixed: baseline も PPO に含まれる
+                result["used_policy_samples"] = n_policy_total
+                result["used_baseline_samples"] = n_baseline_total
+                result["excluded_baseline_samples"] = 0
+            return result
 
     def _compute_grouped_returns_numpy(self, data_d, data_c):
         """tensor data から grouped return を計算 (imitation value warmstart 用)"""
@@ -1029,6 +1078,16 @@ class Stage2aLearner:
                 "num_baseline_samples": n_baseline,
                 "effective_weight_sum_policy": float(n_policy),
                 "effective_weight_sum_baseline": float(n_baseline * self._baseline_sample_weight),
+                # CQ-0282: mixed PPO は baseline action が learned policy
+                # から sample されていないため、PPO ratio が off-policy
+                # になりうる。allow_mixed_offpolicy_baseline=True で
+                # 明示 opt-in した場合に限りここまで到達する。
+                "allow_mixed_offpolicy_baseline": (
+                    self._allow_mixed_offpolicy_baseline),
+                "warning": (
+                    "baseline actor sample is not sampled from learned "
+                    "policy; PPO ratio may be off-policy. "
+                    "Use ppo_mode='separated' unless explicitly intended."),
             }
 
         return {
