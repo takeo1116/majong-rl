@@ -99,7 +99,9 @@ def main():
 
     device = torch.device(args.device)
     sd = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    model.load_state_dict(sd)
+    # CQ-0288: 旧 checkpoint の semantic_proj.* keys を互換的に drop
+    from mahjong_rl.models.stage2a_model import load_stage2a_state_dict
+    load_stage2a_state_dict(model, sd)
 
     # eval
     from mahjong_rl.semantic_eval import evaluate_semantic_heads, format_summary

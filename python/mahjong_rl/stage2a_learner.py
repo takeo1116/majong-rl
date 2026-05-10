@@ -88,8 +88,253 @@ class Stage2aLearner:
         self._semantic_aux_enabled = sa.get("enabled", False)
         self._terminal_loss_coef = sa.get("terminal_loss_coef", 0.2)
         self._yaku_loss_coef = sa.get("yaku_loss_coef", 0.1)
+        # CQ-0284: gradient norm diagnostics (default off)
+        gn = tc.get("diagnostics", {}).get("gradient_norms", {})
+        self._gn_enabled = bool(gn.get("enabled", False))
+        self._gn_max_batches_per_epoch = int(gn.get("max_batches_per_epoch", 4))
+        self._gn_every_n_epochs = max(1, int(gn.get("every_n_epochs", 1)))
+        # CQ-0287: PPO target KL early stop (default off)
+        # 各 minibatch の forward 後に ((ratio-1) - log_ratio).mean() で
+        # approx KL を計算し、`target * stop_multiplier` を超えたら
+        # その branch epoch の残り minibatch を early stop する。
+        # default off では既存学習挙動と完全互換。
+        tk = tc.get("ppo_target_kl", {}) or {}
+        self._tk_enabled = bool(tk.get("enabled", False))
+        self._tk_target = float(tk.get("target", 0.03))
+        self._tk_stop_multiplier = float(tk.get("stop_multiplier", 1.5))
+        self._tk_skip_on_exceed = bool(tk.get("skip_minibatch_on_exceed", True))
+        self._tk_threshold = self._tk_target * self._tk_stop_multiplier
 
-        self._optimizer = torch.optim.Adam(model.parameters(), lr=self._lr)
+        # CQ-0286: optimizer parameter groups (policy / value_semantic) lr 分離
+        # default off: 既存と完全互換 (single group, lr=self._lr)
+        # CQ-0289: `apply_to` 指定で algorithm scope (ppo / imitation) を分離
+        lrg = tc.get("lr_groups", {}) or {}
+        self._lr_groups_enabled = bool(lrg.get("enabled", False))
+        self._lr_groups_apply_to = self._validate_lr_groups_apply_to(
+            lrg.get("apply_to", ["ppo", "imitation"]))
+        # 現在の algorithm で lr_groups が active か
+        self._lr_groups_active = (
+            self._lr_groups_enabled
+            and self._mode in self._lr_groups_apply_to
+        )
+        self._optimizer, self._lr_groups_info = self._build_optimizer(
+            model, base_lr=self._lr, lr_groups_cfg=lrg,
+            active=self._lr_groups_active,
+            requested_enabled=self._lr_groups_enabled,
+            apply_to=self._lr_groups_apply_to,
+            algorithm=self._mode)
+
+    # CQ-0289: lr_groups の適用 scope (algorithm 名)
+    _LR_GROUPS_KNOWN_ALGORITHMS: tuple[str, ...] = ("ppo", "imitation")
+
+    @classmethod
+    def _validate_lr_groups_apply_to(cls, value) -> list[str]:
+        """CQ-0289: apply_to を validate して list[str] で返す。
+
+        - list / tuple 以外は ValueError
+        - 空 list は ValueError
+        - 未知の algorithm 名は ValueError
+        """
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(
+                f"CQ-0289: training.lr_groups.apply_to は list である必要が"
+                f" あります (got {type(value).__name__}: {value!r})")
+        items = [str(x) for x in value]
+        if not items:
+            raise ValueError(
+                "CQ-0289: training.lr_groups.apply_to が空 list です。"
+                " 適用したい algorithm を 1 つ以上指定するか、"
+                " lr_groups.enabled=false にしてください。")
+        unknown = [x for x in items if x not in cls._LR_GROUPS_KNOWN_ALGORITHMS]
+        if unknown:
+            raise ValueError(
+                f"CQ-0289: training.lr_groups.apply_to に未知の algorithm が"
+                f" 含まれます: {unknown}."
+                f" 受け入れる値: {list(cls._LR_GROUPS_KNOWN_ALGORITHMS)}")
+        return items
+
+    def _build_optimizer(self, model, base_lr: float, lr_groups_cfg: dict,
+                          *,
+                          active: bool | None = None,
+                          requested_enabled: bool | None = None,
+                          apply_to: list[str] | None = None,
+                          algorithm: str | None = None,
+                         ) -> tuple["torch.optim.Optimizer", dict]:
+        """CQ-0286 / CQ-0289: optimizer 構築。`lr_groups.enabled=True` かつ
+        現在の algorithm が `apply_to` に含まれるとき、policy / value_semantic
+        の lr を分離する。
+
+        default off (既存互換):
+            Adam(model.parameters(), lr=base_lr) — 1 group のみ
+        active:
+            Adam([{"params": policy, "lr": policy_lr},
+                  {"params": value_semantic, "lr": value_semantic_lr},
+                  {"params": default, "lr": default_lr}], lr=base_lr)
+            (default group は unknown trainable parameter があるときのみ
+             optimizer に追加される)
+
+        ``active`` が False のときは `lr_groups.enabled=true` 指定でも
+        single group optimizer を返す (CQ-0289: scope 外 algorithm の場合)。
+
+        重複チェック (`id`) と取りこぼしチェックを行い、不一致なら
+        ValueError で fail-fast する。
+        """
+        cfg_enabled = bool(lr_groups_cfg.get("enabled", False))
+        # 後方互換: active が明示されない場合は cfg_enabled を使う
+        if active is None:
+            active = cfg_enabled
+        if requested_enabled is None:
+            requested_enabled = cfg_enabled
+
+        info: dict = {
+            "enabled": bool(active),
+            # CQ-0289: 追加 diagnostics keys
+            "requested_enabled": bool(requested_enabled),
+            "active_for_algorithm": bool(active),
+            "apply_to": list(apply_to) if apply_to is not None else None,
+            "algorithm": algorithm,
+            "groups": {},
+        }
+
+        if not active:
+            opt = torch.optim.Adam(model.parameters(), lr=base_lr)
+            # 既存挙動互換のため、info も最小限
+            info["groups"]["all"] = {
+                "lr": float(base_lr),
+                "param_count": int(sum(p.numel() for p in model.parameters()
+                                       if p.requires_grad)),
+                "tensor_count": int(sum(1 for p in model.parameters()
+                                        if p.requires_grad)),
+            }
+            return opt, info
+
+        policy_lr = float(lr_groups_cfg.get("policy", base_lr))
+        value_semantic_lr = float(lr_groups_cfg.get("value_semantic", base_lr))
+        default_lr = float(lr_groups_cfg.get("default", base_lr))
+
+        named_trainable = [(n, p) for n, p in model.named_parameters()
+                           if p.requires_grad]
+        classify = self._classify_param_groups(named_trainable)
+        policy_named = classify["policy"]
+        vs_named = classify["value_semantic"]
+        default_named = classify["default"]
+
+        # 重複チェック (id ベース): 各 named param は厳密に 1 group
+        all_ids: set[int] = set()
+        for label, lst in (("policy", policy_named),
+                           ("value_semantic", vs_named),
+                           ("default", default_named)):
+            for n, p in lst:
+                pid = id(p)
+                if pid in all_ids:
+                    raise ValueError(
+                        f"CQ-0286: parameter {n!r} が複数の group に重複"
+                        f" 分類されました ({label})")
+                all_ids.add(pid)
+        # 取りこぼしチェック: trainable で classifier に拾われなかった
+        # parameter がないこと
+        expected_ids = {id(p) for _, p in named_trainable}
+        missing = expected_ids - all_ids
+        if missing:
+            missing_names = [n for n, p in named_trainable
+                             if id(p) in missing]
+            raise ValueError(
+                f"CQ-0286: trainable parameter が optimizer group に "
+                f"取りこぼされました: {missing_names}")
+        extra = all_ids - expected_ids
+        if extra:
+            raise ValueError(
+                f"CQ-0286: classifier が trainable でない parameter を "
+                f"group に入れました (id 数={len(extra)})")
+
+        param_groups: list[dict] = []
+        if policy_named:
+            param_groups.append({
+                "params": [p for _, p in policy_named],
+                "lr": policy_lr,
+                "name": "policy",
+            })
+        if vs_named:
+            param_groups.append({
+                "params": [p for _, p in vs_named],
+                "lr": value_semantic_lr,
+                "name": "value_semantic",
+            })
+        if default_named:
+            param_groups.append({
+                "params": [p for _, p in default_named],
+                "lr": default_lr,
+                "name": "default",
+            })
+
+        if not param_groups:
+            raise ValueError(
+                "CQ-0286: optimizer に追加する param group がありません "
+                "(trainable parameter が 0 件)")
+
+        opt = torch.optim.Adam(param_groups, lr=base_lr)
+
+        # diagnostics info
+        def _gstats(named_list):
+            return {
+                "param_count": int(sum(p.numel() for _, p in named_list)),
+                "tensor_count": int(len(named_list)),
+            }
+        info["groups"]["policy"] = {
+            "lr": policy_lr, **_gstats(policy_named)}
+        info["groups"]["value_semantic"] = {
+            "lr": value_semantic_lr, **_gstats(vs_named)}
+        if default_named:
+            info["groups"]["default"] = {
+                "lr": default_lr,
+                **_gstats(default_named),
+                "names": [n for n, _ in default_named],
+            }
+        else:
+            info["groups"]["default"] = {
+                "lr": default_lr,
+                "param_count": 0,
+                "tensor_count": 0,
+                "names": [],
+            }
+        return opt, info
+
+    # CQ-0286: parameter group 分類規則 (Stage2aModel の module 階層に基づく)
+    _LR_POLICY_PREFIXES: tuple[str, ...] = (
+        "discard_trunk", "discard_head", "optional_trunk",
+        "candidate_encoder", "optional_scorer",
+        "_tile_embedding", "_local_scorer", "_context_gate",
+    )
+    _LR_VALUE_SEMANTIC_PREFIXES: tuple[str, ...] = (
+        # CQ-0288: semantic_proj は削除済み
+        "value_trunk", "value_head",
+        "terminal_head", "yaku_head",
+    )
+
+    @classmethod
+    def _classify_param_groups(
+        cls, named_params: list[tuple[str, "nn.Parameter"]],
+    ) -> dict[str, list[tuple[str, "nn.Parameter"]]]:
+        """CQ-0286: named parameters を policy / value_semantic / default に
+        分類する。
+
+        Returns:
+            {"policy": [...], "value_semantic": [...], "default": [...]}
+            それぞれ (name, param) のリスト。default は分類規則のどれにも
+            一致しなかった trainable parameter。
+        """
+        out: dict[str, list[tuple[str, "nn.Parameter"]]] = {
+            "policy": [], "value_semantic": [], "default": [],
+        }
+        for name, p in named_params:
+            top = name.split(".", 1)[0]
+            if top in cls._LR_POLICY_PREFIXES:
+                out["policy"].append((name, p))
+            elif top in cls._LR_VALUE_SEMANTIC_PREFIXES:
+                out["value_semantic"].append((name, p))
+            else:
+                out["default"].append((name, p))
+        return out
 
     @staticmethod
     def _compute_terminal_weights(episode_ids, round_ids, player_ids, n: int,
@@ -479,12 +724,12 @@ class Stage2aLearner:
                     # CQ-0256/0268: semantic aux loss with terminal weights
                     if self._semantic_aux_enabled and d_term_cls is not None:
                         tw = d_term_weights[idx] if d_term_weights is not None else None
-                        sa_loss, tl_v, yl_v = self._compute_semantic_aux_loss(
+                        sa_loss, tl_t, yl_t = self._compute_semantic_aux_loss(
                             out.semantic, d_term_cls[idx], d_yaku_mh[idx], d_is_winner[idx],
                             terminal_weights=tw)
                         total = total + sa_loss
-                        sem_tl_list.append(tl_v)
-                        sem_yl_list.append(yl_v)
+                        sem_tl_list.append(float(tl_t.detach()))
+                        sem_yl_list.append(float(yl_t.detach()))
 
                     self._optimizer.zero_grad()
                     total.backward()
@@ -515,12 +760,12 @@ class Stage2aLearner:
                     # CQ-0256/0268: semantic aux loss with terminal weights
                     if self._semantic_aux_enabled and c_term_cls is not None:
                         tw = c_term_weights[idx] if c_term_weights is not None else None
-                        sa_loss, tl_v, yl_v = self._compute_semantic_aux_loss(
+                        sa_loss, tl_t, yl_t = self._compute_semantic_aux_loss(
                             out.semantic, c_term_cls[idx], c_yaku_mh[idx], c_is_winner[idx],
                             terminal_weights=tw)
                         total = total + sa_loss
-                        sem_tl_list.append(tl_v)
-                        sem_yl_list.append(yl_v)
+                        sem_tl_list.append(float(tl_t.detach()))
+                        sem_yl_list.append(float(yl_t.detach()))
 
                     self._optimizer.zero_grad()
                     total.backward()
@@ -569,6 +814,7 @@ class Stage2aLearner:
                 "train_sec": round(train_end - train_start, 3),
                 "diagnostics_sec": round(diag_sec, 3),
             },
+            "optimizer_lr_groups": self._lr_groups_info,  # CQ-0286
             **diag,
         }
 
@@ -958,14 +1204,15 @@ class Stage2aLearner:
         d_diag_bufs: list[dict] = []
         c_diag_bufs: list[dict] = []
 
-        for _ in range(epochs):
+        for epoch_idx in range(epochs):
             if discard_samples:
                 pl, vl, ent, rats, akl, stl, syl, dbuf = self._ppo_discard_epoch(
                     discard_samples, d_ret, d_adv, d_weights,
                     terminal_classes_t=d_term_cls,
                     yaku_multihot_t=d_yaku_mh,
                     is_winner_t=d_is_winner,
-                    terminal_weights_t=d_term_weights)
+                    terminal_weights_t=d_term_weights,
+                    epoch_idx=epoch_idx)
                 all_policy_losses.extend(pl)
                 all_value_losses.extend(vl)
                 all_entropies.extend(ent)
@@ -982,7 +1229,8 @@ class Stage2aLearner:
                     terminal_classes_t=c_term_cls,
                     yaku_multihot_t=c_yaku_mh,
                     is_winner_t=c_is_winner,
-                    terminal_weights_t=c_term_weights)
+                    terminal_weights_t=c_term_weights,
+                    epoch_idx=epoch_idx)
                 all_policy_losses.extend(pl)
                 all_value_losses.extend(vl)
                 all_entropies.extend(ent)
@@ -1090,6 +1338,46 @@ class Stage2aLearner:
                     "Use ppo_mode='separated' unless explicitly intended."),
             }
 
+        # CQ-0284: gradient norm diagnostics aggregate (default off → empty)
+        if self._gn_enabled:
+            d_gn_minibatches: list[dict] = []
+            c_gn_minibatches: list[dict] = []
+            for b in d_diag_bufs:
+                d_gn_minibatches.extend(b.get("gradient_norms", []))
+            for b in c_diag_bufs:
+                c_gn_minibatches.extend(b.get("gradient_norms", []))
+            agg_minibatches = d_gn_minibatches + c_gn_minibatches
+            agg_stats = self._gn_summarize_buffer(agg_minibatches)
+            d_stats = self._gn_summarize_buffer(d_gn_minibatches)
+            c_stats = self._gn_summarize_buffer(c_gn_minibatches)
+            ppo_diag["gradient_norms"] = {
+                "config": {
+                    "enabled": True,
+                    "max_batches_per_epoch": self._gn_max_batches_per_epoch,
+                    "every_n_epochs": self._gn_every_n_epochs,
+                },
+                "aggregate": {
+                    **agg_stats,
+                    "ratios": self._gn_compute_ratios(agg_stats),
+                },
+                "discard": d_stats,
+                "call": c_stats,
+            }
+
+        # CQ-0287: target_kl early-stop diagnostics (top-level + branch 別)
+        d_tk = self._tk_summarize(d_diag_bufs)
+        c_tk = self._tk_summarize(c_diag_bufs)
+        all_tk = self._tk_summarize(d_diag_bufs + c_diag_bufs)
+        # branch 別: 該当 branch dict があるときに merge
+        if "discard" in ppo_diag:
+            ppo_diag["discard"].update(d_tk)
+        if "call" in ppo_diag:
+            ppo_diag["call"].update(c_tk)
+        # top-level (既存 key を上書きしない方針)
+        for k, v in all_tk.items():
+            if k not in ppo_diag:
+                ppo_diag[k] = v
+
         return {
             "mode": "ppo",
             "total_steps": len(discard_samples) + len(call_samples),
@@ -1102,15 +1390,18 @@ class Stage2aLearner:
             "semantic_aux_enabled": self._semantic_aux_enabled,
             "terminal_loss": float(np.mean(all_sem_tl)) if all_sem_tl else None,
             "yaku_loss": float(np.mean(all_sem_yl)) if all_sem_yl else None,
+            "optimizer_lr_groups": self._lr_groups_info,  # CQ-0286
             "ppo_diag": ppo_diag,
         }
 
     def load_anchor(self, checkpoint_path: str) -> None:
         """CQ-0240: anchor model をロードする"""
         import copy
+        from mahjong_rl.models.stage2a_model import load_stage2a_state_dict
         self._anchor_model = copy.deepcopy(self._model)
         sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        self._anchor_model.load_state_dict(sd)
+        # CQ-0288: 旧 checkpoint の semantic_proj.* keys を互換的に drop
+        load_stage2a_state_dict(self._anchor_model, sd)
         self._anchor_model.to(self._device)
         self._anchor_model.eval()
         for p in self._anchor_model.parameters():
@@ -1333,19 +1624,27 @@ class Stage2aLearner:
         yaku_targets: torch.Tensor,
         is_winner: torch.Tensor,
         terminal_weights: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, float, float]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """CQ-0256/0268: semantic aux loss (terminal CE + winner-only yaku BCE)
 
         terminal_weights: CQ-0268 player-round 正規化重み (optional)
+
+        Returns (total, tl, yl) - all torch.Tensor scalars (CQ-0284: tl/yl
+        as tensors so caller can use them for autograd-based gradient norm
+        diagnostics).
         """
         if semantic is None or not self._semantic_aux_enabled:
             z = torch.tensor(0.0, device=self._device)
-            return z, 0.0, 0.0
+            return z, z.detach().clone(), z.detach().clone()
         # CQ-0268: terminal CE with player-round weights
+        # CQ-0285: weighted path を mean lossスケール (sum / weight_sum) に
+        # 正規化する。player-round 重複補正は維持しつつ、batch内の group 数
+        # に比例した scale 膨張を避ける。
         tl_per = F.cross_entropy(
             semantic["terminal_logits"], terminal_targets, reduction="none")
         if terminal_weights is not None:
-            tl = (tl_per * terminal_weights).sum()
+            w_sum = terminal_weights.sum().clamp_min(1e-8)
+            tl = (tl_per * terminal_weights).sum() / w_sum
         else:
             tl = tl_per.mean()
         # yaku: winner-only BCE (unchanged)
@@ -1357,7 +1656,7 @@ class Stage2aLearner:
         else:
             yl = torch.tensor(0.0, device=self._device)
         total = self._terminal_loss_coef * tl + self._yaku_loss_coef * yl
-        return total, tl.item(), yl.item()
+        return total, tl, yl
 
     def _compute_value_loss_per_sample(self, value: torch.Tensor,
                                         target: torch.Tensor) -> torch.Tensor:
@@ -1366,6 +1665,239 @@ class Stage2aLearner:
             return F.huber_loss(value, target, reduction="none",
                                 delta=self._huber_delta)
         return (value - target).pow(2)
+
+    # ------------------------------------------------------------------
+    # CQ-0284: gradient norm diagnostics (default off)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _gn_module_param_indices(named_params: list[tuple[str, "nn.Parameter"]],
+                                  module_name: str) -> list[int]:
+        """`module_name` 配下の parameter index を named_params から拾う"""
+        prefix = module_name + "."
+        return [i for i, (n, _) in enumerate(named_params) if n.startswith(prefix)]
+
+    def _gn_build_param_groups(
+        self, named_params: list[tuple[str, "nn.Parameter"]],
+    ) -> dict[str, list[int]]:
+        """CQ-0284: parameter group → named_params 上の index 集合
+
+        存在しない module は欠落させる (空 list の group は dict に入れない)。
+        """
+        n = len(named_params)
+        groups: dict[str, list[int]] = {"all": list(range(n))}
+
+        # individual modules — Stage2aModel 上にあれば拾う
+        # CQ-0288: semantic_proj は削除済み
+        atomic_modules = [
+            "discard_trunk", "discard_head", "optional_trunk",
+            "candidate_encoder", "optional_scorer",
+            "value_trunk", "value_head",
+            "terminal_head", "yaku_head",
+            "_tile_embedding", "_local_scorer", "_context_gate",
+        ]
+        for k in atomic_modules:
+            idxs = self._gn_module_param_indices(named_params, k)
+            if idxs:
+                groups[k] = idxs
+
+        # composite groups
+        policy_module_names = [
+            "discard_trunk", "discard_head", "optional_trunk",
+            "candidate_encoder", "optional_scorer",
+            "_tile_embedding", "_local_scorer", "_context_gate",
+        ]
+        policy_idxs: list[int] = []
+        for k in policy_module_names:
+            policy_idxs.extend(groups.get(k, []))
+        if policy_idxs:
+            groups["policy"] = policy_idxs
+
+        # CQ-0288: semantic_proj は削除済み
+        value_semantic_module_names = [
+            "value_trunk", "value_head",
+            "terminal_head", "yaku_head",
+        ]
+        vs_idxs: list[int] = []
+        for k in value_semantic_module_names:
+            vs_idxs.extend(groups.get(k, []))
+        if vs_idxs:
+            groups["value_semantic"] = vs_idxs
+
+        return groups
+
+    def _gn_should_measure(self, *, batch_idx_in_epoch: int,
+                           epoch_idx: int) -> bool:
+        """CQ-0284: 計測 budget 内かどうか"""
+        if not self._gn_enabled:
+            return False
+        if self._gn_max_batches_per_epoch <= 0:
+            return False
+        if (epoch_idx % self._gn_every_n_epochs) != 0:
+            return False
+        if batch_idx_in_epoch >= self._gn_max_batches_per_epoch:
+            return False
+        return True
+
+    def _gn_compute_minibatch_norms(
+        self, *,
+        policy_loss: "torch.Tensor",
+        value_loss: "torch.Tensor",
+        sa_loss_total: "torch.Tensor | None",
+        terminal_loss_t: "torch.Tensor | None",
+        yaku_loss_t: "torch.Tensor | None",
+        total_loss: "torch.Tensor",
+    ) -> dict[str, dict[str, float]] | None:
+        """CQ-0284: 1 minibatch ぶんの component × group 別 gradient norm
+
+        ``torch.autograd.grad`` を使うため、optimizer 用の ``.grad`` は汚染
+        しない。``retain_graph=True`` を使うので、後段の ``loss.backward()``
+        は通常通り動く。
+
+        Returns dict[component_name][group_name] -> float (norm)。空 None。
+        """
+        named_params = [
+            (n, p) for n, p in self._model.named_parameters() if p.requires_grad
+        ]
+        if not named_params:
+            return None
+        all_params = [p for _, p in named_params]
+
+        groups = self._gn_build_param_groups(named_params)
+        if not groups:
+            return None
+
+        components: list[tuple[str, "torch.Tensor", float]] = []
+        components.append(("policy_loss", policy_loss, 1.0))
+        components.append(("value_loss", value_loss, 1.0))
+        components.append(("weighted_value_loss", value_loss,
+                           float(self._value_loss_coef)))
+        if (self._semantic_aux_enabled
+                and terminal_loss_t is not None
+                and terminal_loss_t.requires_grad):
+            components.append(("terminal_loss", terminal_loss_t, 1.0))
+            components.append(("weighted_terminal_loss", terminal_loss_t,
+                               float(self._terminal_loss_coef)))
+        if (self._semantic_aux_enabled
+                and yaku_loss_t is not None
+                and yaku_loss_t.requires_grad):
+            components.append(("yaku_loss", yaku_loss_t, 1.0))
+            components.append(("weighted_yaku_loss", yaku_loss_t,
+                               float(self._yaku_loss_coef)))
+        if (self._semantic_aux_enabled
+                and sa_loss_total is not None
+                and sa_loss_total.requires_grad):
+            components.append(("semantic_aux_loss", sa_loss_total, 1.0))
+        components.append(("total_loss_pre_clip", total_loss, 1.0))
+
+        result: dict[str, dict[str, float]] = {}
+        for cname, loss_t, scale in components:
+            if loss_t is None:
+                continue
+            if not isinstance(loss_t, torch.Tensor):
+                continue
+            if not loss_t.requires_grad:
+                # 例: semantic disabled で zero tensor のまま渡された等
+                continue
+            try:
+                grads = torch.autograd.grad(
+                    loss_t, all_params,
+                    retain_graph=True, allow_unused=True,
+                    create_graph=False)
+            except RuntimeError:
+                continue
+            # per-param squared norm (detached, scalar)
+            per_param_sq: list[float] = []
+            for g in grads:
+                if g is None:
+                    per_param_sq.append(0.0)
+                else:
+                    per_param_sq.append(float(g.detach().pow(2).sum().item()))
+            comp_result: dict[str, float] = {}
+            scale_abs = abs(float(scale))
+            for group_name, indices in groups.items():
+                if not indices:
+                    continue
+                sq_sum = 0.0
+                for i in indices:
+                    sq_sum += per_param_sq[i]
+                norm = sq_sum ** 0.5
+                if scale_abs != 1.0:
+                    norm *= scale_abs
+                comp_result[group_name] = norm
+            if comp_result:
+                result[cname] = comp_result
+        return result if result else None
+
+    @staticmethod
+    def _gn_summarize_buffer(
+        per_minibatch_norms: list[dict[str, dict[str, float]]],
+    ) -> dict:
+        """CQ-0284: minibatch ごとの norm dict 列を集計する
+
+        Returns:
+            {component: {group: {mean, p50, p90, max, count}}}
+        """
+        # collect per (component, group) → list[float]
+        from collections import defaultdict
+        bucket: dict[str, dict[str, list[float]]] = defaultdict(
+            lambda: defaultdict(list))
+        for mb in per_minibatch_norms:
+            if not mb:
+                continue
+            for cname, gd in mb.items():
+                for gname, val in gd.items():
+                    bucket[cname][gname].append(float(val))
+
+        out: dict[str, dict[str, dict]] = {}
+        for cname, gdict in bucket.items():
+            out[cname] = {}
+            for gname, vals in gdict.items():
+                if not vals:
+                    out[cname][gname] = {
+                        "mean": None, "p50": None, "p90": None,
+                        "max": None, "count": 0,
+                    }
+                    continue
+                arr = np.asarray(vals, dtype=np.float64)
+                out[cname][gname] = {
+                    "mean": float(arr.mean()),
+                    "p50": float(np.quantile(arr, 0.5)),
+                    "p90": float(np.quantile(arr, 0.9)),
+                    "max": float(arr.max()),
+                    "count": int(arr.size),
+                }
+        return out
+
+    @staticmethod
+    def _gn_compute_ratios(stats: dict) -> dict:
+        """CQ-0284: 係数調整に使う ratio (mean ベース)"""
+        def _get_mean(comp: str, group: str = "value_semantic"):
+            d = stats.get(comp, {}).get(group, {})
+            v = d.get("mean")
+            if v is None:
+                return None
+            return float(v)
+
+        def _ratio(num, den):
+            if num is None or den is None or den == 0.0:
+                return None
+            return float(num / den)
+
+        t = _get_mean("terminal_loss")
+        y = _get_mean("yaku_loss")
+        wt = _get_mean("weighted_terminal_loss")
+        wy = _get_mean("weighted_yaku_loss")
+        wv = _get_mean("weighted_value_loss")
+        return {
+            "value_semantic_terminal_to_yaku": _ratio(t, y),
+            "value_semantic_weighted_terminal_to_weighted_yaku":
+                _ratio(wt, wy),
+            "value_semantic_weighted_terminal_to_weighted_value":
+                _ratio(wt, wv),
+            "value_semantic_weighted_yaku_to_weighted_value":
+                _ratio(wy, wv),
+        }
 
     # ====================================================================
     # CQ-0281: PPO diagnostics helpers
@@ -1512,10 +2044,44 @@ class Stage2aLearner:
             d["max_prob_p99"] = qsm["p99"]
         return d
 
+    def _tk_summarize(self, diag_bufs: list[dict]) -> dict:
+        """CQ-0287: target_kl early-stop diagnostics を集計する
+
+        diag_bufs は 1 cycle 中の epoch ごとの buffer の list (discard 側
+        または call 側、もしくはその結合)。
+        """
+        approx_kls: list[float] = []
+        skipped = 0
+        stop_count = 0
+        for b in diag_bufs:
+            approx_kls.extend(b.get("tk_approx_kls", []) or [])
+            skipped += int(b.get("tk_skipped_minibatches", 0))
+            stop_count += int(b.get("tk_stop_count", 0))
+        checked = len(approx_kls)
+        out: dict = {
+            "target_kl_enabled": bool(self._tk_enabled),
+            "target_kl": float(self._tk_target),
+            "target_kl_threshold": float(self._tk_threshold),
+            "target_kl_skip_minibatch_on_exceed": bool(
+                self._tk_skip_on_exceed),
+            "target_kl_stop_count": int(stop_count),
+            "target_kl_skipped_minibatches": int(skipped),
+            "target_kl_checked_minibatches": int(checked),
+        }
+        if checked > 0:
+            arr = np.asarray(approx_kls, dtype=np.float64)
+            out["approx_kl_mean"] = float(arr.mean())
+            out["approx_kl_max"] = float(arr.max())
+        else:
+            out["approx_kl_mean"] = None
+            out["approx_kl_max"] = None
+        return out
+
     def _ppo_discard_epoch(self, samples, returns_t, advantages_t,
                            weights_t=None,
                            terminal_classes_t=None, yaku_multihot_t=None,
-                           is_winner_t=None, terminal_weights_t=None):
+                           is_winner_t=None, terminal_weights_t=None,
+                           epoch_idx: int = 0):
         """discard PPO の 1 epoch (CQ-0249: weighted mean)"""
         policy_losses, value_losses, entropies = [], [], []
         all_ratios = []
@@ -1527,10 +2093,17 @@ class Stage2aLearner:
         _anchor_kls: list[float] = []
         _sem_tl: list[float] = []
         _sem_yl: list[float] = []
+        # CQ-0284: gradient norm diagnostics buffer (1 entry per measured minibatch)
+        gn_minibatches: list[dict] = []
+        gn_measured = 0
+        # CQ-0287: target_kl early-stop buffers
+        tk_approx_kls: list[float] = []
+        tk_skipped_minibatches = 0
+        tk_stop_count = 0  # この epoch で early stop が発火したか (0 or 1)
         n = len(samples)
         indices = np.random.permutation(n)
 
-        for start in range(0, n, self._batch_size):
+        for batch_idx_in_epoch, start in enumerate(range(0, n, self._batch_size)):
             end = min(start + self._batch_size, n)
             batch_idx = indices[start:end]
             batch = [samples[i] for i in batch_idx]
@@ -1592,15 +2165,73 @@ class Stage2aLearner:
                 loss = loss + self._anchor_coef * anchor_kl
 
             # CQ-0256/0268: semantic aux loss with terminal weights
+            sa_loss_t = None
+            tl_t = None
+            yl_t = None
             if self._semantic_aux_enabled and terminal_classes_t is not None:
                 tw = terminal_weights_t[idx_t] if terminal_weights_t is not None else None
-                sa_loss, tl_v, yl_v = self._compute_semantic_aux_loss(
+                sa_loss, tl_t, yl_t = self._compute_semantic_aux_loss(
                     out.semantic, terminal_classes_t[idx_t],
                     yaku_multihot_t[idx_t], is_winner_t[idx_t],
                     terminal_weights=tw)
                 loss = loss + sa_loss
-                _sem_tl.append(tl_v)
-                _sem_yl.append(yl_v)
+                sa_loss_t = sa_loss
+                _sem_tl.append(float(tl_t.detach()))
+                _sem_yl.append(float(yl_t.detach()))
+
+            # CQ-0284: gradient norm diagnostics (default off)
+            # ``loss.backward()`` の前に ``torch.autograd.grad`` で計測。
+            # ``retain_graph=True`` を使うので後段 backward は通常通り動く。
+            if self._gn_should_measure(
+                    batch_idx_in_epoch=gn_measured, epoch_idx=epoch_idx):
+                gn_norms = self._gn_compute_minibatch_norms(
+                    policy_loss=policy_loss,
+                    value_loss=value_loss,
+                    sa_loss_total=sa_loss_t,
+                    terminal_loss_t=tl_t,
+                    yaku_loss_t=yl_t,
+                    total_loss=loss,
+                )
+                if gn_norms is not None:
+                    gn_minibatches.append(gn_norms)
+                    gn_measured += 1
+
+            # CQ-0287: target_kl early stop. 学習挙動を変えないように、
+            # default off では「approx_kl の記録のみ」、enabled かつ
+            # threshold 超過のときだけ skip / break する。
+            with torch.no_grad():
+                approx_kl = float(
+                    ((ratio.detach() - 1.0) - log_ratio.detach()).mean().item())
+            tk_approx_kls.append(approx_kl)
+            if self._tk_enabled and approx_kl > self._tk_threshold:
+                tk_stop_count = 1  # この epoch は early-stop した
+                if self._tk_skip_on_exceed:
+                    # backward / optimizer step を呼ばずに break
+                    tk_skipped_minibatches += 1
+                    # diagnostics 用 tensor は記録 (skip 前 forward の結果)
+                    all_ratios.append(ratio.detach().cpu())
+                    all_log_ratios.append(log_ratio.detach().cpu())
+                    all_batch_adv.append(batch_advantages.detach().cpu())
+                    all_max_probs.append(max_prob.detach().cpu())
+                    all_batch_w.append(batch_w.detach().cpu())
+                    break
+                # skip_on_exceed=False: 通常 step してから break する
+                self._optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self._model.parameters(),
+                                          self._max_grad_norm)
+                self._optimizer.step()
+                policy_losses.append(policy_loss.item())
+                value_losses.append(value_loss.item())
+                entropies.append(entropy.item())
+                all_ratios.append(ratio.detach().cpu())
+                all_log_ratios.append(log_ratio.detach().cpu())
+                all_batch_adv.append(batch_advantages.detach().cpu())
+                all_max_probs.append(max_prob.detach().cpu())
+                all_batch_w.append(batch_w.detach().cpu())
+                if self._anchor_enabled and self._anchor_model is not None:
+                    _anchor_kls.append(akl_val)
+                break
 
             self._optimizer.zero_grad()
             loss.backward()
@@ -1624,6 +2255,12 @@ class Stage2aLearner:
             "advantages": all_batch_adv,
             "max_probs": all_max_probs,
             "weights": all_batch_w,
+            # CQ-0284
+            "gradient_norms": gn_minibatches,
+            # CQ-0287
+            "tk_approx_kls": tk_approx_kls,
+            "tk_skipped_minibatches": tk_skipped_minibatches,
+            "tk_stop_count": tk_stop_count,
         }
         return (policy_losses, value_losses, entropies, all_ratios,
                 _anchor_kls, _sem_tl, _sem_yl, diag_buffer)
@@ -1631,7 +2268,8 @@ class Stage2aLearner:
     def _ppo_call_epoch(self, samples, returns_t, advantages_t,
                         weights_t=None,
                         terminal_classes_t=None, yaku_multihot_t=None,
-                        is_winner_t=None, terminal_weights_t=None):
+                        is_winner_t=None, terminal_weights_t=None,
+                        epoch_idx: int = 0):
         """optional PPO の 1 epoch (CQ-0249: weighted mean)"""
         policy_losses, value_losses, entropies = [], [], []
         all_ratios = []
@@ -1643,6 +2281,13 @@ class Stage2aLearner:
         _anchor_kls: list[float] = []
         _sem_tl: list[float] = []
         _sem_yl: list[float] = []
+        # CQ-0284: gradient norm diagnostics buffer
+        gn_minibatches: list[dict] = []
+        gn_measured = 0
+        # CQ-0287: target_kl early-stop buffers
+        tk_approx_kls: list[float] = []
+        tk_skipped_minibatches = 0
+        tk_stop_count = 0
         max_cands = max(s.candidate_count for s in samples)
         n = len(samples)
         indices = np.random.permutation(n)
@@ -1720,15 +2365,66 @@ class Stage2aLearner:
                 loss = loss + self._anchor_coef * anchor_kl
 
             # CQ-0256/0268: semantic aux loss with terminal weights
+            sa_loss_t = None
+            tl_t = None
+            yl_t = None
             if self._semantic_aux_enabled and terminal_classes_t is not None:
                 tw = terminal_weights_t[idx_t] if terminal_weights_t is not None else None
-                sa_loss, tl_v, yl_v = self._compute_semantic_aux_loss(
+                sa_loss, tl_t, yl_t = self._compute_semantic_aux_loss(
                     out.semantic, terminal_classes_t[idx_t],
                     yaku_multihot_t[idx_t], is_winner_t[idx_t],
                     terminal_weights=tw)
                 loss = loss + sa_loss
-                _sem_tl.append(tl_v)
-                _sem_yl.append(yl_v)
+                sa_loss_t = sa_loss
+                _sem_tl.append(float(tl_t.detach()))
+                _sem_yl.append(float(yl_t.detach()))
+
+            # CQ-0284: gradient norm diagnostics (default off)
+            if self._gn_should_measure(
+                    batch_idx_in_epoch=gn_measured, epoch_idx=epoch_idx):
+                gn_norms = self._gn_compute_minibatch_norms(
+                    policy_loss=policy_loss,
+                    value_loss=value_loss,
+                    sa_loss_total=sa_loss_t,
+                    terminal_loss_t=tl_t,
+                    yaku_loss_t=yl_t,
+                    total_loss=loss,
+                )
+                if gn_norms is not None:
+                    gn_minibatches.append(gn_norms)
+                    gn_measured += 1
+
+            # CQ-0287: target_kl early stop (call branch)
+            with torch.no_grad():
+                approx_kl = float(
+                    ((ratio.detach() - 1.0) - log_ratio.detach()).mean().item())
+            tk_approx_kls.append(approx_kl)
+            if self._tk_enabled and approx_kl > self._tk_threshold:
+                tk_stop_count = 1
+                if self._tk_skip_on_exceed:
+                    tk_skipped_minibatches += 1
+                    all_ratios.append(ratio.detach().cpu())
+                    all_log_ratios.append(log_ratio.detach().cpu())
+                    all_batch_adv.append(batch_advantages.detach().cpu())
+                    all_max_probs.append(max_prob.detach().cpu())
+                    all_batch_w.append(batch_w.detach().cpu())
+                    break
+                self._optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self._model.parameters(),
+                                          self._max_grad_norm)
+                self._optimizer.step()
+                policy_losses.append(policy_loss.item())
+                value_losses.append(value_loss.item())
+                entropies.append(entropy.item())
+                all_ratios.append(ratio.detach().cpu())
+                all_log_ratios.append(log_ratio.detach().cpu())
+                all_batch_adv.append(batch_advantages.detach().cpu())
+                all_max_probs.append(max_prob.detach().cpu())
+                all_batch_w.append(batch_w.detach().cpu())
+                if self._anchor_enabled and self._anchor_model is not None:
+                    _anchor_kls.append(akl_val)
+                break
 
             self._optimizer.zero_grad()
             loss.backward()
@@ -1752,6 +2448,12 @@ class Stage2aLearner:
             "advantages": all_batch_adv,
             "max_probs": all_max_probs,
             "weights": all_batch_w,
+            # CQ-0284
+            "gradient_norms": gn_minibatches,
+            # CQ-0287
+            "tk_approx_kls": tk_approx_kls,
+            "tk_skipped_minibatches": tk_skipped_minibatches,
+            "tk_stop_count": tk_stop_count,
         }
         return (policy_losses, value_losses, entropies, all_ratios,
                 _anchor_kls, _sem_tl, _sem_yl, diag_buffer)

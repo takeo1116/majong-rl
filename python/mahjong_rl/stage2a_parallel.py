@@ -100,7 +100,9 @@ def _stage2a_selfplay_worker_fn(
                 semantic_only_ranges=sem_only if sem_only else None,
             )
             sd = torch.load(model_state_path, map_location="cpu", weights_only=True)
-            model.load_state_dict(sd)
+            # CQ-0288: 旧 semantic_proj.* keys を互換的に drop して load
+            from mahjong_rl.models.stage2a_model import load_stage2a_state_dict
+            load_stage2a_state_dict(model, sd)
 
         # CQ-0276: reward_config を worker config に伝播
         # CQ-0278 follow-up: temperature も worker config に伝播
@@ -248,7 +250,9 @@ def _stage2a_eval_worker_fn(
             semantic_only_ranges=sem_only if sem_only else None,
         )
         sd = torch.load(model_state_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(sd)
+        # CQ-0288: 旧 semantic_proj.* keys を互換的に drop して load
+        from mahjong_rl.models.stage2a_model import load_stage2a_state_dict
+        load_stage2a_state_dict(model, sd)
 
         # CQ-0276: reward_config を eval にも伝播
         from mahjong_rl.stage2_selfplay_worker import build_reward_policy_config

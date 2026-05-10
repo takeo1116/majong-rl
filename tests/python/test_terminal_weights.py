@@ -170,6 +170,195 @@ class TestTerminalLossWeighted:
         assert yl1 == pytest.approx(yl2)
 
 
+# ========== CQ-0285: mean-scale normalization ==========
+
+
+class TestTerminalLossMeanScale:
+    """CQ-0285: terminal weighted loss は (tl_per * w).sum() / w.sum()"""
+
+    def _make_learner(self):
+        from mahjong_rl.outcome_vocab import NUM_TERMINAL_CLASSES, NUM_YAKU
+        model = Stage2aModel(
+            input_dim=50, discard_hidden_dims=[16],
+            optional_hidden_dims=[16], value_hidden_dims=[16],
+            semantic_aux_config={"enabled": True, "policy_projection_dim": 4})
+        return Stage2aLearner(
+            config={"training": {
+                "algorithm": "imitation",
+                "semantic_aux": {"enabled": True,
+                                  "terminal_loss_coef": 1.0,
+                                  "yaku_loss_coef": 1.0},
+            }},
+            model=model, run_dir=torch.device("cpu"),
+            device=torch.device("cpu"),
+        )
+
+    def _make_semantic(self, n=4):
+        from mahjong_rl.outcome_vocab import NUM_TERMINAL_CLASSES, NUM_YAKU
+        torch.manual_seed(42)
+        return {
+            "terminal_logits": torch.randn(n, NUM_TERMINAL_CLASSES),
+            "yaku_logits": torch.randn(n, NUM_YAKU),
+            "semantic_summary": torch.zeros(n, 10),
+        }
+
+    def test_weighted_terminal_is_sum_over_weight_sum(self):
+        """weighted terminal == (tl_per * w).sum() / w.sum()"""
+        import torch.nn.functional as F
+        learner = self._make_learner()
+        semantic = self._make_semantic(n=4)
+        targets = torch.tensor([0, 1, 2, 3])
+        yaku_targets = torch.zeros(4, semantic["yaku_logits"].size(-1))
+        is_winner = torch.zeros(4)
+
+        # 不揃いな weights (= 同一 player-round 内 1/3 each + 別 group 1.0)
+        weights = torch.tensor([1.0 / 3, 1.0 / 3, 1.0 / 3, 1.0])
+
+        _, tl_t, _ = learner._compute_semantic_aux_loss(
+            semantic, targets, yaku_targets, is_winner,
+            terminal_weights=weights)
+
+        tl_per = F.cross_entropy(
+            semantic["terminal_logits"], targets, reduction="none")
+        expected = (tl_per * weights).sum() / weights.sum()
+        assert tl_t.item() == pytest.approx(expected.item(), abs=1e-6)
+
+    def test_no_weights_is_unweighted_mean(self):
+        """terminal_weights=None で従来通り tl_per.mean()"""
+        import torch.nn.functional as F
+        learner = self._make_learner()
+        semantic = self._make_semantic(n=4)
+        targets = torch.tensor([0, 1, 2, 3])
+        yaku_targets = torch.zeros(4, semantic["yaku_logits"].size(-1))
+        is_winner = torch.zeros(4)
+
+        _, tl_t, _ = learner._compute_semantic_aux_loss(
+            semantic, targets, yaku_targets, is_winner,
+            terminal_weights=None)
+
+        tl_per = F.cross_entropy(
+            semantic["terminal_logits"], targets, reduction="none")
+        expected = tl_per.mean()
+        assert tl_t.item() == pytest.approx(expected.item(), abs=1e-6)
+
+    def test_uniform_weights_equals_unweighted_mean(self):
+        """全 sample 同一 weight (= 1.0) で unweighted mean と一致"""
+        import torch.nn.functional as F
+        learner = self._make_learner()
+        semantic = self._make_semantic(n=4)
+        targets = torch.tensor([0, 1, 2, 3])
+        yaku_targets = torch.zeros(4, semantic["yaku_logits"].size(-1))
+        is_winner = torch.zeros(4)
+
+        # 全部 1.0
+        w_ones = torch.ones(4)
+        _, tl_w, _ = learner._compute_semantic_aux_loss(
+            semantic, targets, yaku_targets, is_winner,
+            terminal_weights=w_ones)
+        # 全部 0.5 でも同じ結果になるはず (CQ-0285: scale invariant)
+        w_half = torch.full((4,), 0.5)
+        _, tl_h, _ = learner._compute_semantic_aux_loss(
+            semantic, targets, yaku_targets, is_winner,
+            terminal_weights=w_half)
+
+        tl_per = F.cross_entropy(
+            semantic["terminal_logits"], targets, reduction="none")
+        expected = tl_per.mean()
+        assert tl_w.item() == pytest.approx(expected.item(), abs=1e-6)
+        assert tl_h.item() == pytest.approx(expected.item(), abs=1e-6)
+        # uniform weights の値そのものに不変
+        assert tl_w.item() == pytest.approx(tl_h.item(), abs=1e-6)
+
+    def test_two_groups_yields_average_of_group_means(self):
+        """player-round group A (3 samples, w=1/3) + group B (1 sample, w=1)
+        → expected = (group_A_mean + group_B_mean) / 2"""
+        import torch.nn.functional as F
+        learner = self._make_learner()
+        semantic = self._make_semantic(n=4)
+        targets = torch.tensor([0, 1, 2, 3])
+        yaku_targets = torch.zeros(4, semantic["yaku_logits"].size(-1))
+        is_winner = torch.zeros(4)
+
+        # group A (idx 0,1,2): 3 samples, weight 1/3 each → group sum = 1.0
+        # group B (idx 3): 1 sample, weight 1.0 → group sum = 1.0
+        weights = torch.tensor([1.0 / 3, 1.0 / 3, 1.0 / 3, 1.0])
+        _, tl_t, _ = learner._compute_semantic_aux_loss(
+            semantic, targets, yaku_targets, is_winner,
+            terminal_weights=weights)
+
+        tl_per = F.cross_entropy(
+            semantic["terminal_logits"], targets, reduction="none")
+        group_a_mean = tl_per[:3].mean()
+        group_b_mean = tl_per[3]
+        expected = (group_a_mean + group_b_mean) / 2.0
+        assert tl_t.item() == pytest.approx(expected.item(), abs=1e-6)
+
+    def test_yaku_loss_unchanged_by_cq0285(self):
+        """yaku loss は従来定義 (winner-only mean BCE) のままでなければならない"""
+        import torch.nn.functional as F
+        learner = self._make_learner()
+        semantic = self._make_semantic(n=4)
+        targets = torch.tensor([0, 1, 2, 3])
+        yaku_targets = torch.zeros(4, semantic["yaku_logits"].size(-1))
+        yaku_targets[0, 0] = 1.0
+        yaku_targets[1, 1] = 1.0
+        is_winner = torch.tensor([1.0, 1.0, 0.0, 0.0])
+
+        # terminal_weights は何でもよい (yaku は影響を受けない)
+        weights = torch.tensor([0.25, 0.5, 1.0, 0.0])
+        _, _, yl_t = learner._compute_semantic_aux_loss(
+            semantic, targets, yaku_targets, is_winner,
+            terminal_weights=weights)
+
+        # 従来定義: winner mask 適用 BCE 平均
+        yl_per = F.binary_cross_entropy_with_logits(
+            semantic["yaku_logits"], yaku_targets, reduction="none")
+        mask = is_winner.unsqueeze(-1)
+        expected = (yl_per * mask).sum() / mask.sum() / yl_per.size(-1)
+        assert yl_t.item() == pytest.approx(expected.item(), abs=1e-6)
+
+    def test_terminal_loss_drops_vs_old_definition(self):
+        """同じ logits/targets/weights で、新定義 (sum/w_sum) は
+        旧定義 (sum) より w_sum が大きい batch ほど大きく値が下がる"""
+        import torch.nn.functional as F
+        learner = self._make_learner()
+        semantic = self._make_semantic(n=4)
+        targets = torch.tensor([0, 1, 2, 3])
+        yaku_targets = torch.zeros(4, semantic["yaku_logits"].size(-1))
+        is_winner = torch.zeros(4)
+
+        # 4 つの player-round group が均等に 1.0 寄与する: w_sum = 4
+        weights = torch.tensor([1.0, 1.0, 1.0, 1.0])
+        _, tl_new, _ = learner._compute_semantic_aux_loss(
+            semantic, targets, yaku_targets, is_winner,
+            terminal_weights=weights)
+        tl_per = F.cross_entropy(
+            semantic["terminal_logits"], targets, reduction="none")
+        # 旧定義: (tl_per * weights).sum() = tl_per.sum()
+        old_def = (tl_per * weights).sum()
+        # 新定義: 上記を w_sum=4 で割ったもの
+        new_def = old_def / weights.sum()
+        # 新値 ≈ tl_per.mean() であり旧値より約 1/n 倍小さい
+        assert tl_new.item() == pytest.approx(new_def.item(), abs=1e-6)
+        assert tl_new.item() < old_def.item()
+
+    def test_zero_weights_does_not_crash(self):
+        """w_sum=0 でも clamp_min(1e-8) で割り 0 にならない"""
+        learner = self._make_learner()
+        semantic = self._make_semantic(n=4)
+        targets = torch.tensor([0, 1, 2, 3])
+        yaku_targets = torch.zeros(4, semantic["yaku_logits"].size(-1))
+        is_winner = torch.zeros(4)
+
+        weights = torch.zeros(4)
+        # crash しないこと
+        _, tl_t, _ = learner._compute_semantic_aux_loss(
+            semantic, targets, yaku_targets, is_winner,
+            terminal_weights=weights)
+        # 値は finite (0 / 1e-8 = 0)
+        assert torch.isfinite(tl_t).item()
+
+
 # ========== integration smokes ==========
 
 def _write_shards_with_rounds(shard_dir, obs_dim=50, n_per_round=5):

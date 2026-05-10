@@ -15,6 +15,11 @@ import torch.nn as nn
 
 RESPONSE_CONTEXT_DIM = 3  # tile_type/34 + rel_seat/4 + menzen_flag
 
+# CQ-0288: 旧 checkpoint 由来で互換的に無視する key prefix
+_LEGACY_DROPPED_KEY_PREFIXES: tuple[str, ...] = (
+    "semantic_proj.",
+)
+
 
 class Stage2aOutput(NamedTuple):
     """Stage2a model の出力"""
@@ -22,6 +27,33 @@ class Stage2aOutput(NamedTuple):
     optional_scores: torch.Tensor | None     # (B, max_cands) or None
     values: dict[str, torch.Tensor]      # {"round_delta": (B, 1)}
     semantic: dict | None = None  # CQ-0256: {terminal_logits, yaku_logits, semantic_summary}
+
+
+def load_stage2a_state_dict(model: "Stage2aModel",
+                             state_dict: dict,
+                             strict: bool = True) -> "torch.nn.modules.module._IncompatibleKeys":
+    """CQ-0288: 旧 Stage2a checkpoint との互換ロード
+
+    旧 checkpoint には `semantic_proj.weight` / `semantic_proj.bias` が
+    含まれるが、CQ-0288 で `semantic_proj` を削除したため strict load では
+    unexpected key になる。本 helper はこれら CQ-0288 で削除済みの
+    互換性 key だけを安全に剥がしてから ``model.load_state_dict`` を呼ぶ。
+    それ以外の missing/unexpected はそのまま fail-fast する。
+
+    Args:
+        model: Stage2aModel
+        state_dict: 入力 state dict
+        strict: 既定 True。CQ-0288 互換 key のみ事前 drop し、それ以外は
+            通常 strict 動作
+
+    Returns:
+        ``torch.nn.Module.load_state_dict`` の戻り (NamedTuple)
+    """
+    filtered = {
+        k: v for k, v in state_dict.items()
+        if not any(k.startswith(p) for p in _LEGACY_DROPPED_KEY_PREFIXES)
+    }
+    return model.load_state_dict(filtered, strict=strict)
 
 
 # ---------- Candidate Encoder ----------
@@ -184,16 +216,17 @@ class Stage2aModel(nn.Module):
         self._summary_dim = summary_dim
 
         # CQ-0256: semantic auxiliary trunk + heads
+        # CQ-0288: semantic_proj は detach 後に summary に詰めるだけで loss を
+        # 受けず、dead weight だったため削除した。`policy_projection_dim`
+        # config は互換性のため受け取るが無視する (ignored/deprecated)。
         self._semantic_summary_dim = 0
         if self._semantic_aux_enabled:
             from mahjong_rl.outcome_vocab import NUM_TERMINAL_CLASSES, NUM_YAKU
-            sa_proj = sa.get("policy_projection_dim", 16)
             # reuse value_trunk hidden → semantic heads
             self.terminal_head = nn.Linear(prev_v, NUM_TERMINAL_CLASSES)
             self.yaku_head = nn.Linear(prev_v, NUM_YAKU)
-            self.semantic_proj = nn.Linear(prev_v, sa_proj)
-            # summary dim = terminal_probs + yaku_probs + projection
-            self._semantic_summary_dim = NUM_TERMINAL_CLASSES + NUM_YAKU + sa_proj
+            # summary dim = terminal_probs + yaku_probs (CQ-0288: proj 削除)
+            self._semantic_summary_dim = NUM_TERMINAL_CLASSES + NUM_YAKU
 
             # expand discard / optional trunk input to accept semantic summary
             # rebuild first layer of each trunk to accept wider input
@@ -291,15 +324,17 @@ class Stage2aModel(nn.Module):
         return self.value_trunk(val_in)
 
     def _compute_semantic(self, h_value: torch.Tensor) -> dict:
-        """CQ-0256: semantic heads + detached summary for policy"""
+        """CQ-0256: semantic heads + detached summary for policy
+
+        CQ-0288: 旧来の `semantic_proj(h_value).detach()` 成分は削除した
+        (dead weight だったため)。summary は terminal/yaku prediction のみ。
+        """
         terminal_logits = self.terminal_head(h_value)
         yaku_logits = self.yaku_head(h_value)
-        proj = self.semantic_proj(h_value)
         # summary: detach for policy input
         summary = torch.cat([
             torch.softmax(terminal_logits, dim=-1).detach(),
             torch.sigmoid(yaku_logits).detach(),
-            proj.detach(),
         ], dim=-1)
         return {
             "terminal_logits": terminal_logits,
