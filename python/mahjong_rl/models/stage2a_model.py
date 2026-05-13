@@ -32,27 +32,96 @@ class Stage2aOutput(NamedTuple):
 def load_stage2a_state_dict(model: "Stage2aModel",
                              state_dict: dict,
                              strict: bool = True) -> "torch.nn.modules.module._IncompatibleKeys":
-    """CQ-0288: 旧 Stage2a checkpoint との互換ロード
+    """CQ-0288 / CQ-0291: 旧 Stage2a checkpoint との互換ロード
 
-    旧 checkpoint には `semantic_proj.weight` / `semantic_proj.bias` が
-    含まれるが、CQ-0288 で `semantic_proj` を削除したため strict load では
-    unexpected key になる。本 helper はこれら CQ-0288 で削除済みの
-    互換性 key だけを安全に剥がしてから ``model.load_state_dict`` を呼ぶ。
+    旧 checkpoint との互換性のために以下を行う:
+
+    - CQ-0288: `semantic_proj.weight` / `semantic_proj.bias` を strict load
+      前に drop する
+    - CQ-0291 batch 1/2: `candidate_encoder.action_type_emb.weight` の行数が
+      増えた場合 (旧 4 → 新 6 → 新 8 など)、旧の上 N 行を新 weight の
+      上 N 行にコピーし、残り (新行は新 family, batch 1: NoRiichi=4 / Riichi=5、
+      batch 2: TsumoWin=6 / Ron=7) は init 値のままにする。
+      これにより旧 checkpoint は新 family が未使用な状態で互換動作する
+
     それ以外の missing/unexpected はそのまま fail-fast する。
 
     Args:
         model: Stage2aModel
         state_dict: 入力 state dict
-        strict: 既定 True。CQ-0288 互換 key のみ事前 drop し、それ以外は
-            通常 strict 動作
+        strict: 既定 True
 
     Returns:
         ``torch.nn.Module.load_state_dict`` の戻り (NamedTuple)
     """
-    filtered = {
+    # CQ-0288: semantic_proj.* を drop
+    filtered: dict = {
         k: v for k, v in state_dict.items()
         if not any(k.startswith(p) for p in _LEGACY_DROPPED_KEY_PREFIXES)
     }
+
+    # CQ-0291: action_type_emb の行数差分に対応 (旧 4 行 → 新 6 行)
+    EMB_KEY = "candidate_encoder.action_type_emb.weight"
+    if EMB_KEY in filtered:
+        src_w = filtered[EMB_KEY]
+        try:
+            tgt_w = model.candidate_encoder.action_type_emb.weight.data
+        except AttributeError:
+            tgt_w = None
+        if (tgt_w is not None and src_w.dim() == 2 and tgt_w.dim() == 2
+                and src_w.shape[0] < tgt_w.shape[0]
+                and src_w.shape[1] == tgt_w.shape[1]):
+            # 上 N 行を src からコピー、残り行は target init 値のまま
+            new_w = tgt_w.detach().clone()
+            new_w[: src_w.shape[0]] = src_w
+            filtered[EMB_KEY] = new_w
+
+    # CQ-0294: optional_summary の action_type_presence を 4 → 11 に拡張した
+    # ことで value_trunk.0.weight の column 数が +7 ずれる。旧 checkpoint を
+    # 安全にロードできるよう、新 family の presence 列に 0 を挿入する。
+    VAL_KEY = "value_trunk.0.weight"
+    if VAL_KEY in filtered:
+        src_w = filtered[VAL_KEY]
+        try:
+            tgt_w = model.value_trunk[0].weight.data
+        except (AttributeError, IndexError):
+            tgt_w = None
+        if (tgt_w is not None and src_w.dim() == 2 and tgt_w.dim() == 2
+                and src_w.shape[0] == tgt_w.shape[0]
+                and src_w.shape[1] < tgt_w.shape[1]):
+            # value_trunk 入力レイアウト (CQ-0294 前):
+            #   [trunk_input | df=1 | rc=3 | summary | value_aux]
+            #   summary = [available=1, count_norm=1, at_presence=K_old=4,
+            #              emb_mean=cand_dim, emb_max=cand_dim]
+            # 新レイアウト: K_new = NUM_ACTION_TYPE_INDICES (=11)。
+            # 差分は (K_new - K_old) 列で、at_presence 末尾と emb_mean の
+            # 間に挿入する。挿入位置 = trunk_input + 1 + rc + 2 + K_old。
+            from mahjong_rl.candidate_encoding import NUM_ACTION_TYPE_INDICES
+            from mahjong_rl.encoders.flat_encoder import FlatFeatureEncoder
+            cand_dim = getattr(model, "_candidate_dim", 0)
+            value_aux = getattr(model, "_value_aux_dim", 0)
+            extra = tgt_w.shape[1] - src_w.shape[1]
+            # K_new is fixed in current code; K_old = K_new - extra
+            k_new = NUM_ACTION_TYPE_INDICES
+            k_old = k_new - extra
+            # sanity: cols match the expected shape with K_old action types
+            expected_old_cols = (
+                src_w.shape[1] - (1 + 3 + 2 + k_old + 2 * cand_dim + value_aux))
+            # expected_old_cols = trunk_input_dim
+            if (k_old in (4, 6, 8) and expected_old_cols >= 0
+                    and 1 + 3 + 2 + k_old <= src_w.shape[1]):
+                trunk_input_dim = expected_old_cols
+                insert_at = trunk_input_dim + 1 + 3 + 2 + k_old
+                # 挿入する extra 列は 0
+                left = src_w[:, :insert_at]
+                right = src_w[:, insert_at:]
+                pad = torch.zeros(
+                    src_w.shape[0], extra, dtype=src_w.dtype,
+                    device=src_w.device)
+                new_w = torch.cat([left, pad, right], dim=1)
+                if new_w.shape == tgt_w.shape:
+                    filtered[VAL_KEY] = new_w
+
     return model.load_state_dict(filtered, strict=strict)
 
 
@@ -68,8 +137,14 @@ class CandidateEncoder(nn.Module):
     def __init__(self, candidate_dim: int = 16):
         super().__init__()
         self._candidate_dim = candidate_dim
-        # action_type: Skip=0, Chi=1, Pon=2, Daiminkan=3 → 4 種 (no padding)
-        self.action_type_emb = nn.Embedding(4, 4)
+        # action_type embedding 行 (CQ-0291):
+        #   0=Skip, 1=Chi, 2=Pon, 3=Daiminkan
+        #   4=NoRiichi, 5=Riichi (batch 1)
+        #   6=TsumoWin, 7=Ron (batch 2)
+        #   8=Kakan, 9=Ankan, 10=Kyuushu (batch 3)
+        # default off では batch 1-3 の追加行は未使用 (init 値のまま)
+        from mahjong_rl.candidate_encoding import NUM_ACTION_TYPE_INDICES
+        self.action_type_emb = nn.Embedding(NUM_ACTION_TYPE_INDICES, 4)
         # tile_type: valid=1..34 (0-based +1), padding=0 → vocab=35
         self.tile_emb = nn.Embedding(35, 8, padding_idx=0)
         # rel_seat: valid=1..4, padding=0 → vocab=5
@@ -111,9 +186,16 @@ class Stage2aModel(nn.Module):
     """
 
     # optional_summary の固定長次元
-    # optional_available(1) + candidate_count_norm(1) + action_type_presence(4)
-    # + candidate_embedding_mean(cand_dim) + candidate_embedding_max(cand_dim)
-    _SUMMARY_FIXED = 6  # available + count_norm + 4 action types
+    # optional_available(1) + candidate_count_norm(1)
+    #   + action_type_presence(NUM_ACTION_TYPE_INDICES)
+    #   + candidate_embedding_mean(cand_dim) + candidate_embedding_max(cand_dim)
+    # CQ-0294: action_type_presence を NUM_ACTION_TYPE_INDICES (=11) に拡張
+    # (Skip/Chi/Pon/Daiminkan/NoRiichi/Riichi/TsumoWin/Ron/Kakan/Ankan/Kyuushu)
+    @classmethod
+    def _summary_fixed_dim(cls) -> int:
+        from mahjong_rl.candidate_encoding import NUM_ACTION_TYPE_INDICES
+        return 2 + NUM_ACTION_TYPE_INDICES  # available + count_norm + presence
+    _SUMMARY_FIXED = 2 + 11  # available + count_norm + 11 action types
 
     def __init__(
         self,
@@ -371,8 +453,12 @@ class Stage2aModel(nn.Module):
     ) -> torch.Tensor:
         """candidate 集合を固定長 summary に圧縮
 
-        action_type_presence: Skip(0)/Chi(1)/Pon(2)/Daiminkan(3) の有無
+        CQ-0294: action_type_presence を NUM_ACTION_TYPE_INDICES に拡張。
+        各 idx (Skip=0, Chi=1, Pon=2, Daiminkan=3, NoRiichi=4, Riichi=5,
+        TsumoWin=6, Ron=7, Kakan=8, Ankan=9, Kyuushu=10) について
+        valid candidate に存在するかどうかを 0/1 で立てる。
         """
+        from mahjong_rl.candidate_encoding import NUM_ACTION_TYPE_INDICES
         B, C, D = cand_enc.shape
         # available flag
         available = (cand_mask.sum(dim=-1, keepdim=True) > 0).float()
@@ -380,13 +466,14 @@ class Stage2aModel(nn.Module):
         _MAX_CANDS_NORM = 10.0
         count_norm = cand_mask.sum(dim=-1, keepdim=True) / _MAX_CANDS_NORM
         # action type presence from raw candidate features
-        # cand_features[..., 0] is action_type_idx: Skip=0, Chi=1, Pon=2, Daiminkan=3
-        at_presence = torch.zeros(B, 4, device=cand_enc.device)
+        # cand_features[..., 0] is action_type_idx
+        at_presence = torch.zeros(
+            B, NUM_ACTION_TYPE_INDICES, device=cand_enc.device)
         if cand_features is not None:
             at_idx = cand_features[..., 0]  # (B, C)
-            for k in range(4):
-                # any valid candidate with this action type?
-                match = ((at_idx == k) & (cand_mask > 0.5)).float()
+            valid = (cand_mask > 0.5)
+            for k in range(NUM_ACTION_TYPE_INDICES):
+                match = ((at_idx == k) & valid).float()
                 at_presence[:, k] = (match.sum(dim=-1) > 0).float()
         else:
             at_presence[:, 0] = (cand_mask.sum(dim=-1) > 0).float()

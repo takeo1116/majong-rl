@@ -30,12 +30,25 @@ class Stage2aEvaluator:
         observation_mode: str = "full",
         device=None,
         reward_config=None,
+        optional_riichi_enabled: bool = False,
+        optional_tsumo_enabled: bool = False,
+        optional_ron_enabled: bool = False,
+        optional_ankan_enabled: bool = False,
+        optional_kakan_enabled: bool = False,
+        optional_kyuushu_enabled: bool = False,
     ):
         self._model = model
         self._encoder = encoder
         self._obs_mode = observation_mode
         self._device = device or torch.device("cpu")
         self._reward_config = reward_config  # CQ-0276
+        # CQ-0292: optional decision flags (default off で従来挙動を維持)
+        self._optional_riichi_enabled = bool(optional_riichi_enabled)
+        self._optional_tsumo_enabled = bool(optional_tsumo_enabled)
+        self._optional_ron_enabled = bool(optional_ron_enabled)
+        self._optional_ankan_enabled = bool(optional_ankan_enabled)
+        self._optional_kakan_enabled = bool(optional_kakan_enabled)
+        self._optional_kyuushu_enabled = bool(optional_kyuushu_enabled)
         self._model.to(self._device)
         self._model.eval()
         self._baseline = RuleBasedBaseline()
@@ -64,7 +77,13 @@ class Stage2aEvaluator:
             eval metrics dict
         """
         env = Stage2Env(observation_mode=self._obs_mode,
-                         reward_config=self._reward_config)
+                         reward_config=self._reward_config,
+                         optional_riichi_enabled=self._optional_riichi_enabled,
+                         optional_tsumo_enabled=self._optional_tsumo_enabled,
+                         optional_ron_enabled=self._optional_ron_enabled,
+                         optional_ankan_enabled=self._optional_ankan_enabled,
+                         optional_kakan_enabled=self._optional_kakan_enabled,
+                         optional_kyuushu_enabled=self._optional_kyuushu_enabled)
         scores: list[int] = []
         ranks: list[int] = []
         wins = 0
@@ -81,13 +100,22 @@ class Stage2aEvaluator:
 
                 if env.decision_type == DecisionType.DISCARD:
                     # CQ-0271: snapshot-based discard
+                    # CQ-0294: policy seat と baseline seat で mask を分離。
+                    # baseline seat は teacher mask (riichi-only 優先) を
+                    # 使うことで optional_riichi 有効時でも旧 auto-riichi
+                    # 相当の挙動を維持する。
                     mask, discard_snap = env.get_legal_discard_snapshot()
                     if is_policy:
                         action = self._policy_discard(env, mask)
                     else:
-                        hand_ids = list(env.env_state.round_state.players[player].hand)
+                        teacher_mask = (
+                            env.get_teacher_discard_mask_from_snapshot(
+                                discard_snap))
+                        hand_ids = list(
+                            env.env_state.round_state.players[player].hand)
                         mc = len(env.env_state.round_state.players[player].melds)
-                        action = self._baseline.select_discard(hand_ids, mask, meld_count=mc)
+                        action = self._baseline.select_discard(
+                            hand_ids, teacher_mask, meld_count=mc)
                     _, _, terminated, _, info = env.step_discard_with_snapshot(
                         action, discard_snap)
 
@@ -98,6 +126,22 @@ class Stage2aEvaluator:
                     else:
                         hand_ids = list(env.env_state.round_state.players[player].hand)
                         idx = self._call_baseline.select_action(candidates, hand_ids)
+                    _, _, terminated, _, info = env.step_response(idx)
+
+                elif env.decision_type in (
+                    DecisionType.RIICHI_OPTIONAL,
+                    DecisionType.TSUMO_OPTIONAL,
+                    DecisionType.RON_OPTIONAL,
+                    DecisionType.ANKAN_OPTIONAL,
+                    DecisionType.KAKAN_OPTIONAL,
+                    DecisionType.KYUUSHU_OPTIONAL,
+                ):
+                    # CQ-0292: optional decision を policy / baseline で選択
+                    candidates = env.response_candidates
+                    if is_policy:
+                        idx = self._policy_call(env, candidates, player)
+                    else:
+                        idx = self._baseline_optional_index(env.decision_type)
                     _, _, terminated, _, info = env.step_response(idx)
 
                 # round outcome
@@ -171,9 +215,24 @@ class Stage2aEvaluator:
             "eval_mode": "rotation",
         }
 
+    @staticmethod
+    def _baseline_optional_index(decision_type: DecisionType) -> int:
+        """CQ-0292: optional decision baseline teacher index.
+
+        - RIICHI_OPTIONAL: Riichi (idx=1)  既存自動 riichi
+        - TSUMO_OPTIONAL / RON_OPTIONAL: Win (idx=0)  既存自動和了
+        - ANKAN_OPTIONAL / KAKAN_OPTIONAL / KYUUSHU_OPTIONAL: Skip (idx=1)
+          既存 Stage02a の自動 Skip 挙動
+        """
+        if decision_type == DecisionType.RIICHI_OPTIONAL:
+            return 1
+        if decision_type in (DecisionType.TSUMO_OPTIONAL,
+                              DecisionType.RON_OPTIONAL):
+            return 0
+        return 1  # ankan / kakan / kyuushu → Skip
+
     def _policy_discard(self, env: Stage2Env, mask: np.ndarray) -> int:
-        obs = env._make_observation()
-        features = self._encoder.encode(obs, legal_mask=mask)
+        features = self._encode_env_obs(env, legal_mask=mask)
         if features.ndim > 1:
             features = features.flatten()
         with torch.inference_mode():
@@ -184,12 +243,43 @@ class Stage2aEvaluator:
             action, _ = select_discard_argmax(out.discard_logits[0], self._mask_buf[0])
         return action
 
-    def _policy_call(self, env: Stage2Env, candidates, player: int) -> int:
+    def _encode_env_obs(
+        self,
+        env: Stage2Env,
+        legal_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Encode current env state with mask-dependent auxiliary features.
+
+        CQ-0297 follow-up: at ``ResponsePhase`` (RESPONSE / RON_OPTIONAL)
+        ``env.get_legal_mask()`` returns an all-zero mask because no Discard
+        actions are legal. Passing that mask to the encoder would silently
+        change ``discard_ukeire_hint`` from "unrestricted normalized
+        acceptance" (pre-CQ-0297) to "all-zero", which would break
+        backward compatibility with response-branch features used by
+        optional-off baselines. Detect the no-discard case and revert to
+        ``legal_mask=None`` so the encoder preserves the legacy behavior.
+        SelfActionPhase optional decisions retain the new mask-aware path.
+        """
         obs = env._make_observation()
-        features = self._encoder.encode(obs)
+        if legal_mask is None:
+            legal_mask = env.get_legal_mask()
+            if legal_mask.sum() == 0:
+                # ResponsePhase: no Discard legal; preserve pre-CQ-0297
+                # encoder semantics (legal_mask=None) to avoid altering
+                # response-branch features for optional-off baselines.
+                legal_mask = None
+        if getattr(self._encoder, "_riichi_discard_mask", False):
+            r_mask = env.get_riichi_discard_mask()
+            features = self._encoder.encode(
+                obs, legal_mask=legal_mask, riichi_discard_mask=r_mask)
+        else:
+            features = self._encoder.encode(obs, legal_mask=legal_mask)
         if features.ndim > 1:
             features = features.flatten()
-        features_flat = features
+        return features
+
+    def _policy_call(self, env: Stage2Env, candidates, player: int) -> int:
+        features_flat = self._encode_env_obs(env)
 
         from mahjong_rl.candidate_encoding import encode_candidates_single
         cand_records = [

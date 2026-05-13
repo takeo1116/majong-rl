@@ -1,19 +1,43 @@
 """CQ-0245: candidate encoding — 定義は1箇所、batch/single で wrapper
 
 learner batch path と selfplay/eval single path で encoding schema を共有する。
+
+CQ-0291 (batch 1): Riichi optional 用に synthetic action_type 値を追加。
+engine の `Discard` (ActionType=0) は riichi flag によって 2 形態が存在する
+ため、optional decision の candidate として扱うときは synthetic 値で区別する。
 """
 from __future__ import annotations
 
 import numpy as np
 import torch
 
+# CQ-0291: Riichi optional 用 synthetic action type ints
+# engine の ActionType と被らないように 100+ を割り当てる
+OPTIONAL_NORIICHI = 100  # NoRiichi (Discard with riichi=False, optional decision)
+OPTIONAL_RIICHI = 101    # Riichi (Discard with riichi=True, optional decision)
+
 # ActionType int → model embedding index
+# CQ-0291 batch 2: TsumoWin (engine=1) / Ron (engine=2) を直接マップ
+# CQ-0291 batch 3: Kakan (engine=6) / Ankan (engine=7) / Kyuushu (engine=9)
+# (Discard と違い engine の int 値が一意に決まるため synthetic 不要)
 ACTION_TYPE_MAP = {
     8: 0,  # Skip
     3: 1,  # Chi
     4: 2,  # Pon
     5: 3,  # Daiminkan
+    # CQ-0291 batch 1: Riichi optional 候補
+    OPTIONAL_NORIICHI: 4,  # NoRiichi
+    OPTIONAL_RIICHI: 5,    # Riichi
+    # CQ-0291 batch 2: 和了 optional 候補
+    1: 6,  # TsumoWin
+    2: 7,  # Ron
+    # CQ-0291 batch 3: Kan/Kyuushu optional 候補
+    6: 8,   # Kakan
+    7: 9,   # Ankan
+    9: 10,  # Kyuushu
 }
+# embedding 行数 (CandidateEncoder.action_type_emb の num_embeddings)
+NUM_ACTION_TYPE_INDICES = 11
 MAX_CONSUMED = 3
 CAND_FEAT_DIM = 6  # [at_idx, tile_1based, seat_1based, c0, c1, c2]
 

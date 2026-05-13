@@ -401,11 +401,16 @@ class TestParallelWorkerConfigBuild:
             temperature=0.31,
         )
         assert len(captured_args) == 2
-        # _stage2a_selfplay_worker_fn の引数列の最後 ([..., reward_config_dict, temperature])
-        # signature: (i, ..., num_threads, reward_config_dict, temperature)
+        # _stage2a_selfplay_worker_fn の positional 引数列を inspect.signature
+        # 経由で位置検索する (CQ-0292 で末尾に optional_flags が増えた)
+        import inspect
+        sig = inspect.signature(sap._stage2a_selfplay_worker_fn)
+        params = list(sig.parameters.keys())
+        # captured_args は worker_fn 1st arg 以降の positional
+        # = inspect 上の "worker_id" を含む全 positional
+        temp_idx = params.index("temperature")
         for args in captured_args:
-            # 最後の要素が temperature
-            assert args[-1] == pytest.approx(0.31)
+            assert args[temp_idx] == pytest.approx(0.31)
 
 
 class TestRunnerPassesTemperature:

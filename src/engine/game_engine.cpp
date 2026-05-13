@@ -1594,28 +1594,51 @@ std::vector<Action> GameEngine::get_self_actions(const EnvironmentState& env) co
     auto counts = hand_utils::make_type_counts(player.hand);
 
     // --- 打牌 ---
+    // CQ-0290: 同一 tile_type 内で通常牌 → 赤牌 の順に列挙する
+    // (赤牌・通常牌が同時に手にある場合に、wrapper や consumer が
+    // hand order に依存せず deterministic に通常牌を優先できるようにする)
     std::set<TileId> added_discards;
-    for (TileId tile : player.hand) {
+    auto add_discard_if_legal = [&](TileId tile) {
         // 喰い替えチェック
-        if (rs.just_called && (tile / 4) == rs.last_call_tile_type) continue;
+        if (rs.just_called && (tile / 4) == rs.last_call_tile_type) return;
         if (added_discards.insert(tile).second) {
             actions.push_back(Action::make_discard(player_id, tile));
         }
+    };
+    // 1st pass: 非赤牌のみ
+    for (TileId tile : player.hand) {
+        if (Tile::is_red_id(tile)) continue;
+        add_discard_if_legal(tile);
+    }
+    // 2nd pass: 赤牌のみ (同 tile_type の通常牌は既に追加済み)
+    for (TileId tile : player.hand) {
+        if (!Tile::is_red_id(tile)) continue;
+        add_discard_if_legal(tile);
     }
 
     // --- 立直打牌 ---
     if (player.is_menzen && !player.is_riichi && player.score >= 1000) {
-        // 各牌を仮に捨てたときにテンパイかチェック
+        // CQ-0290: 立直打牌候補も通常牌 → 赤牌の順に列挙する
         std::set<TileId> added_riichi;
-        for (TileId tile : player.hand) {
-            if (rs.just_called && (tile / 4) == rs.last_call_tile_type) continue;
-            if (!added_riichi.insert(tile).second) continue;
+        auto add_riichi_if_legal = [&](TileId tile) {
+            if (rs.just_called && (tile / 4) == rs.last_call_tile_type) return;
+            if (!added_riichi.insert(tile).second) return;
 
             auto temp = counts;
             temp[tile / 4]--;
             if (hand_utils::is_tenpai(temp)) {
                 actions.push_back(Action::make_discard(player_id, tile, true));
             }
+        };
+        // 1st pass: 非赤牌のみ
+        for (TileId tile : player.hand) {
+            if (Tile::is_red_id(tile)) continue;
+            add_riichi_if_legal(tile);
+        }
+        // 2nd pass: 赤牌のみ
+        for (TileId tile : player.hand) {
+            if (!Tile::is_red_id(tile)) continue;
+            add_riichi_if_legal(tile);
         }
     }
 

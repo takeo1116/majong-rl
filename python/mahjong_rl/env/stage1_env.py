@@ -23,6 +23,11 @@ except ImportError:
     _HAS_CPP_MASK = False
 
 
+def _is_red_tile_id(tile_id: int) -> bool:
+    """CQ-0290: 赤牌 (5m=16, 5p=52, 5s=88) の TileId 判定"""
+    return tile_id in (16, 52, 88)
+
+
 class Stage1Env:
     """Stage 1 DiscardOnly 環境ラッパー"""
 
@@ -211,18 +216,26 @@ class Stage1Env:
         return legal_actions[0]
 
     def _resolve_discard(self, tile_type: int) -> Action:
-        """TileType (0-33) から具体的な Discard Action を生成する"""
+        """TileType (0-33) から具体的な Discard Action を生成する
+
+        CQ-0290: 同一 tile_type 内で通常牌 → 赤牌の順に優先する
+        (engine 側でも同順で列挙されるが、wrapper でも明示的に
+         deterministic な選択を保証する)
+        """
         legal_actions = self._engine.get_legal_actions(self._env)
 
-        # 立直打牌を優先（テンパイ時自動立直）
-        for a in legal_actions:
-            if a.type == ActionType.Discard and a.riichi and (a.tile // 4) == tile_type:
-                return a
-
-        # 通常打牌
-        for a in legal_actions:
-            if a.type == ActionType.Discard and not a.riichi and (a.tile // 4) == tile_type:
-                return a
+        # priority key: (riichi 優先=False/True, 赤牌=False/True)
+        # → riichi+normal > riichi+red > non-riichi+normal > non-riichi+red
+        candidates = [
+            a for a in legal_actions
+            if a.type == ActionType.Discard and (a.tile // 4) == tile_type
+        ]
+        if candidates:
+            candidates.sort(key=lambda a: (
+                not a.riichi,  # riichi 先
+                _is_red_tile_id(a.tile),  # 通常牌先
+            ))
+            return candidates[0]
 
         raise ValueError(
             f"tile_type {tile_type} は合法打牌ではありません。"

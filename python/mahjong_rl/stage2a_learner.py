@@ -1364,19 +1364,31 @@ class Stage2aLearner:
                 "call": c_stats,
             }
 
-        # CQ-0287: target_kl early-stop diagnostics (top-level + branch 別)
+        # CQ-0287/CQ-0293: target_kl early-stop diagnostics (top-level + branch 別)
         d_tk = self._tk_summarize(d_diag_bufs)
         c_tk = self._tk_summarize(c_diag_bufs)
         all_tk = self._tk_summarize(d_diag_bufs + c_diag_bufs)
-        # branch 別: 該当 branch dict があるときに merge
-        if "discard" in ppo_diag:
-            ppo_diag["discard"].update(d_tk)
-        if "call" in ppo_diag:
-            ppo_diag["call"].update(c_tk)
+        # branch 別: 該当 branch の minibatch が処理された (applied or skipped)
+        # 場合に sub-dict を必ず作って tk info を attach する。
+        # CQ-0293: skip_on_exceed=True で全 minibatch が skip された場合でも
+        # branch sub-dict 経由で target_kl_* / approx_kl_* を見られるように
+        # する。
+        if d_diag_bufs:
+            ppo_diag.setdefault("discard", {}).update(d_tk)
+        if c_diag_bufs:
+            ppo_diag.setdefault("call", {}).update(c_tk)
         # top-level (既存 key を上書きしない方針)
         for k, v in all_tk.items():
             if k not in ppo_diag:
                 ppo_diag[k] = v
+
+        # CQ-0295: family 別 PPO diagnostics
+        # applied minibatch の per-sample log_ratio / advantage / max_prob /
+        # weight / decision_family を集めて family ごとに集計する。
+        family_diag = self._compute_family_ppo_diag(
+            d_diag_bufs + c_diag_bufs)
+        if family_diag:
+            ppo_diag["decision_family"] = family_diag
 
         return {
             "mode": "ppo",
@@ -2044,8 +2056,120 @@ class Stage2aLearner:
             d["max_prob_p99"] = qsm["p99"]
         return d
 
+    # CQ-0295: family-level PPO diagnostics で扱う family 名一覧
+    _FAMILY_DIAG_KEYS: tuple[str, ...] = (
+        "discard", "response", "riichi", "tsumo", "ron",
+        "ankan", "kakan", "kyuushu", "unknown",
+    )
+
+    @classmethod
+    def _normalize_family_diag(cls, value: str | None) -> str:
+        """family 文字列を ``_FAMILY_DIAG_KEYS`` に正規化する。
+
+        ``None`` / 空文字 / 未知の値は ``"unknown"`` を返す。既存
+        sample が ``decision_family="response"`` 既定の場合はそのまま
+        ``"response"`` として扱う。
+        """
+        if value is None:
+            return "unknown"
+        v = str(value).strip().lower()
+        if v in cls._FAMILY_DIAG_KEYS:
+            return v
+        return "unknown"
+
+    def _compute_family_ppo_diag(
+        self, diag_bufs: list[dict],
+    ) -> dict:
+        """CQ-0295: applied minibatch の per-sample 値を family 別に集約。
+
+        各 buffer は per-minibatch list (tensor / list[str]) を持つ。
+        ここでは family ごとに log_ratios / advantages / max_probs /
+        weights を結合し、``_compute_ppo_diag_stats`` を呼んで family
+        別 stats を生成する。
+
+        Returns:
+            ``{family: {"sample_count": int, "ratio_mean": float, ...}}``
+            形式の dict。applied sample 0 の family は空 (キー無し)。
+        """
+        family_log_ratios: dict[str, list[np.ndarray]] = {}
+        family_advantages: dict[str, list[np.ndarray]] = {}
+        family_max_probs: dict[str, list[np.ndarray]] = {}
+        family_weights: dict[str, list[np.ndarray]] = {}
+
+        for buf in diag_bufs:
+            fam_minibatches: list[list[str]] = buf.get(
+                "decision_families", []) or []
+            lr_mbs = buf.get("log_ratios", []) or []
+            adv_mbs = buf.get("advantages", []) or []
+            mp_mbs = buf.get("max_probs", []) or []
+            w_mbs = buf.get("weights", []) or []
+            n_mb = min(len(fam_minibatches), len(lr_mbs))
+            for mi in range(n_mb):
+                fams = fam_minibatches[mi]
+                lr = lr_mbs[mi].numpy().astype(np.float64)
+                adv = (adv_mbs[mi].numpy().astype(np.float64)
+                       if mi < len(adv_mbs) else None)
+                mp = (mp_mbs[mi].numpy().astype(np.float64)
+                      if mi < len(mp_mbs) else None)
+                w = (w_mbs[mi].numpy().astype(np.float64)
+                     if mi < len(w_mbs) else None)
+                # group by family within minibatch
+                # 期待: len(fams) == lr.size == adv.size 等
+                if len(fams) != lr.size:
+                    continue
+                fam_arr = np.array(
+                    [self._normalize_family_diag(f) for f in fams])
+                for fam in np.unique(fam_arr):
+                    mask = (fam_arr == fam)
+                    family_log_ratios.setdefault(str(fam), []).append(lr[mask])
+                    if adv is not None and adv.size == lr.size:
+                        family_advantages.setdefault(str(fam), []).append(adv[mask])
+                    if mp is not None and mp.size == lr.size:
+                        family_max_probs.setdefault(str(fam), []).append(mp[mask])
+                    if w is not None and w.size == lr.size:
+                        family_weights.setdefault(str(fam), []).append(w[mask])
+
+        if not family_log_ratios:
+            return {}
+
+        out: dict = {}
+        for fam in self._FAMILY_DIAG_KEYS:
+            if fam not in family_log_ratios:
+                continue
+            lr_arr = np.concatenate(family_log_ratios[fam])
+            adv_arr = (np.concatenate(family_advantages[fam])
+                       if fam in family_advantages else None)
+            mp_arr = (np.concatenate(family_max_probs[fam])
+                      if fam in family_max_probs else None)
+            w_arr = (np.concatenate(family_weights[fam])
+                     if fam in family_weights else None)
+            stats = self._compute_ppo_diag_stats(
+                lr_arr, adv_arr, mp_arr, w_arr, self._clip_epsilon)
+            # 軽量 family-level の中核 key を明示的に出す
+            ratio = np.exp(lr_arr)
+            fam_entry: dict = {
+                "sample_count": int(lr_arr.size),
+                "ratio_mean": float(np.mean(ratio)) if lr_arr.size else None,
+                "clip_fraction": stats.get("clip_fraction"),
+            }
+            if adv_arr is not None and adv_arr.size > 0:
+                fam_entry["advantage_mean"] = float(np.mean(adv_arr))
+                fam_entry["advantage_std"] = float(np.std(adv_arr))
+                fam_entry["advantage_pos_frac"] = float(
+                    np.mean(adv_arr > 0))
+            else:
+                fam_entry["advantage_mean"] = None
+                fam_entry["advantage_std"] = None
+                fam_entry["advantage_pos_frac"] = None
+            # approx_kl_mean = E[(ratio-1) - log_ratio]
+            kl_per = (ratio - 1.0) - lr_arr
+            fam_entry["approx_kl_mean"] = (
+                float(np.mean(kl_per)) if lr_arr.size else None)
+            out[fam] = fam_entry
+        return out
+
     def _tk_summarize(self, diag_bufs: list[dict]) -> dict:
-        """CQ-0287: target_kl early-stop diagnostics を集計する
+        """CQ-0287/CQ-0293: target_kl early-stop diagnostics を集計する
 
         diag_bufs は 1 cycle 中の epoch ごとの buffer の list (discard 側
         または call 側、もしくはその結合)。
@@ -2058,6 +2182,9 @@ class Stage2aLearner:
             skipped += int(b.get("tk_skipped_minibatches", 0))
             stop_count += int(b.get("tk_stop_count", 0))
         checked = len(approx_kls)
+        # CQ-0293: applied = checked - skipped (skip_on_exceed=True で KL
+        # を超えて optimizer.step が呼ばれなかった minibatch の補集合)
+        applied = max(0, checked - skipped)
         out: dict = {
             "target_kl_enabled": bool(self._tk_enabled),
             "target_kl": float(self._tk_target),
@@ -2067,6 +2194,8 @@ class Stage2aLearner:
             "target_kl_stop_count": int(stop_count),
             "target_kl_skipped_minibatches": int(skipped),
             "target_kl_checked_minibatches": int(checked),
+            # CQ-0293: applied minibatch count (= step が走った minibatch 数)
+            "target_kl_applied_minibatches": int(applied),
         }
         if checked > 0:
             arr = np.asarray(approx_kls, dtype=np.float64)
@@ -2090,6 +2219,8 @@ class Stage2aLearner:
         all_batch_adv: list[torch.Tensor] = []
         all_max_probs: list[torch.Tensor] = []
         all_batch_w: list[torch.Tensor] = []
+        # CQ-0295: per-sample decision_family (applied minibatch のみ)
+        all_decision_families: list[list[str]] = []
         _anchor_kls: list[float] = []
         _sem_tl: list[float] = []
         _sem_yl: list[float] = []
@@ -2133,12 +2264,35 @@ class Stage2aLearner:
                        else torch.ones(len(batch), device=self._device))
             w_sum = batch_w.sum().clamp(min=1e-8)
 
+            log_ratio = action_log_probs - old_log_probs
+            ratio = torch.exp(log_ratio)
+
+            # CQ-0287/CQ-0293: target_kl 判定を applied diagnostics より前に。
+            # batch_w がある場合は weighted mean で approx_kl を計算する。
+            with torch.no_grad():
+                kl_per = (ratio.detach() - 1.0) - log_ratio.detach()
+                w_sum_kl = batch_w.detach().sum().clamp(min=1e-8)
+                approx_kl = float(
+                    ((kl_per * batch_w.detach()).sum() / w_sum_kl).item())
+            tk_approx_kls.append(approx_kl)
+
+            # CQ-0293: skipped minibatch を applied diagnostics から除外
+            kl_exceeded = (self._tk_enabled
+                           and approx_kl > self._tk_threshold)
+            skip_minibatch = kl_exceeded and self._tk_skip_on_exceed
+            if kl_exceeded:
+                tk_stop_count = 1
+            if skip_minibatch:
+                # backward / optimizer step / applied diagnostics を全て
+                # 飛ばし、approx_kl の記録のみで break。
+                tk_skipped_minibatches += 1
+                break
+
+            # ↓ 以下は applied minibatch のみ実行
             probs = torch.softmax(out.discard_logits, dim=-1)
             ent_per = -(probs * log_probs).sum(dim=-1)
             entropy = (ent_per * batch_w).sum() / w_sum
 
-            log_ratio = action_log_probs - old_log_probs
-            ratio = torch.exp(log_ratio)
             surr1 = ratio * batch_advantages
             surr2 = torch.clamp(ratio, 1 - self._clip_epsilon,
                                 1 + self._clip_epsilon) * batch_advantages
@@ -2182,6 +2336,7 @@ class Stage2aLearner:
             # CQ-0284: gradient norm diagnostics (default off)
             # ``loss.backward()`` の前に ``torch.autograd.grad`` で計測。
             # ``retain_graph=True`` を使うので後段 backward は通常通り動く。
+            # CQ-0293: applied minibatch のみ集計に入れる。
             if self._gn_should_measure(
                     batch_idx_in_epoch=gn_measured, epoch_idx=epoch_idx):
                 gn_norms = self._gn_compute_minibatch_norms(
@@ -2195,43 +2350,6 @@ class Stage2aLearner:
                 if gn_norms is not None:
                     gn_minibatches.append(gn_norms)
                     gn_measured += 1
-
-            # CQ-0287: target_kl early stop. 学習挙動を変えないように、
-            # default off では「approx_kl の記録のみ」、enabled かつ
-            # threshold 超過のときだけ skip / break する。
-            with torch.no_grad():
-                approx_kl = float(
-                    ((ratio.detach() - 1.0) - log_ratio.detach()).mean().item())
-            tk_approx_kls.append(approx_kl)
-            if self._tk_enabled and approx_kl > self._tk_threshold:
-                tk_stop_count = 1  # この epoch は early-stop した
-                if self._tk_skip_on_exceed:
-                    # backward / optimizer step を呼ばずに break
-                    tk_skipped_minibatches += 1
-                    # diagnostics 用 tensor は記録 (skip 前 forward の結果)
-                    all_ratios.append(ratio.detach().cpu())
-                    all_log_ratios.append(log_ratio.detach().cpu())
-                    all_batch_adv.append(batch_advantages.detach().cpu())
-                    all_max_probs.append(max_prob.detach().cpu())
-                    all_batch_w.append(batch_w.detach().cpu())
-                    break
-                # skip_on_exceed=False: 通常 step してから break する
-                self._optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self._model.parameters(),
-                                          self._max_grad_norm)
-                self._optimizer.step()
-                policy_losses.append(policy_loss.item())
-                value_losses.append(value_loss.item())
-                entropies.append(entropy.item())
-                all_ratios.append(ratio.detach().cpu())
-                all_log_ratios.append(log_ratio.detach().cpu())
-                all_batch_adv.append(batch_advantages.detach().cpu())
-                all_max_probs.append(max_prob.detach().cpu())
-                all_batch_w.append(batch_w.detach().cpu())
-                if self._anchor_enabled and self._anchor_model is not None:
-                    _anchor_kls.append(akl_val)
-                break
 
             self._optimizer.zero_grad()
             loss.backward()
@@ -2247,8 +2365,18 @@ class Stage2aLearner:
             all_batch_adv.append(batch_advantages.detach().cpu())
             all_max_probs.append(max_prob.detach().cpu())
             all_batch_w.append(batch_w.detach().cpu())
+            # CQ-0295: per-sample decision_family を minibatch ごとに記録
+            # discard branch なので legacy "response" 既定は "discard"
+            # として扱う (decision_type==discard サンプル)。
+            all_decision_families.append([
+                "discard" for _ in batch])
             if self._anchor_enabled and self._anchor_model is not None:
                 _anchor_kls.append(akl_val)
+
+            # CQ-0293: skip_on_exceed=False で KL を超えた minibatch は
+            # step してから break する (既存仕様維持)
+            if kl_exceeded:
+                break
 
         diag_buffer = {
             "log_ratios": all_log_ratios,
@@ -2261,6 +2389,8 @@ class Stage2aLearner:
             "tk_approx_kls": tk_approx_kls,
             "tk_skipped_minibatches": tk_skipped_minibatches,
             "tk_stop_count": tk_stop_count,
+            # CQ-0295: per-minibatch per-sample decision_family
+            "decision_families": all_decision_families,
         }
         return (policy_losses, value_losses, entropies, all_ratios,
                 _anchor_kls, _sem_tl, _sem_yl, diag_buffer)
@@ -2278,6 +2408,8 @@ class Stage2aLearner:
         all_batch_adv: list[torch.Tensor] = []
         all_max_probs: list[torch.Tensor] = []
         all_batch_w: list[torch.Tensor] = []
+        # CQ-0295: per-sample decision_family (applied minibatch のみ)
+        all_decision_families: list[list[str]] = []
         _anchor_kls: list[float] = []
         _sem_tl: list[float] = []
         _sem_yl: list[float] = []
@@ -2331,12 +2463,33 @@ class Stage2aLearner:
                        else torch.ones(len(batch), device=self._device))
             w_sum = batch_w.sum().clamp(min=1e-8)
 
+            log_ratio = action_log_probs - old_log_probs
+            ratio = torch.exp(log_ratio)
+
+            # CQ-0287/CQ-0293: target_kl 判定を applied diagnostics より前に。
+            # batch_w がある場合は weighted mean で approx_kl を計算する。
+            with torch.no_grad():
+                kl_per = (ratio.detach() - 1.0) - log_ratio.detach()
+                w_sum_kl = batch_w.detach().sum().clamp(min=1e-8)
+                approx_kl = float(
+                    ((kl_per * batch_w.detach()).sum() / w_sum_kl).item())
+            tk_approx_kls.append(approx_kl)
+
+            # CQ-0293: skipped minibatch を applied diagnostics から除外
+            kl_exceeded = (self._tk_enabled
+                           and approx_kl > self._tk_threshold)
+            skip_minibatch = kl_exceeded and self._tk_skip_on_exceed
+            if kl_exceeded:
+                tk_stop_count = 1
+            if skip_minibatch:
+                tk_skipped_minibatches += 1
+                break
+
+            # ↓ 以下は applied minibatch のみ実行
             probs = torch.softmax(out.optional_scores, dim=-1)
             ent_per = -(probs * log_probs).sum(dim=-1)
             entropy = (ent_per * batch_w).sum() / w_sum
 
-            log_ratio = action_log_probs - old_log_probs
-            ratio = torch.exp(log_ratio)
             surr1 = ratio * batch_advantages
             surr2 = torch.clamp(ratio, 1 - self._clip_epsilon,
                                 1 + self._clip_epsilon) * batch_advantages
@@ -2380,6 +2533,7 @@ class Stage2aLearner:
                 _sem_yl.append(float(yl_t.detach()))
 
             # CQ-0284: gradient norm diagnostics (default off)
+            # CQ-0293: applied minibatch のみ集計に入れる
             if self._gn_should_measure(
                     batch_idx_in_epoch=gn_measured, epoch_idx=epoch_idx):
                 gn_norms = self._gn_compute_minibatch_norms(
@@ -2393,38 +2547,6 @@ class Stage2aLearner:
                 if gn_norms is not None:
                     gn_minibatches.append(gn_norms)
                     gn_measured += 1
-
-            # CQ-0287: target_kl early stop (call branch)
-            with torch.no_grad():
-                approx_kl = float(
-                    ((ratio.detach() - 1.0) - log_ratio.detach()).mean().item())
-            tk_approx_kls.append(approx_kl)
-            if self._tk_enabled and approx_kl > self._tk_threshold:
-                tk_stop_count = 1
-                if self._tk_skip_on_exceed:
-                    tk_skipped_minibatches += 1
-                    all_ratios.append(ratio.detach().cpu())
-                    all_log_ratios.append(log_ratio.detach().cpu())
-                    all_batch_adv.append(batch_advantages.detach().cpu())
-                    all_max_probs.append(max_prob.detach().cpu())
-                    all_batch_w.append(batch_w.detach().cpu())
-                    break
-                self._optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self._model.parameters(),
-                                          self._max_grad_norm)
-                self._optimizer.step()
-                policy_losses.append(policy_loss.item())
-                value_losses.append(value_loss.item())
-                entropies.append(entropy.item())
-                all_ratios.append(ratio.detach().cpu())
-                all_log_ratios.append(log_ratio.detach().cpu())
-                all_batch_adv.append(batch_advantages.detach().cpu())
-                all_max_probs.append(max_prob.detach().cpu())
-                all_batch_w.append(batch_w.detach().cpu())
-                if self._anchor_enabled and self._anchor_model is not None:
-                    _anchor_kls.append(akl_val)
-                break
 
             self._optimizer.zero_grad()
             loss.backward()
@@ -2440,8 +2562,21 @@ class Stage2aLearner:
             all_batch_adv.append(batch_advantages.detach().cpu())
             all_max_probs.append(max_prob.detach().cpu())
             all_batch_w.append(batch_w.detach().cpu())
+            # CQ-0295: per-sample decision_family を minibatch ごとに記録。
+            # sample.decision_family が無い旧 shard は learner 側で
+            # DecisionShardReader.read_all() が "response" 既定で
+            # 充当しているため、ここではそれをそのまま使う。
+            mb_families = [
+                str(getattr(s, "decision_family", "response") or "response")
+                for s in batch]
+            all_decision_families.append(mb_families)
             if self._anchor_enabled and self._anchor_model is not None:
                 _anchor_kls.append(akl_val)
+
+            # CQ-0293: skip_on_exceed=False で KL を超えた minibatch は
+            # step してから break する (既存仕様維持)
+            if kl_exceeded:
+                break
 
         diag_buffer = {
             "log_ratios": all_log_ratios,
@@ -2454,6 +2589,8 @@ class Stage2aLearner:
             "tk_approx_kls": tk_approx_kls,
             "tk_skipped_minibatches": tk_skipped_minibatches,
             "tk_stop_count": tk_stop_count,
+            # CQ-0295: per-minibatch per-sample decision_family
+            "decision_families": all_decision_families,
         }
         return (policy_losses, value_losses, entropies, all_ratios,
                 _anchor_kls, _sem_tl, _sem_yl, diag_buffer)

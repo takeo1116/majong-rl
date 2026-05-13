@@ -55,6 +55,10 @@ class DecisionSample:
     step_id: int = 0
     actor_type: str = "policy"
     sample_semantics_version: int = 3  # CQ-0279: v3 = CQ-0274 同 player transition reward
+    # CQ-0291: optional family メタデータ
+    # default "response" は既存 Chi/Pon/Daiminkan/Skip 系の optional decision
+    # CQ-0291 batch 1 で "riichi" が追加される (Riichi/NoRiichi optional)
+    decision_family: str = "response"
 
     # discard 用
     action: int = -1                # TileType (discard のみ)
@@ -130,6 +134,8 @@ class DecisionShardWriter:
             "actor_type": [s.actor_type for s in self._buffer],
             "sample_semantics_version": [s.sample_semantics_version
                                           for s in self._buffer],
+            # CQ-0291: optional decision family ("response" | "riichi" | ...)
+            "decision_family": [s.decision_family for s in self._buffer],
             # discard fields (-1 sentinel for call)
             "action": [s.action for s in self._buffer],
             # call fields (-1 sentinel for discard)
@@ -313,6 +319,11 @@ class DecisionShardReader:
                         int(table.column("sample_semantics_version")[i].as_py())
                         if "sample_semantics_version" in table.column_names
                         else 0),  # CQ-0279: legacy shard 0 扱い (learner で fail-fast)
+                    # CQ-0291: optional family ("response" 既定で legacy 互換)
+                    decision_family=(
+                        table.column("decision_family")[i].as_py()
+                        if "decision_family" in table.column_names
+                        else "response"),
                     action=table.column("action")[i].as_py(),
                     legal_mask=mask if dt == "discard" else None,
                     selected_candidate_index=table.column(

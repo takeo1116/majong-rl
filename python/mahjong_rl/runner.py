@@ -150,6 +150,7 @@ def _rebuild_encoder(encoder_config: dict, obs_mode: str):
         opponent_tenpai_flag=_parse_encoder_flag(encoder_config, "opponent_tenpai_flag"),
         danger_mask=_parse_encoder_flag(encoder_config, "danger_mask"),
         tile_presence_flags=_parse_encoder_flag(encoder_config, "tile_presence_flags"),
+        riichi_discard_mask=_parse_encoder_flag(encoder_config, "riichi_discard_mask"),
     )
 
 
@@ -1584,6 +1585,25 @@ class Stage1Runner:
         logger.info(f"  total_steps: {sp_stats['total_steps']}")
         return sp_stats
 
+    def _stage2a_optional_flags(self) -> dict:
+        """CQ-0292: training.optional_*.enabled を dict として取り出す。
+
+        parallel selfplay / eval / Stage2aEvaluator に渡すための共通 helper。
+        """
+        tc = self._config.training
+        keys = (
+            "optional_riichi", "optional_tsumo", "optional_ron",
+            "optional_ankan", "optional_kakan", "optional_kyuushu",
+        )
+        out: dict = {}
+        for k in keys:
+            sub = tc.get(k, {})
+            if isinstance(sub, dict):
+                out[k] = bool(sub.get("enabled", False))
+            else:
+                out[k] = bool(sub)
+        return out
+
     def _create_stage2a_model(self, encoder):
         """Stage2a model factory"""
         from mahjong_rl.models.stage2a_model import Stage2aModel
@@ -1654,6 +1674,7 @@ class Stage1Runner:
                 num_threads=sp_cfg.get("worker_num_threads", 1),
                 reward_config_dict=dict(self._config.reward),  # CQ-0276
                 temperature=float(sp_cfg.get("temperature", 1.0)),  # CQ-0278
+                optional_flags=self._stage2a_optional_flags(),  # CQ-0292
             )
         else:
             worker = Stage2SelfPlayWorker(
@@ -1715,6 +1736,11 @@ class Stage1Runner:
             "total_steps": gen_stats["total_steps"],
             "discard_count": gen_stats["discard_count"],
             "call_count": gen_stats["call_count"],
+            # CQ-0292 (batch 2): decision family diagnostics
+            "decision_family_counts": gen_stats.get(
+                "decision_family_counts", {}),
+            "optional_decision_count": gen_stats.get(
+                "optional_decision_count", 0),
             "train_metrics": train_metrics,
             "imitation_epochs": imi_epochs,
             "imitation_eval": imitation_eval_metrics,
@@ -1763,6 +1789,7 @@ class Stage1Runner:
                     reward_config_dict=dict(self._config.reward),  # CQ-0276
                     temperature=float(self._config.selfplay.get(
                         "temperature", 1.0)),  # CQ-0278
+                    optional_flags=self._stage2a_optional_flags(),  # CQ-0292
                 )
             else:
                 from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
@@ -1849,11 +1876,24 @@ class Stage1Runner:
                          f"avg_rank={imitation_eval_metrics.get('avg_rank', 0):.2f}")
 
         last_tm = chunks_data[-1]["train_metrics"] if chunks_data else {}
+        # CQ-0292 (batch 2): decision_family_counts を chunk 横断で合算
+        from mahjong_rl.stage2a_parallel import _DECISION_FAMILY_KEYS as _FAM_KEYS
+        family_total = {k: 0 for k in _FAM_KEYS}
+        for c in chunks_data:
+            fam = c["gen_stats"].get("decision_family_counts") or {}
+            for k in _FAM_KEYS:
+                family_total[k] += int(fam.get(k, 0))
+        optional_total = sum(
+            v for k, v in family_total.items()
+            if k not in ("discard", "response")
+        )
         return {
             "stage": "stage2a",
             "total_steps": sum(c["gen_stats"]["total_steps"] for c in chunks_data),
             "discard_count": sum(c["gen_stats"]["discard_count"] for c in chunks_data),
             "call_count": sum(c["gen_stats"]["call_count"] for c in chunks_data),
+            "decision_family_counts": family_total,
+            "optional_decision_count": int(optional_total),
             "train_metrics": last_tm,
             "imitation_epochs": imi_epochs,
             "imitation_eval": imitation_eval_metrics,
@@ -1900,6 +1940,7 @@ class Stage1Runner:
                 save_baseline_actions=sp_cfg.get("save_baseline_actions", False),
                 reward_config_dict=dict(self._config.reward),  # CQ-0276
                 temperature=float(sp_cfg.get("temperature", 1.0)),  # CQ-0278
+                optional_flags=self._stage2a_optional_flags(),  # CQ-0292
             )
         else:
             from mahjong_rl.stage2_selfplay_worker import Stage2SelfPlayWorker
@@ -2147,6 +2188,7 @@ class Stage1Runner:
                 inference_device=eval_cfg.get("inference_device", "cpu"),
                 num_threads=eval_cfg.get("worker_num_threads", 1),
                 reward_config_dict=dict(self._config.reward),  # CQ-0276
+                optional_flags=self._stage2a_optional_flags(),  # CQ-0292
             )
         else:
             from mahjong_rl.stage2a_evaluator import Stage2aEvaluator
@@ -2159,11 +2201,19 @@ class Stage1Runner:
             from mahjong_rl.stage2_selfplay_worker import build_reward_policy_config
             eval_reward_config = build_reward_policy_config(
                 dict(self._config.reward))
+            # CQ-0292: optional_* flags を single-process eval にも伝播
+            _opt_flags = self._stage2a_optional_flags()
             evaluator = Stage2aEvaluator(
                 model=s2_model, encoder=encoder,
                 observation_mode=obs_mode,
                 device=torch.device("cpu"),
                 reward_config=eval_reward_config,
+                optional_riichi_enabled=_opt_flags["optional_riichi"],
+                optional_tsumo_enabled=_opt_flags["optional_tsumo"],
+                optional_ron_enabled=_opt_flags["optional_ron"],
+                optional_ankan_enabled=_opt_flags["optional_ankan"],
+                optional_kakan_enabled=_opt_flags["optional_kakan"],
+                optional_kyuushu_enabled=_opt_flags["optional_kyuushu"],
             )
 
             if eval_mode == "rotation":
@@ -2752,6 +2802,12 @@ class Stage1Runner:
             opponent_tenpai_flag=_parse_encoder_flag(enc_cfg, "opponent_tenpai_flag"),
             danger_mask=_parse_encoder_flag(enc_cfg, "danger_mask"),
             tile_presence_flags=_parse_encoder_flag(enc_cfg, "tile_presence_flags"),
+            # CQ-0294 follow-up: runner._create_encoder() でも
+            # riichi_discard_mask flag を反映する。これが抜けていたため
+            # learner/model の input_dim が shard の observation_dim と
+            # 一致せず "mat1 and mat2 shapes cannot be multiplied" の
+            # shape mismatch が発生していた。
+            riichi_discard_mask=_parse_encoder_flag(enc_cfg, "riichi_discard_mask"),
         )
 
     def _create_model(self, encoder):
@@ -3053,6 +3109,9 @@ class Stage1Runner:
             "opponent_tenpai_flag": _parse_encoder_flag(enc_cfg, "opponent_tenpai_flag"),
             "danger_mask": _parse_encoder_flag(enc_cfg, "danger_mask"),
             "tile_presence_flags": _parse_encoder_flag(enc_cfg, "tile_presence_flags"),
+            # CQ-0294: riichi_discard_mask feature flag
+            "riichi_discard_mask": _parse_encoder_flag(
+                enc_cfg, "riichi_discard_mask"),
             "input_dim": result.get("input_dim"),
         }
 
@@ -3516,6 +3575,9 @@ class Stage1Runner:
             "opponent_tenpai_flag": _parse_encoder_flag(enc_cfg, "opponent_tenpai_flag"),
             "danger_mask": _parse_encoder_flag(enc_cfg, "danger_mask"),
             "tile_presence_flags": _parse_encoder_flag(enc_cfg, "tile_presence_flags"),
+            # CQ-0294: riichi_discard_mask feature flag
+            "riichi_discard_mask": _parse_encoder_flag(
+                enc_cfg, "riichi_discard_mask"),
         }
         _flag_str = ", ".join(f"{k}={'on' if v else 'off'}" for k, v in _flags.items())
         lines.append(f"- encoder: {enc_cfg.get('name', '?')} "

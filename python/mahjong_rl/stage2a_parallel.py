@@ -29,6 +29,36 @@ def distribute_matches(total: int, num_workers: int) -> list[int]:
 
 # ============ Selfplay Worker ============
 
+_OPTIONAL_FLAG_KEYS = (
+    "optional_riichi",
+    "optional_tsumo",
+    "optional_ron",
+    "optional_ankan",
+    "optional_kakan",
+    "optional_kyuushu",
+)
+
+
+def _normalize_optional_flags(optional_flags: dict | None) -> dict[str, bool]:
+    """CQ-0292: optional flag dict を正規化する。
+
+    入力は ``{"optional_riichi": True, ...}`` または
+    ``{"optional_riichi": {"enabled": True}, ...}`` のいずれでもよい。
+    """
+    out: dict[str, bool] = {k: False for k in _OPTIONAL_FLAG_KEYS}
+    if not isinstance(optional_flags, dict):
+        return out
+    for k in _OPTIONAL_FLAG_KEYS:
+        v = optional_flags.get(k)
+        if isinstance(v, dict):
+            out[k] = bool(v.get("enabled", False))
+        elif v is None:
+            out[k] = False
+        else:
+            out[k] = bool(v)
+    return out
+
+
 def _stage2a_selfplay_worker_fn(
     worker_id: int,
     output_dir: str,
@@ -48,6 +78,7 @@ def _stage2a_selfplay_worker_fn(
     num_threads: int = 1,
     reward_config_dict: dict | None = None,
     temperature: float = 1.0,
+    optional_flags: dict | None = None,
 ):
     """subprocess で Stage2a selfplay を実行"""
     try:
@@ -71,6 +102,7 @@ def _stage2a_selfplay_worker_fn(
             opponent_tenpai_flag=_parse_encoder_flag(encoder_config, "opponent_tenpai_flag"),
             danger_mask=_parse_encoder_flag(encoder_config, "danger_mask"),
             tile_presence_flags=_parse_encoder_flag(encoder_config, "tile_presence_flags"),
+            riichi_discard_mask=_parse_encoder_flag(encoder_config, "riichi_discard_mask"),
         )
 
         # model 再構築 (selfplay 用)
@@ -106,10 +138,14 @@ def _stage2a_selfplay_worker_fn(
 
         # CQ-0276: reward_config を worker config に伝播
         # CQ-0278 follow-up: temperature も worker config に伝播
+        # CQ-0292: optional_* flags を worker config に伝播
         worker_config: dict = {}
         if reward_config_dict:
             worker_config["reward"] = reward_config_dict
         worker_config["selfplay"] = {"temperature": float(temperature)}
+        normalized_flags = _normalize_optional_flags(optional_flags)
+        for k, v in normalized_flags.items():
+            worker_config[k] = {"enabled": bool(v)}
         worker = Stage2SelfPlayWorker(
             config=worker_config,
             output_dir=output_dir,
@@ -149,6 +185,7 @@ def run_stage2a_selfplay_parallel(
     num_threads: int = 1,
     reward_config_dict: dict | None = None,
     temperature: float = 1.0,
+    optional_flags: dict | None = None,
 ) -> dict:
     """Stage2a selfplay を multi-process で実行"""
     output_dir = Path(output_dir)
@@ -160,6 +197,7 @@ def run_stage2a_selfplay_parallel(
     error_queue = ctx.Queue()
     processes = []
 
+    normalized_flags = _normalize_optional_flags(optional_flags)
     for i, wm in enumerate(matches_per_worker):
         if wm == 0:
             continue
@@ -171,7 +209,8 @@ def run_stage2a_selfplay_parallel(
                   model_state_path, model_config, wm, worker_seed,
                   experiment_id, run_id, result_queue, error_queue,
                   inference_device, policy_ratio, save_baseline_actions,
-                  num_threads, reward_config_dict, temperature),
+                  num_threads, reward_config_dict, temperature,
+                  normalized_flags),
         )
         p.start()
         processes.append(p)
@@ -202,6 +241,7 @@ def _stage2a_eval_worker_fn(
     inference_device: str = "cpu",
     num_threads: int = 1,
     reward_config_dict: dict | None = None,
+    optional_flags: dict | None = None,
 ):
     """subprocess で Stage2a eval を実行"""
     try:
@@ -225,6 +265,7 @@ def _stage2a_eval_worker_fn(
             opponent_tenpai_flag=_parse_encoder_flag(encoder_config, "opponent_tenpai_flag"),
             danger_mask=_parse_encoder_flag(encoder_config, "danger_mask"),
             tile_presence_flags=_parse_encoder_flag(encoder_config, "tile_presence_flags"),
+            riichi_discard_mask=_parse_encoder_flag(encoder_config, "riichi_discard_mask"),
         )
 
         meta = enc.metadata()
@@ -255,13 +296,21 @@ def _stage2a_eval_worker_fn(
         load_stage2a_state_dict(model, sd)
 
         # CQ-0276: reward_config を eval にも伝播
+        # CQ-0292: optional_* flags を evaluator に伝播
         from mahjong_rl.stage2_selfplay_worker import build_reward_policy_config
         eval_reward_config = build_reward_policy_config(reward_config_dict)
+        normalized_flags = _normalize_optional_flags(optional_flags)
         evaluator = Stage2aEvaluator(
             model=model, encoder=enc,
             observation_mode=obs_mode,
             device=device,
             reward_config=eval_reward_config,
+            optional_riichi_enabled=normalized_flags["optional_riichi"],
+            optional_tsumo_enabled=normalized_flags["optional_tsumo"],
+            optional_ron_enabled=normalized_flags["optional_ron"],
+            optional_ankan_enabled=normalized_flags["optional_ankan"],
+            optional_kakan_enabled=normalized_flags["optional_kakan"],
+            optional_kyuushu_enabled=normalized_flags["optional_kyuushu"],
         )
         metrics = evaluator.evaluate(
             num_matches=num_matches,
@@ -286,6 +335,7 @@ def run_stage2a_eval_parallel(
     inference_device: str = "cpu",
     num_threads: int = 1,
     reward_config_dict: dict | None = None,
+    optional_flags: dict | None = None,
 ) -> dict:
     """Stage2a eval を multi-process で実行"""
     if eval_mode == "rotation":
@@ -305,6 +355,7 @@ def run_stage2a_eval_parallel(
                 inference_device=inference_device,
                 num_threads=num_threads,
                 reward_config_dict=reward_config_dict,
+                optional_flags=optional_flags,
             )
             all_results.append(r)
         # 集約
@@ -328,6 +379,7 @@ def run_stage2a_eval_parallel(
     processes = []
 
     offset = 0
+    normalized_flags = _normalize_optional_flags(optional_flags)
     for i, wm in enumerate(matches_per_worker):
         if wm == 0:
             continue
@@ -336,7 +388,7 @@ def run_stage2a_eval_parallel(
             args=(i, obs_mode, encoder_config, model_state_path,
                   model_config, wm, seed_start + offset, policy_seat,
                   result_queue, error_queue, inference_device,
-                  num_threads, reward_config_dict),
+                  num_threads, reward_config_dict, normalized_flags),
         )
         p.start()
         processes.append(p)
@@ -399,6 +451,24 @@ _SUM_KEYS = [
 ]
 
 
+_DECISION_FAMILY_KEYS = (
+    "discard", "response", "riichi", "tsumo", "ron",
+    "ankan", "kakan", "kyuushu",
+)
+
+# CQ-0294: riichi opportunity diagnostics keys (合算対象)
+_RIICHI_OPPORTUNITY_SCALAR_KEYS = (
+    "riichi_opportunity_discard_count",
+    "riichi_optional_opened_count",
+    "riichi_bypassed_by_non_riichi_discard_count",
+)
+_RIICHI_OPPORTUNITY_BY_ACTOR_KEYS = (
+    "riichi_opportunity_by_actor",
+    "riichi_optional_opened_by_actor",
+    "riichi_bypassed_by_actor",
+)
+
+
 def _aggregate_stats(stats_list: list[dict], num_workers: int) -> dict:
     """worker stats を合算"""
     if not stats_list:
@@ -407,6 +477,35 @@ def _aggregate_stats(stats_list: list[dict], num_workers: int) -> dict:
     for key in _SUM_KEYS:
         agg[key] = sum(s.get(key, 0) for s in stats_list)
     agg["num_workers"] = num_workers
+    # CQ-0292 (batch 2): decision_family_counts / optional_decision_count を合算
+    family_agg = {k: 0 for k in _DECISION_FAMILY_KEYS}
+    for s in stats_list:
+        family = s.get("decision_family_counts")
+        if isinstance(family, dict):
+            for k in _DECISION_FAMILY_KEYS:
+                family_agg[k] += int(family.get(k, 0))
+    agg["decision_family_counts"] = family_agg
+    agg["optional_decision_count"] = sum(
+        v for k, v in family_agg.items()
+        if k not in ("discard", "response")
+    )
+    # CQ-0294: riichi opportunity diagnostics 合算
+    for k in _RIICHI_OPPORTUNITY_SCALAR_KEYS:
+        agg[k] = sum(int(s.get(k, 0)) for s in stats_list)
+    if agg["riichi_opportunity_discard_count"] > 0:
+        agg["riichi_bypass_rate"] = (
+            agg["riichi_bypassed_by_non_riichi_discard_count"]
+            / agg["riichi_opportunity_discard_count"])
+    else:
+        agg["riichi_bypass_rate"] = 0.0
+    for k in _RIICHI_OPPORTUNITY_BY_ACTOR_KEYS:
+        merged: dict[str, int] = {"policy": 0, "baseline": 0}
+        for s in stats_list:
+            sub = s.get(k)
+            if isinstance(sub, dict):
+                merged["policy"] += int(sub.get("policy", 0))
+                merged["baseline"] += int(sub.get("baseline", 0))
+        agg[k] = merged
     return agg
 
 

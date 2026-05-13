@@ -99,6 +99,8 @@ class FlatFeatureEncoder(FeatureEncoder):
     _OPPONENT_SHANTEN_DIM = 3    # 相対席3家 × shanten/8.0
     _OPPONENT_TENPAI_DIM = 3     # 相対席3家 × 0/1
     _DANGER_MASK_DIM = 34        # per-opponent, 34 牌種
+    # CQ-0294: riichi discard mask feature (34 tile_types)
+    _RIICHI_DISCARD_MASK_DIM = 34
 
     def __init__(self, observation_mode: str = "both",
                  shanten_hint: bool = False,
@@ -109,7 +111,8 @@ class FlatFeatureEncoder(FeatureEncoder):
                  opponent_current_shanten: bool = False,
                  opponent_tenpai_flag: bool = False,
                  danger_mask: bool = False,
-                 tile_presence_flags: bool = False):
+                 tile_presence_flags: bool = False,
+                 riichi_discard_mask: bool = False):
         """
         Args:
             observation_mode: "full", "partial", "both"
@@ -122,6 +125,9 @@ class FlatFeatureEncoder(FeatureEncoder):
             opponent_tenpai_flag: True で相手3家のテンパイフラグを追加 (CQ-0213, full-only)
             danger_mask: True で相手3家の danger_mask を追加 (CQ-0213, full-only)
             tile_presence_flags: True で self tile-presence flags を追加 (CQ-0270/0272)
+            riichi_discard_mask: True で 34 次元 riichi 打牌可能 flag を追加
+                (CQ-0294)。``encode(..., riichi_discard_mask=...)`` で
+                Stage2Env から渡された値を使う。渡されない場合は全 0。
         """
         self._observation_mode = observation_mode
         self._shanten_hint = shanten_hint
@@ -130,6 +136,7 @@ class FlatFeatureEncoder(FeatureEncoder):
         self._shape_hint = shape_hint
         self._turn_context = turn_context
         self._tile_presence_flags = tile_presence_flags
+        self._riichi_discard_mask = riichi_discard_mask
         # CQ-0246: scratch buffers for encode (re-zeroed each call)
         self._scratch_hand = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
         self._scratch_discard = np.zeros(NUM_TILE_TYPES, dtype=np.float32)
@@ -141,18 +148,26 @@ class FlatFeatureEncoder(FeatureEncoder):
         self._danger_mask = danger_mask
 
     def encode(self, obs: Observation, *,
-               legal_mask: np.ndarray | None = None) -> np.ndarray:
+               legal_mask: np.ndarray | None = None,
+               riichi_discard_mask: np.ndarray | None = None) -> np.ndarray:
         """Observation を特徴量ベクトルに変換する
 
         Args:
             obs: PartialObservation or FullObservation
             legal_mask: 合法手マスク (34次元, optional, CQ-0172)。
                 discard_ukeire_hint 有効時に渡すと非合法候補を 0.0 にする。
+            riichi_discard_mask: riichi 打牌可能 flag (34次元, optional,
+                CQ-0294)。``self._riichi_discard_mask=True`` の場合に
+                feature として concat する。``None`` のときは全 0 を使う。
         """
         if isinstance(obs, FullObservation):
-            return self._encode_full(obs, legal_mask=legal_mask)
+            return self._encode_full(
+                obs, legal_mask=legal_mask,
+                riichi_discard_mask=riichi_discard_mask)
         elif isinstance(obs, PartialObservation):
-            return self._encode_partial(obs, legal_mask=legal_mask)
+            return self._encode_partial(
+                obs, legal_mask=legal_mask,
+                riichi_discard_mask=riichi_discard_mask)
         else:
             raise TypeError(f"未対応の Observation 型: {type(obs)}")
 
@@ -184,6 +199,11 @@ class FlatFeatureEncoder(FeatureEncoder):
         if self._tile_presence_flags:
             ranges["tile_presence_flags"] = (dim, dim + self._TILE_PRESENCE_DIM)
             dim += self._TILE_PRESENCE_DIM
+        # CQ-0294: riichi discard mask (34 tile_types)
+        if self._riichi_discard_mask:
+            ranges["riichi_discard_mask"] = (
+                dim, dim + self._RIICHI_DISCARD_MASK_DIM)
+            dim += self._RIICHI_DISCARD_MASK_DIM
         if self._shape_hint:
             ranges["shape_hint"] = (dim, dim + self._SHAPE_HINT_DIM)
             dim += self._SHAPE_HINT_DIM
@@ -223,7 +243,9 @@ class FlatFeatureEncoder(FeatureEncoder):
         )
 
     def _encode_partial(self, obs: PartialObservation, *,
-                        legal_mask: np.ndarray | None = None) -> np.ndarray:
+                        legal_mask: np.ndarray | None = None,
+                        riichi_discard_mask: np.ndarray | None = None,
+                        ) -> np.ndarray:
         features: list[np.ndarray] = []
 
         # 自家手牌 34種カウント
@@ -307,6 +329,11 @@ class FlatFeatureEncoder(FeatureEncoder):
         if self._tile_presence_flags:
             features.append(self._compute_tile_presence_flags(obs.hand, obs.melds))
 
+        # CQ-0294: riichi discard mask (34 tile_types)
+        if self._riichi_discard_mask:
+            features.append(self._coerce_riichi_discard_mask(
+                riichi_discard_mask))
+
         # 手牌形状ヒント (CQ-0170)
         if self._shape_hint:
             features.append(self._compute_shape_hint(hand_counts_for_hint))
@@ -318,7 +345,9 @@ class FlatFeatureEncoder(FeatureEncoder):
         return np.concatenate(features)
 
     def _encode_full(self, obs: FullObservation, *,
-                     legal_mask: np.ndarray | None = None) -> np.ndarray:
+                     legal_mask: np.ndarray | None = None,
+                     riichi_discard_mask: np.ndarray | None = None,
+                     ) -> np.ndarray:
         features: list[np.ndarray] = []
 
         # CQ-0246: scratch buffer 再利用
@@ -424,6 +453,11 @@ class FlatFeatureEncoder(FeatureEncoder):
         if self._tile_presence_flags:
             features.append(self._compute_tile_presence_flags(
                 obs.hands[current_player], obs.melds[current_player]))
+
+        # CQ-0294: riichi discard mask (34 tile_types)
+        if self._riichi_discard_mask:
+            features.append(self._coerce_riichi_discard_mask(
+                riichi_discard_mask))
 
         # 手牌形状ヒント (CQ-0170)
         if self._shape_hint:
@@ -613,6 +647,24 @@ class FlatFeatureEncoder(FeatureEncoder):
         if max_acc > 0:
             return raw / max_acc
         return raw
+
+    @classmethod
+    def _coerce_riichi_discard_mask(
+        cls, mask: np.ndarray | None,
+    ) -> np.ndarray:
+        """CQ-0294: encode 引数 ``riichi_discard_mask`` を 34 次元 float32
+        に整形する。``None`` のときは全 0、長さが異なるときは shape を
+        合わせて zeros にフォールバック。
+        """
+        if mask is None:
+            return np.zeros(cls._RIICHI_DISCARD_MASK_DIM, dtype=np.float32)
+        arr = np.asarray(mask, dtype=np.float32)
+        if arr.shape != (cls._RIICHI_DISCARD_MASK_DIM,):
+            arr = arr.reshape(-1)
+            if arr.shape[0] != cls._RIICHI_DISCARD_MASK_DIM:
+                return np.zeros(
+                    cls._RIICHI_DISCARD_MASK_DIM, dtype=np.float32)
+        return arr
 
     @staticmethod
     def _compute_current_shanten(hand_counts: np.ndarray,

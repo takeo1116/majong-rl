@@ -89,6 +89,26 @@ class Stage2SelfPlayWorker:
                 self._temperature = float(sp["temperature"])
             elif "temperature" in config:
                 self._temperature = float(config["temperature"])
+        # CQ-0291 (batch 1/2/3): optional family flags
+        # default False は既存自動 riichi/tsumo/ron/kan/kyuushu 挙動と完全互換
+        self._optional_riichi_enabled = self._read_optional_flag(
+            config, "optional_riichi")
+        self._optional_tsumo_enabled = self._read_optional_flag(
+            config, "optional_tsumo")
+        self._optional_ron_enabled = self._read_optional_flag(
+            config, "optional_ron")
+        # CQ-0291 batch 3
+        self._optional_ankan_enabled = self._read_optional_flag(
+            config, "optional_ankan")
+        self._optional_kakan_enabled = self._read_optional_flag(
+            config, "optional_kakan")
+        self._optional_kyuushu_enabled = self._read_optional_flag(
+            config, "optional_kyuushu")
+
+        # CQ-0291 follow-up: model setup と preallocated inference buffers の
+        # 初期化が以前 _read_optional_flag の return False 後ろに紛れ込んで
+        # dead code 化していた (Stage2SelfPlayWorker._feat_buf 等が __init__
+        # 後に存在せず selfplay loop で AttributeError)。__init__ 末尾に戻す。
         if model is not None:
             self._model = model.to(self._device)
             self._model.eval()
@@ -98,18 +118,82 @@ class Stage2SelfPlayWorker:
             obs_dim = encoder.metadata().output_shape[0]
         else:
             obs_dim = 10
-        self._feat_buf = torch.zeros(1, obs_dim, dtype=torch.float32, device=self._device)
-        self._mask_buf = torch.zeros(1, 34, dtype=torch.float32, device=self._device)
-        self._rc_buf = torch.zeros(1, 3, dtype=torch.float32, device=self._device)
+        self._feat_buf = torch.zeros(
+            1, obs_dim, dtype=torch.float32, device=self._device)
+        self._mask_buf = torch.zeros(
+            1, 34, dtype=torch.float32, device=self._device)
+        self._rc_buf = torch.zeros(
+            1, 3, dtype=torch.float32, device=self._device)
 
-    def _encode_obs(self, obs, legal_mask=None) -> np.ndarray:
+    @staticmethod
+    def _read_optional_flag(config, key: str) -> bool:
+        """CQ-0291: training.<key>.enabled または config[<key>].enabled を読む"""
+        if not isinstance(config, dict):
+            return False
+        tc = config.get("training")
+        if isinstance(tc, dict):
+            sub = tc.get(key, {})
+            if isinstance(sub, dict):
+                return bool(sub.get("enabled", False))
+        sub = config.get(key, {})
+        if isinstance(sub, dict):
+            return bool(sub.get("enabled", False))
+        return False
+
+    def _encode_obs(self, obs, legal_mask=None,
+                    riichi_discard_mask=None) -> np.ndarray:
         if self._encoder is not None:
-            features = self._encoder.encode(obs, legal_mask=legal_mask)
+            # CQ-0294: encoder が riichi_discard_mask feature を持つ場合
+            # のみ kwarg を渡す。古い encoder 互換のため getattr で
+            # fallback する。
+            if getattr(self._encoder, "_riichi_discard_mask", False):
+                features = self._encoder.encode(
+                    obs, legal_mask=legal_mask,
+                    riichi_discard_mask=riichi_discard_mask)
+            else:
+                features = self._encoder.encode(obs, legal_mask=legal_mask)
             # CQ-0244: encoder output は既に flat float32 → 不要なコピーを避ける
             if features.ndim > 1:
                 features = features.flatten()
             return features
         return np.zeros(10, dtype=np.float32)
+
+    def _encode_env_obs(self, env, obs=None) -> np.ndarray:
+        """Encode the current env state with discard-derived auxiliary masks.
+
+        CQ-0297: optional/response branches must see the same state-level
+        auxiliary features as discard branches. In particular,
+        ``riichi_discard_mask`` and legal-mask-gated ukeire hints should not
+        silently become all-zero just because the decision is represented as an
+        optional branch.
+
+        CQ-0297 follow-up: at ``ResponsePhase`` (RESPONSE / RON_OPTIONAL)
+        the engine has no legal Discard actions, so ``env.get_legal_mask()``
+        returns an all-zero mask. Passing that mask to the encoder would
+        flip ``discard_ukeire_hint`` from "unrestricted normalized
+        acceptance" (pre-CQ-0297 behavior) to "all-zero", which is a
+        silent semantic change for the response branch and would break
+        backward compatibility with optional-off baselines that use
+        ``discard_ukeire_hint=True``. Detect the no-discard case and pass
+        ``legal_mask=None`` so the encoder preserves the legacy
+        unrestricted behavior at ResponsePhase. SelfActionPhase optional
+        decisions (RIICHI/TSUMO/ANKAN/KAKAN/KYUUSHU) still have a non-zero
+        discard mask and thus continue to benefit from the new mask-aware
+        encoding.
+        """
+        if obs is None:
+            obs = env._make_observation()
+        legal_mask = env.get_legal_mask()
+        if legal_mask.sum() == 0:
+            # ResponsePhase: no Discard legal; preserve pre-CQ-0297
+            # encoder semantics (legal_mask=None) to keep optional-off /
+            # response-branch behavior identical to the prior baseline.
+            legal_mask = None
+        riichi_mask = None
+        if getattr(self._encoder, "_riichi_discard_mask", False):
+            riichi_mask = env.get_riichi_discard_mask()
+        return self._encode_obs(
+            obs, legal_mask=legal_mask, riichi_discard_mask=riichi_mask)
 
     def generate(
         self,
@@ -122,7 +206,13 @@ class Stage2SelfPlayWorker:
         """指定数の半荘を自動プレイし、shard を書き出す"""
         writer = DecisionShardWriter(self._output_dir, max_samples=10000)
         env = Stage2Env(observation_mode=self._obs_mode,
-                         reward_config=self._reward_config)
+                         reward_config=self._reward_config,
+                         optional_riichi_enabled=self._optional_riichi_enabled,
+                         optional_tsumo_enabled=self._optional_tsumo_enabled,
+                         optional_ron_enabled=self._optional_ron_enabled,
+                         optional_ankan_enabled=self._optional_ankan_enabled,
+                         optional_kakan_enabled=self._optional_kakan_enabled,
+                         optional_kyuushu_enabled=self._optional_kyuushu_enabled)
         from mahjong_rl.baseline.rule_based import RuleBasedBaseline
         baseline = RuleBasedBaseline()
 
@@ -140,6 +230,34 @@ class Stage2SelfPlayWorker:
         policy_draws = 0
         policy_win_by_tsumo = 0
         policy_win_by_ron = 0
+        # CQ-0292 (batch 2): decision_family ごとの sample count
+        # save された sample (= shard に書き出される sample) のみカウント
+        decision_family_counts: dict[str, int] = {
+            "discard": 0,
+            "response": 0,
+            "riichi": 0,
+            "tsumo": 0,
+            "ron": 0,
+            "ankan": 0,
+            "kakan": 0,
+            "kyuushu": 0,
+        }
+        # CQ-0294: Riichi opportunity diagnostics
+        # opportunity: discard 時点で riichi 打牌 action が legal だった回数
+        # opened: その discard で実際に RIICHI_OPTIONAL が開いた回数
+        # bypassed: opportunity はあったが RIICHI_OPTIONAL が開かなかった回数
+        riichi_opportunity_discard_count = 0
+        riichi_optional_opened_count = 0
+        riichi_bypassed_by_non_riichi_discard_count = 0
+        riichi_opportunity_by_actor: dict[str, int] = {
+            "policy": 0, "baseline": 0,
+        }
+        riichi_optional_opened_by_actor: dict[str, int] = {
+            "policy": 0, "baseline": 0,
+        }
+        riichi_bypassed_by_actor: dict[str, int] = {
+            "policy": 0, "baseline": 0,
+        }
 
         for match_idx in range(num_matches):
             seed = base_seed + match_idx
@@ -164,21 +282,45 @@ class Stage2SelfPlayWorker:
 
                 if env.decision_type == DecisionType.DISCARD:
                     # CQ-0271: snapshot-based discard
+                    # CQ-0294: policy 用 mask と teacher / baseline 用
+                    # mask を分離する。policy mask は optional_riichi
+                    # 有効時に全 Discard tile_type を含む (CQ-0292 batch 2)。
+                    # teacher mask は常に旧 auto-riichi 優先 semantics
+                    # (= riichi 可能なら riichi tile_type のみ) を使う。
                     mask, discard_snap = env.get_legal_discard_snapshot()
+                    teacher_mask = env.get_teacher_discard_mask_from_snapshot(
+                        discard_snap)
+                    riichi_feature_mask = env.get_riichi_discard_mask()
                     obs = env._make_observation()
-                    features = self._encode_obs(obs, mask)
+                    features = self._encode_obs(
+                        obs, legal_mask=mask,
+                        riichi_discard_mask=riichi_feature_mask)
                     use_policy = seat_is_policy[player] and self._model is not None
 
+                    # CQ-0294: riichi opportunity diagnostics
+                    had_riichi_opportunity = any(
+                        a.riichi for a in discard_snap)
+                    if had_riichi_opportunity:
+                        riichi_opportunity_discard_count += 1
+
                     if use_policy:
+                        # policy は policy mask を使う
                         action, log_prob, value = self._policy_discard(
                             features, mask)
                         actor_type = "policy"
                     else:
+                        # CQ-0294: baseline は teacher mask (riichi-only
+                        # 優先) を使うことで旧 auto-riichi 挙動を維持
                         hand_ids = list(env.env_state.round_state.players[player].hand)
                         mc = len(env.env_state.round_state.players[player].melds)
-                        action = baseline.select_discard(hand_ids, mask, meld_count=mc)
-                        log_prob, value = self._infer_discard(features, mask, action)
+                        action = baseline.select_discard(
+                            hand_ids, teacher_mask, meld_count=mc)
+                        log_prob, value = self._infer_discard(
+                            features, mask, action)
                         actor_type = "baseline"
+
+                    if had_riichi_opportunity:
+                        riichi_opportunity_by_actor[actor_type] += 1
 
                     # save: policy always, baseline if save_baseline or no model (imitation mode)
                     should_save = (actor_type == "policy"
@@ -187,15 +329,19 @@ class Stage2SelfPlayWorker:
 
                     if should_save:
                         # CQ-0239: teacher info for discard
+                        # CQ-0294: teacher_top1 / teacher_best も
+                        # teacher mask 上で計算する (旧 auto-riichi 優先)
                         hand_for_teacher = list(
                             env.env_state.round_state.players[player].hand)
                         mc_t = len(env.env_state.round_state.players[player].melds)
                         t_action, t_mask = baseline.select_discard_with_best_set(
-                            hand_for_teacher, mask, meld_count=mc_t)
+                            hand_for_teacher, teacher_mask,
+                            meld_count=mc_t)
                         t_best = [i for i in range(34) if t_mask[i] > 0.5]
 
                         sample = DecisionSample(
                             decision_type="discard",
+                            decision_family="discard",  # CQ-0292 (batch 2)
                             observation=features,
                             reward=0.0,
                             log_prob=log_prob,
@@ -219,18 +365,51 @@ class Stage2SelfPlayWorker:
                             prev = pending.pop(player)
                             round_buffer.append(prev)
                         pending[player] = sample
+                        decision_family_counts["discard"] += 1
 
+                    # CQ-0294: 記録用に discard 直前の chosen riichi flag
+                    # を保持。``action`` は tile_type (int) なので
+                    # discard_snap を見て、その tile_type に riichi action
+                    # が含まれているかを判定する。
+                    # default off (auto-riichi) では _resolve_discard が
+                    # riichi action を優先して選ぶため、riichi action が
+                    # tile_type にあれば riichi が declared される。
+                    # optional on でも、選んだ tile_type に riichi のみ
+                    # (= 他に non-riichi なし) なら _maybe_open_riichi_optional
+                    # は発火せず riichi が declared される。
+                    chosen_tt = int(action) if not isinstance(
+                        action, int) else action
+                    chosen_was_riichi = any(
+                        a.riichi for a in discard_snap
+                        if (a.tile // 4) == chosen_tt)
                     step_counter += 1
                     discard_count += 1
                     _, rewards, terminated, _, _ = env.step_discard_with_snapshot(
                         action, discard_snap)
+                    # CQ-0294: opportunity → opened / bypass の分類
+                    # - opened: RIICHI_OPTIONAL が実際に開いた (両方の
+                    #   discard form があり、agent に riichi/no-riichi の
+                    #   選択を委ねた)
+                    # - bypassed: opportunity はあったが RIICHI_OPTIONAL
+                    #   が開かず、かつ chosen Discard が riichi=False
+                    #   (= agent が riichi 機会を素通りした)
+                    # default off の auto-riichi 経路 (chosen riichi=True
+                    # で RIICHI_OPTIONAL なし) は opened/bypass どちらでも
+                    # ないため counter を増やさない。
+                    if had_riichi_opportunity:
+                        if env.decision_type == DecisionType.RIICHI_OPTIONAL:
+                            riichi_optional_opened_count += 1
+                            riichi_optional_opened_by_actor[actor_type] += 1
+                        elif not chosen_was_riichi:
+                            riichi_bypassed_by_non_riichi_discard_count += 1
+                            riichi_bypassed_by_actor[actor_type] += 1
                     # CQ-0274: pending 中の全保存対象 player に reward を累積
                     self._accumulate_pending_rewards(
                         pending, rewards, terminated=terminated)
 
                 elif env.decision_type == DecisionType.RESPONSE:
                     obs = env._make_observation()
-                    features = self._encode_obs(obs)
+                    features = self._encode_env_obs(env, obs)
                     candidates = env.response_candidates
                     use_policy = seat_is_policy[player] and self._model is not None
 
@@ -262,6 +441,7 @@ class Stage2SelfPlayWorker:
 
                         sample = DecisionSample(
                             decision_type="call",
+                            decision_family="response",  # CQ-0292 (batch 2)
                             observation=features,
                             reward=0.0,
                             log_prob=log_prob,
@@ -286,11 +466,218 @@ class Stage2SelfPlayWorker:
                             prev = pending.pop(player)
                             round_buffer.append(prev)
                         pending[player] = sample
+                        decision_family_counts["response"] += 1
 
                     step_counter += 1
                     call_count += 1
                     _, rewards, terminated, _, _ = env.step_response(idx)
                     # CQ-0274: pending 中の全保存対象 player に reward を累積
+                    self._accumulate_pending_rewards(
+                        pending, rewards, terminated=terminated)
+
+                elif env.decision_type == DecisionType.RIICHI_OPTIONAL:
+                    # CQ-0291 (batch 1): Riichi/NoRiichi optional decision
+                    # candidates: [NoRiichi (idx 0), Riichi (idx 1)]
+                    # baseline/teacher: 既存自動リーチ挙動を維持するため Riichi(=1) を採用
+                    obs = env._make_observation()
+                    features = self._encode_env_obs(env, obs)
+                    candidates = env.response_candidates
+                    use_policy = seat_is_policy[player] and self._model is not None
+                    cand_records = self._make_cand_records(candidates)
+                    resp_ctx = make_response_context(env.env_state, player)
+
+                    if use_policy:
+                        idx, log_prob, value = self._policy_call(
+                            features, candidates, resp_ctx=resp_ctx,
+                            cand_records=cand_records)
+                        actor_type = "policy"
+                    else:
+                        # baseline = 自動リーチ (既存 Stage02a 互換)
+                        idx = 1  # Riichi
+                        log_prob, value = self._infer_call(
+                            features, cand_records, idx, resp_ctx=resp_ctx)
+                        actor_type = "baseline"
+                    should_save = (actor_type == "policy"
+                                   or self._save_baseline_actions
+                                   or self._model is None)
+
+                    if should_save:
+                        # CQ-0291: teacher = Riichi (= 既存自動 riichi 挙動)
+                        sample = DecisionSample(
+                            decision_type="call",  # 既存 optional 経路を再利用
+                            decision_family="riichi",  # CQ-0291 (batch 1)
+                            observation=features,
+                            reward=0.0,
+                            log_prob=log_prob,
+                            value=value,
+                            terminated=False, round_over=False,
+                            selected_candidate_index=idx,
+                            candidate_count=len(candidates),
+                            candidates=cand_records,
+                            response_context=make_response_context(
+                                env.env_state, player),
+                            teacher_top1_index=1,  # Riichi
+                            teacher_source="auto_riichi",
+                            player_id=player,
+                            episode_id=episode_id,
+                            round_id=round_id,
+                            step_id=step_counter,
+                            actor_type=actor_type,
+                            experiment_id=experiment_id,
+                            run_id=run_id,
+                            worker_id=worker_id,
+                        )
+                        if player in pending:
+                            prev = pending.pop(player)
+                            round_buffer.append(prev)
+                        pending[player] = sample
+                        decision_family_counts["riichi"] += 1
+
+                    step_counter += 1
+                    call_count += 1
+                    _, rewards, terminated, _, _ = env.step_response(idx)
+                    self._accumulate_pending_rewards(
+                        pending, rewards, terminated=terminated)
+
+                elif env.decision_type in (DecisionType.TSUMO_OPTIONAL,
+                                            DecisionType.RON_OPTIONAL):
+                    # CQ-0291 (batch 2): TsumoWin/Ron optional decision
+                    # candidates: [Win (idx 0), Skip (idx 1)]
+                    # baseline/teacher: 既存自動和了挙動を維持するため Win(=0) を採用
+                    is_tsumo = (env.decision_type
+                                == DecisionType.TSUMO_OPTIONAL)
+                    decision_family = "tsumo" if is_tsumo else "ron"
+                    teacher_source = ("auto_tsumo" if is_tsumo
+                                       else "auto_ron")
+                    obs = env._make_observation()
+                    features = self._encode_env_obs(env, obs)
+                    candidates = env.response_candidates
+                    use_policy = seat_is_policy[player] and self._model is not None
+                    cand_records = self._make_cand_records(candidates)
+                    resp_ctx = make_response_context(env.env_state, player)
+
+                    if use_policy:
+                        idx, log_prob, value = self._policy_call(
+                            features, candidates, resp_ctx=resp_ctx,
+                            cand_records=cand_records)
+                        actor_type = "policy"
+                    else:
+                        # baseline = 自動 Tsumo/Ron (既存 Stage02a 互換)
+                        idx = 0  # Win (TsumoWin / Ron)
+                        log_prob, value = self._infer_call(
+                            features, cand_records, idx, resp_ctx=resp_ctx)
+                        actor_type = "baseline"
+                    should_save = (actor_type == "policy"
+                                   or self._save_baseline_actions
+                                   or self._model is None)
+
+                    if should_save:
+                        sample = DecisionSample(
+                            decision_type="call",  # 既存 optional 経路を再利用
+                            decision_family=decision_family,
+                            observation=features,
+                            reward=0.0,
+                            log_prob=log_prob,
+                            value=value,
+                            terminated=False, round_over=False,
+                            selected_candidate_index=idx,
+                            candidate_count=len(candidates),
+                            candidates=cand_records,
+                            response_context=make_response_context(
+                                env.env_state, player),
+                            teacher_top1_index=0,  # Win (TsumoWin / Ron)
+                            teacher_source=teacher_source,
+                            player_id=player,
+                            episode_id=episode_id,
+                            round_id=round_id,
+                            step_id=step_counter,
+                            actor_type=actor_type,
+                            experiment_id=experiment_id,
+                            run_id=run_id,
+                            worker_id=worker_id,
+                        )
+                        if player in pending:
+                            prev = pending.pop(player)
+                            round_buffer.append(prev)
+                        pending[player] = sample
+                        decision_family_counts[decision_family] += 1
+
+                    step_counter += 1
+                    call_count += 1
+                    _, rewards, terminated, _, _ = env.step_response(idx)
+                    self._accumulate_pending_rewards(
+                        pending, rewards, terminated=terminated)
+
+                elif env.decision_type in (DecisionType.ANKAN_OPTIONAL,
+                                            DecisionType.KAKAN_OPTIONAL,
+                                            DecisionType.KYUUSHU_OPTIONAL):
+                    # CQ-0291 (batch 3): Ankan / Kakan / Kyuushu optional
+                    # candidates: [primary (idx 0), Skip (idx 1)]
+                    # baseline/teacher: 既存 Stage02a の自動スキップ挙動を
+                    # 維持するため Skip(=1) を採用
+                    if env.decision_type == DecisionType.ANKAN_OPTIONAL:
+                        decision_family = "ankan"
+                    elif env.decision_type == DecisionType.KAKAN_OPTIONAL:
+                        decision_family = "kakan"
+                    else:
+                        decision_family = "kyuushu"
+                    teacher_source = f"auto_skip_{decision_family}"
+                    obs = env._make_observation()
+                    features = self._encode_env_obs(env, obs)
+                    candidates = env.response_candidates
+                    use_policy = seat_is_policy[player] and self._model is not None
+                    cand_records = self._make_cand_records(candidates)
+                    resp_ctx = make_response_context(env.env_state, player)
+
+                    if use_policy:
+                        idx, log_prob, value = self._policy_call(
+                            features, candidates, resp_ctx=resp_ctx,
+                            cand_records=cand_records)
+                        actor_type = "policy"
+                    else:
+                        # baseline = 自動 Skip (= 既存 Stage02a 互換)
+                        idx = 1  # Skip
+                        log_prob, value = self._infer_call(
+                            features, cand_records, idx, resp_ctx=resp_ctx)
+                        actor_type = "baseline"
+                    should_save = (actor_type == "policy"
+                                   or self._save_baseline_actions
+                                   or self._model is None)
+
+                    if should_save:
+                        sample = DecisionSample(
+                            decision_type="call",
+                            decision_family=decision_family,
+                            observation=features,
+                            reward=0.0,
+                            log_prob=log_prob,
+                            value=value,
+                            terminated=False, round_over=False,
+                            selected_candidate_index=idx,
+                            candidate_count=len(candidates),
+                            candidates=cand_records,
+                            response_context=make_response_context(
+                                env.env_state, player),
+                            teacher_top1_index=1,  # Skip (auto-skip 互換)
+                            teacher_source=teacher_source,
+                            player_id=player,
+                            episode_id=episode_id,
+                            round_id=round_id,
+                            step_id=step_counter,
+                            actor_type=actor_type,
+                            experiment_id=experiment_id,
+                            run_id=run_id,
+                            worker_id=worker_id,
+                        )
+                        if player in pending:
+                            prev = pending.pop(player)
+                            round_buffer.append(prev)
+                        pending[player] = sample
+                        decision_family_counts[decision_family] += 1
+
+                    step_counter += 1
+                    call_count += 1
+                    _, rewards, terminated, _, _ = env.step_response(idx)
                     self._accumulate_pending_rewards(
                         pending, rewards, terminated=terminated)
 
@@ -348,6 +735,20 @@ class Stage2SelfPlayWorker:
 
         writer.close()
 
+        # CQ-0292 (batch 2): optional decision count = response/discard 以外の合計
+        optional_decision_count = sum(
+            v for k, v in decision_family_counts.items()
+            if k not in ("discard", "response")
+        )
+
+        # CQ-0294: riichi opportunity / bypass rate
+        if riichi_opportunity_discard_count > 0:
+            riichi_bypass_rate = (
+                riichi_bypassed_by_non_riichi_discard_count
+                / riichi_opportunity_discard_count)
+        else:
+            riichi_bypass_rate = 0.0
+
         return {
             "num_matches": num_matches,
             "total_matches": num_matches,
@@ -363,6 +764,21 @@ class Stage2SelfPlayWorker:
             "policy_draws": policy_draws,
             "policy_win_by_tsumo": policy_win_by_tsumo,
             "policy_win_by_ron": policy_win_by_ron,
+            # CQ-0292 (batch 2): decision_family ごとの sample counts
+            "decision_family_counts": dict(decision_family_counts),
+            "optional_decision_count": int(optional_decision_count),
+            # CQ-0294: riichi opportunity diagnostics
+            "riichi_opportunity_discard_count": int(
+                riichi_opportunity_discard_count),
+            "riichi_optional_opened_count": int(
+                riichi_optional_opened_count),
+            "riichi_bypassed_by_non_riichi_discard_count": int(
+                riichi_bypassed_by_non_riichi_discard_count),
+            "riichi_bypass_rate": float(riichi_bypass_rate),
+            "riichi_opportunity_by_actor": dict(riichi_opportunity_by_actor),
+            "riichi_optional_opened_by_actor": dict(
+                riichi_optional_opened_by_actor),
+            "riichi_bypassed_by_actor": dict(riichi_bypassed_by_actor),
         }
 
     def _assign_seats(self, seed: int) -> list[bool]:
